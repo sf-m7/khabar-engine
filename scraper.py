@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Shopify Price Scraper (v2 — optimized)
+# KHABAR — Shopify Price Scraper (v3 — correct size detection)
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -8,22 +8,18 @@ import requests
 from supabase import create_client
 from datetime import datetime, timezone
 
-# Force output to appear in real time in GitHub Actions logs
 sys.stdout.reconfigure(line_buffering=True)
 
-# ── Supabase connection ─────────────────────────────────
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Brands to scrape ────────────────────────────────────
 BRANDS = [
     {"name": "town_team", "domain": "www.townteam.com"},
-    {"name": "ravin",     "domain": "www.ravin.com"},
-    {"name": "mens_club", "domain": "www.mensclubeg.com"},
+    {"name": "ravin",     "domain": "https://shop.iravin.com"},
+    {"name": "mens_club", "domain": "https://mensclubcollection.com"},
 ]
 
-# ── Category keyword map ────────────────────────────────
 CATEGORY_MAP = {
     "tops":        ["shirt", "t-shirt", "tee", "blouse", "top", "polo",
                     "sweatshirt", "tank", "henley", "تيشيرت", "بلوزة"],
@@ -38,6 +34,65 @@ CATEGORY_MAP = {
     "accessories": ["bag", "belt", "scarf", "hat", "cap", "jewelry",
                     "watch", "sunglasses", "شنطة", "حزام"],
 }
+
+# These are values that look like sizes — NOT colors
+SIZE_KEYWORDS = {
+    "xs", "s", "m", "l", "xl", "xxl", "xxxl", "2xl", "3xl", "4xl",
+    "small", "medium", "large", "x-large", "xx-large",
+    "os", "one size", "free size", "onesize", "فري", "فري سايز",
+}
+
+def looks_like_size(value):
+    """Returns True if a variant option value looks like a size, not a color."""
+    if not value:
+        return False
+    v = value.strip().lower()
+    if v in SIZE_KEYWORDS:
+        return True
+    # Pure numbers = waist/shoe sizes (28, 30, 38, 39, 40...)
+    if v.isdigit():
+        return True
+    # Formats like "28/30", "32W", "30L", "28W/30L"
+    if "/" in v or v.endswith("w") or v.endswith("l"):
+        return True
+    return False
+
+def extract_sizes(variants):
+    """
+    Finds which Shopify option (option1, option2, option3) contains sizes.
+    Returns (all_sizes, sizes_in_stock) — deduplicated lists.
+    """
+    # Sample up to 8 variants to decide which option holds sizes
+    sample = variants[:8]
+    opt1_samples = [v.get("option1", "") for v in sample]
+    opt2_samples = [v.get("option2", "") for v in sample]
+    opt3_samples = [v.get("option3", "") for v in sample]
+
+    if any(looks_like_size(v) for v in opt1_samples):
+        size_key = "option1"
+    elif any(looks_like_size(v) for v in opt2_samples):
+        size_key = "option2"
+    elif any(looks_like_size(v) for v in opt3_samples):
+        size_key = "option3"
+    else:
+        # Fallback: use option1 even if we can't confirm it's a size
+        size_key = "option1"
+
+    seen = set()
+    all_sizes = []
+    sizes_in_stock = []
+
+    for v in variants:
+        size = (v.get(size_key) or v.get("title") or "").strip()
+        if not size or size.lower() == "default title":
+            continue
+        if size not in seen:
+            seen.add(size)
+            all_sizes.append(size)
+        if v.get("available") and size not in sizes_in_stock:
+            sizes_in_stock.append(size)
+
+    return all_sizes, sizes_in_stock
 
 def normalize_category(text):
     text = text.lower()
@@ -57,7 +112,6 @@ def normalize_gender(tags, product_type, title):
     return "unisex"
 
 def check_domain(domain):
-    """Quick check that the domain is reachable before scraping."""
     try:
         r = requests.get(
             f"https://{domain}/products.json?limit=1",
@@ -70,11 +124,6 @@ def check_domain(domain):
         return False
 
 def load_last_prices(brand_name):
-    """
-    Load the most recent recorded price for every product of this brand
-    in ONE database query instead of one query per product.
-    Returns a dict: { product_db_id: last_price_float }
-    """
     print(f"  Loading existing price history for {brand_name}...")
     result = (
         supabase.table("price_events")
@@ -87,7 +136,7 @@ def load_last_prices(brand_name):
     prices = {}
     for row in result.data:
         pid = row["product_id"]
-        if pid not in prices:          # first occurrence = most recent (ordered desc)
+        if pid not in prices:
             prices[pid] = float(row["price_after"])
     print(f"  Found {len(prices)} products with existing price history.")
     return prices
@@ -101,12 +150,10 @@ def scrape_brand(brand_name, domain):
         print(f"  ⚠️  Skipping — domain unreachable.")
         return 0
 
-    # Load all existing prices in one shot before the loop
     last_prices = load_last_prices(brand_name)
-
-    products_seen  = 0
-    price_changes  = 0
-    page           = 1
+    products_seen = 0
+    price_changes = 0
+    page = 1
 
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
@@ -119,11 +166,11 @@ def scrape_brand(brand_name, domain):
                               "Chrome/120.0.0.0 Safari/537.36"
             })
         except requests.RequestException as e:
-            print(f"network error: {e} — stopping pagination.")
+            print(f"network error: {e} — stopping.")
             break
 
         if response.status_code != 200:
-            print(f"HTTP {response.status_code} — stopping pagination.")
+            print(f"HTTP {response.status_code} — stopping.")
             break
 
         products = response.json().get("products", [])
@@ -138,8 +185,8 @@ def scrape_brand(brand_name, domain):
             if not variants:
                 continue
 
-            main          = variants[0]
-            price         = float(main.get("price") or 0)
+            main             = variants[0]
+            price            = float(main.get("price") or 0)
             if price == 0:
                 continue
 
@@ -149,13 +196,8 @@ def scrape_brand(brand_name, domain):
             if compare_at_price and compare_at_price > price:
                 discount_pct = round((compare_at_price - price) / compare_at_price * 100, 2)
 
-            all_sizes, sizes_in_stock = [], []
-            for v in variants:
-                size = v.get("option1") or v.get("title", "")
-                if size and size.lower() != "default title":
-                    all_sizes.append(size)
-                    if v.get("available"):
-                        sizes_in_stock.append(size)
+            # ── Correct size extraction ──
+            all_sizes, sizes_in_stock = extract_sizes(variants)
 
             title        = product.get("title", "")
             product_type = product.get("product_type", "")
@@ -163,7 +205,6 @@ def scrape_brand(brand_name, domain):
             handle       = product.get("handle", "")
             images       = product.get("images", [])
 
-            # Upsert product record
             upsert_result = (
                 supabase.table("products")
                 .upsert({
@@ -183,7 +224,7 @@ def scrape_brand(brand_name, domain):
             )
 
             db_id      = upsert_result.data[0]["id"]
-            last_price = last_prices.get(db_id)   # ← dict lookup, no DB call
+            last_price = last_prices.get(db_id)
             products_seen += 1
 
             if last_price is None or abs(last_price - price) > 0.01:
@@ -206,7 +247,6 @@ def scrape_brand(brand_name, domain):
                     "recorded_at":      datetime.now(timezone.utc).isoformat(),
                 }).execute()
 
-                # Keep our local dict updated so we don't re-insert within same run
                 last_prices[db_id] = price
 
         page += 1
@@ -216,7 +256,6 @@ def scrape_brand(brand_name, domain):
     return price_changes
 
 
-# ── Entry point ─────────────────────────────────────────
 if __name__ == "__main__":
     print("🚀 Khabar scraper starting...")
     total = 0
