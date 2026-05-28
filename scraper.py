@@ -16,8 +16,8 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BRANDS = [
     {"name": "town_team", "domain": "www.townteam.com"},
-    {"name": "ravin",     "domain": "https://shop.iravin.com"},
-    {"name": "mens_club", "domain": "https://mensclubcollection.com"},
+    {"name": "ravin",     "domain": "shop.iravin.com"},
+    {"name": "mens_club", "domain": "mensclubcollection.com"},
 ]
 
 CATEGORY_MAP = {
