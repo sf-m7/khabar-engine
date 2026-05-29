@@ -1,13 +1,14 @@
-name: Khabar Bot Poller
+name: Khabar Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
       - name: Pull the code
