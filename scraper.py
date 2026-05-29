@@ -12,7 +12,6 @@ sys.stdout.reconfigure(line_buffering=True)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BRANDS = [
     {"name": "town_team", "domain": "www.townteam.com"},
@@ -144,6 +143,8 @@ def load_last_prices(brand_name):
     return prices
 
 def scrape_brand(brand_name, domain):
+    global supabase
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)  # fresh connection per brand
     print(f"\n{'─'*55}")
     print(f"▶  {brand_name.upper()}  —  {domain}")
     print(f"{'─'*55}")
