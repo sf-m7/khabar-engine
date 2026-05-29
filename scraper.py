@@ -18,6 +18,8 @@ BRANDS = [
     {"name": "town_team", "domain": "www.townteam.com"},
     {"name": "ravin",     "domain": "shop.iravin.com"},
     {"name": "mens_club", "domain": "mensclubcollection.com"},
+    {"name": "tree",      "domain": "tree-stores.com"},
+    {"name": "dott_jeans", "domain": "dottjeans.com"},
 ]
 
 CATEGORY_MAP = {
