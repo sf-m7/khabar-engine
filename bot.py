@@ -1,7 +1,5 @@
 # ═══════════════════════════════════════════════════════
 # KHABAR — Telegram Bot (long-poll mode)
-# Stays running for up to 6 hours via GitHub Actions.
-# Responds to users within ~3 seconds via long-polling.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -22,12 +20,13 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 FREE_BRAND_LIMIT = 2
 
+# Brand emoji act as visual identifiers since buttons can't hold images
 BRANDS = {
-    "town_team":  "Town Team",
-    "ravin":      "Ravin",
-    "mens_club":  "Men's Club",
-    "tree":       "Tree",
-    "dott_jeans": "Dott Jeans",
+    "town_team":  "👕 Town Team",
+    "ravin":      "⚡ Ravin",
+    "mens_club":  "👔 Men's Club",
+    "tree":       "🌿 Tree",
+    "dott_jeans": "🔵 Dott Jeans",
 }
 
 CATEGORIES = {
@@ -37,6 +36,16 @@ CATEGORIES = {
     "outerwear":   "Outerwear 🧥",
     "footwear":    "Footwear 👟",
     "accessories": "Accessories 👜",
+}
+
+# Size options shown per category as buttons
+CATEGORY_SIZES = {
+    "tops":        ["XS", "S", "M", "L", "XL", "XXL", "XXXL"],
+    "bottoms":     ["26", "28", "30", "32", "34", "36", "38", "40"],
+    "dresses":     ["XS", "S", "M", "L", "XL", "XXL"],
+    "outerwear":   ["XS", "S", "M", "L", "XL", "XXL", "XXXL"],
+    "footwear":    ["36", "37", "38", "39", "40", "41", "42", "43", "44"],
+    "accessories": ["One Size", "S/M", "L/XL"],
 }
 
 # ── Telegram helpers ──────────────────────────────────
@@ -141,7 +150,9 @@ def format_deals_text(deals):
     for d in deals:
         p     = d.get("products") or {}
         name  = (p.get("name") or "Product")[:38]
-        brand = BRANDS.get(d.get("brand", ""), d.get("brand", "")).upper()
+        # Strip emoji from brand name for display
+        brand_raw = d.get("brand", "")
+        brand = BRANDS.get(brand_raw, brand_raw).split(" ", 1)[-1].upper()
         disc  = int(d.get("discount_pct") or 0)
         price = int(d.get("price_after") or 0)
         lines.append(f"  🔥 {name} — <b>{disc}% off</b> @ {price} EGP [{brand}]")
@@ -154,9 +165,9 @@ def brands_keyboard(selected, tier="free"):
     limit = FREE_BRAND_LIMIT if tier == "free" else len(BRANDS)
     for key, label in BRANDS.items():
         tick = "✅ " if key in selected else ""
-        rows.append([{"text": f"{tick}{label}", "callback_data": f"brand_{key}"}])
+        rows.append([{"text": f"{tick}{label}", "callback_data": f"brand|{key}"}])
     count = len(selected)
-    done  = f"Done → ({count}/{limit} selected)" if count else "← Select at least one brand"
+    done  = f"Done → ({count}/{limit} selected)" if count else "← Pick at least one brand"
     rows.append([{"text": done, "callback_data": "brands_done"}])
     return rows
 
@@ -164,7 +175,7 @@ def categories_keyboard(selected):
     rows, row = [], []
     for key, label in CATEGORIES.items():
         tick = "✅ " if key in selected else ""
-        row.append({"text": f"{tick}{label}", "callback_data": f"cat_{key}"})
+        row.append({"text": f"{tick}{label}", "callback_data": f"cat|{key}"})
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -172,6 +183,22 @@ def categories_keyboard(selected):
         rows.append(row)
     label = f"Done → ({len(selected)} selected)" if selected else "Done → (all categories)"
     rows.append([{"text": label, "callback_data": "cats_done"}])
+    return rows
+
+def size_keyboard(category):
+    """Builds size buttons for a specific category, 4 per row."""
+    sizes = CATEGORY_SIZES.get(category, ["S", "M", "L", "XL"])
+    rows, row = [], []
+    for size in sizes:
+        # Use pipe separator to safely encode: sz|category|size
+        safe_size = size.replace("/", "-")  # "S/M" → "S-M" for callback safety
+        row.append({"text": size, "callback_data": f"sz|{category}|{safe_size}"})
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Skip (any size) →", "callback_data": f"sz|{category}|skip"}])
     return rows
 
 # ── Conversation steps ─────────────────────────────────
@@ -199,7 +226,7 @@ def show_brand_selection(chat_id, user, message_id):
     text = (
         "<b>Step 1 of 3 — Choose brands</b>\n\n"
         f"Free plan: pick up to <b>{limit} brands</b>.\n"
-        "Upgrade to monitor all 5 brands."
+        "Upgrade anytime to monitor all 5 brands."
     )
     edit(chat_id, message_id, text, brands_keyboard(selected, tier))
     update_user(chat_id, {"conversation_state": "setup_brands"})
@@ -212,33 +239,46 @@ def show_category_selection(chat_id, user, message_id):
     text = (
         "<b>Step 2 of 3 — Choose categories</b>\n\n"
         f"Monitoring: <b>{names}</b>\n\n"
-        "Select specific categories, or tap Done to get alerts for everything."
+        "Select the categories you want alerts for.\n"
+        "Tap Done to get alerts for all categories."
     )
     edit(chat_id, message_id, text, categories_keyboard(selected))
     update_user(chat_id, {"conversation_state": "setup_categories"})
 
-def show_size_input(chat_id, user, message_id):
-    text = (
-        "<b>Step 3 of 3 — Your size</b>\n\n"
-        "Type your size and I'll only alert you when that size is in stock.\n\n"
-        "Examples: <code>M</code>  <code>L</code>  <code>XL</code>  "
-        "<code>32</code>  <code>28/30</code>\n\n"
-        "Or type <code>skip</code> to get alerts for all sizes."
-    )
-    edit(chat_id, message_id, text)
-    update_user(chat_id, {"conversation_state": "setup_size"})
+def show_size_for_category(chat_id, user, message_id):
+    """
+    Shows size buttons for the next pending category.
+    Called once per selected category in sequence.
+    """
+    temp        = user.get("temp_data") or {}
+    pending     = temp.get("sizes_pending", [])
+    all_cats    = temp.get("selected_categories", [])
+    collected   = temp.get("sizes_collected", {})
 
-def complete_setup(chat_id, user, size_text):
+    # If no pending categories, complete setup
+    if not pending:
+        complete_setup(chat_id, user, message_id)
+        return
+
+    current     = pending[0]
+    total       = len(all_cats) if all_cats else len(pending)
+    done_so_far = total - len(pending)
+    cat_label   = CATEGORIES.get(current, current)
+
+    text = (
+        f"<b>Step 3 of 3 — Sizes ({done_so_far + 1}/{total})</b>\n\n"
+        f"What's your size for <b>{cat_label}</b>?\n\n"
+        "Tap your size. Khabar will only alert you when that size is in stock."
+    )
+    edit(chat_id, message_id, text, size_keyboard(current))
+    update_user(chat_id, {"conversation_state": "setup_sizes"})
+
+def complete_setup(chat_id, user, message_id=None):
+    """Finalises setup using collected sizes from temp_data."""
     temp       = user.get("temp_data") or {}
     brands     = temp.get("selected_brands", [])
     categories = temp.get("selected_categories", [])
-    size       = None if size_text.lower() == "skip" else size_text.strip()
-
-    sizes_dict = {}
-    if size:
-        cats = categories if categories else list(CATEGORIES.keys())
-        for c in cats:
-            sizes_dict[c] = size
+    sizes_dict = temp.get("sizes_collected", {})
 
     update_user(chat_id, {
         "conversation_state":  "active",
@@ -250,13 +290,21 @@ def complete_setup(chat_id, user, size_text):
 
     brand_names = [BRANDS.get(b, b) for b in brands]
     cat_names   = [CATEGORIES.get(c, c) for c in categories] if categories else ["All categories"]
-    size_label  = size or "All sizes"
+
+    # Build sizes summary
+    if sizes_dict:
+        size_lines = "\n".join(
+            f"  • {CATEGORIES.get(c, c)}: {s}"
+            for c, s in sizes_dict.items()
+        )
+    else:
+        size_lines = "  • All sizes"
 
     text = (
         "✅ <b>You're all set!</b>\n\n"
         f"<b>Brands:</b> {', '.join(brand_names)}\n"
         f"<b>Categories:</b> {', '.join(cat_names)}\n"
-        f"<b>Size:</b> {size_label}\n\n"
+        f"<b>Sizes:</b>\n{size_lines}\n\n"
         "Khabar checks for deals every 30 minutes. The moment something matching "
         "your preferences goes on sale, you'll get an instant alert.\n\n"
         "Use /settings anytime to update your preferences."
@@ -267,7 +315,7 @@ def complete_setup(chat_id, user, size_text):
 
 def process_update(update):
 
-    # Button tap
+    # ── Button tap ──
     if "callback_query" in update:
         cq         = update["callback_query"]
         chat_id    = cq["from"]["id"]
@@ -278,11 +326,13 @@ def process_update(update):
 
         user = get_user(chat_id) or create_user(chat_id, username)
 
+        # ── Start setup ──
         if data == "start_setup":
             show_brand_selection(chat_id, user, message_id)
 
-        elif data.startswith("brand_"):
-            brand = data[6:]
+        # ── Brand toggle ──
+        elif data.startswith("brand|"):
+            brand = data.split("|")[1]
             temp  = user.get("temp_data") or {}
             sel   = list(temp.get("selected_brands", []))
             tier  = user.get("tier", "free")
@@ -298,10 +348,11 @@ def process_update(update):
             text = (
                 "<b>Step 1 of 3 — Choose brands</b>\n\n"
                 f"Free plan: pick up to <b>{limit} brands</b>.\n"
-                "Upgrade to monitor all 5 brands."
+                "Upgrade anytime to monitor all 5 brands."
             )
             edit(chat_id, message_id, text, brands_keyboard(sel_now, tier))
 
+        # ── Brands confirmed ──
         elif data == "brands_done":
             user = get_user(chat_id)
             sel  = (user.get("temp_data") or {}).get("selected_brands", [])
@@ -310,8 +361,9 @@ def process_update(update):
             else:
                 show_category_selection(chat_id, user, message_id)
 
-        elif data.startswith("cat_"):
-            cat  = data[4:]
+        # ── Category toggle ──
+        elif data.startswith("cat|"):
+            cat  = data.split("|")[1]
             temp = user.get("temp_data") or {}
             sel  = list(temp.get("selected_categories", []))
             if cat in sel:
@@ -331,13 +383,52 @@ def process_update(update):
             )
             edit(chat_id, message_id, text, categories_keyboard(sel_now))
 
+        # ── Categories confirmed → start size flow ──
         elif data == "cats_done":
             user = get_user(chat_id)
-            show_size_input(chat_id, user, message_id)
+            temp = user.get("temp_data") or {}
+            selected_cats = temp.get("selected_categories", [])
+
+            # If no categories selected, use all categories for size prompts
+            cats_to_size = selected_cats if selected_cats else list(CATEGORIES.keys())
+
+            temp["sizes_pending"]   = list(cats_to_size)
+            temp["sizes_collected"] = {}
+            update_user(chat_id, {"temp_data": temp})
+            user = get_user(chat_id)
+            show_size_for_category(chat_id, user, message_id)
+
+        # ── Size selected for a category ──
+        elif data.startswith("sz|"):
+            parts    = data.split("|")          # ["sz", category, size_value]
+            category = parts[1]
+            size_val = parts[2]
+
+            temp      = user.get("temp_data") or {}
+            pending   = list(temp.get("sizes_pending", []))
+            collected = dict(temp.get("sizes_collected", {}))
+
+            # Record size (restore "/" in display values like "S-M" → "S/M")
+            if size_val != "skip":
+                collected[category] = size_val.replace("-", "/")
+
+            # Remove this category from pending
+            if category in pending:
+                pending.remove(category)
+
+            temp["sizes_pending"]   = pending
+            temp["sizes_collected"] = collected
+            update_user(chat_id, {"temp_data": temp})
+            user = get_user(chat_id)
+
+            if pending:
+                show_size_for_category(chat_id, user, message_id)
+            else:
+                complete_setup(chat_id, user, message_id)
 
         return
 
-    # Text message
+    # ── Text message ──
     if "message" not in update:
         return
 
@@ -358,9 +449,6 @@ def process_update(update):
         user = user or create_user(chat_id, username)
         update_user(chat_id, {"conversation_state": "new", "temp_data": {}})
         show_welcome(chat_id, get_user(chat_id))
-
-    elif user and user.get("conversation_state") == "setup_size":
-        complete_setup(chat_id, user, text)
 
     elif not user or user.get("conversation_state") in ("new", None):
         send(chat_id, "Send /start to set up your deal alerts 👋")
