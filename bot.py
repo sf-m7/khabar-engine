@@ -399,4 +399,44 @@ def main():
     print("  ✅ Done.")
 
 if __name__ == "__main__":
+    def main():
+    import time
+    print("🤖 Khabar bot starting (long-poll mode)...")
+
+    offset = get_offset()
+    next_offset = offset + 1 if offset else 0
+    print(f"  Listening from offset {next_offset}. Waiting for messages...")
+
+    while True:
+        try:
+            # timeout=25 means: hold connection open 25 sec waiting for updates.
+            # If a message arrives before that, return immediately.
+            # This gives users sub-3-second response times.
+            resp = tg("getUpdates", {
+                "offset":  next_offset,
+                "limit":   100,
+                "timeout": 25,
+            })
+
+            if not resp.get("ok"):
+                print(f"  ⚠️  getUpdates error: {resp}")
+                time.sleep(5)
+                continue
+
+            updates = resp.get("result", [])
+
+            for upd in updates:
+                try:
+                    process_update(upd)
+                except Exception as e:
+                    print(f"  ❌ Error processing update {upd.get('update_id')}: {e}")
+                next_offset = upd["update_id"] + 1
+                save_offset(upd["update_id"])
+
+        except Exception as e:
+            print(f"  ⚠️  Poll loop error: {e}")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
     main()
