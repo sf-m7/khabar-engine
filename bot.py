@@ -1,20 +1,19 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Telegram Bot Poller
-# Runs every 5 minutes via GitHub Actions.
-# Handles /start, brand/category/size setup, and stores
-# user preferences in Supabase.
+# KHABAR — Telegram Bot (long-poll mode)
+# Stays running for up to 6 hours via GitHub Actions.
+# Responds to users within ~3 seconds via long-polling.
 # ═══════════════════════════════════════════════════════
 
 import os
 import sys
-import json
+import time
 import requests
 from supabase import create_client
 from datetime import datetime, timezone
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+BOT_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 API          = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -40,11 +39,11 @@ CATEGORIES = {
     "accessories": "Accessories 👜",
 }
 
-# ── Telegram helpers ─────────────────────────────────
+# ── Telegram helpers ──────────────────────────────────
 
 def tg(method, data=None):
     try:
-        r = requests.post(f"{API}/{method}", json=data or {}, timeout=10)
+        r = requests.post(f"{API}/{method}", json=data or {}, timeout=35)
         return r.json()
     except Exception as e:
         print(f"  Telegram API error ({method}): {e}")
@@ -58,9 +57,9 @@ def send(chat_id, text, keyboard=None):
 
 def edit(chat_id, message_id, text, keyboard=None):
     payload = {
-        "chat_id": chat_id,
+        "chat_id":    chat_id,
         "message_id": message_id,
-        "text": text,
+        "text":       text,
         "parse_mode": "HTML",
     }
     if keyboard:
@@ -82,7 +81,9 @@ def get_offset():
         return 0
 
 def save_offset(update_id):
-    supabase.table("bot_state").upsert({"key": "last_update_id", "value": str(update_id)}).execute()
+    supabase.table("bot_state").upsert(
+        {"key": "last_update_id", "value": str(update_id)}
+    ).execute()
 
 def get_user(telegram_id):
     r = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
@@ -90,16 +91,16 @@ def get_user(telegram_id):
 
 def create_user(telegram_id, username):
     data = {
-        "telegram_id":        telegram_id,
-        "username":           username or "",
-        "tier":               "free",
-        "conversation_state": "new",
-        "temp_data":          {},
-        "brands_monitored":   [],
-        "categories_selected":[],
-        "sizes":              {},
-        "joined_at":          datetime.now(timezone.utc).isoformat(),
-        "last_active_at":     datetime.now(timezone.utc).isoformat(),
+        "telegram_id":         telegram_id,
+        "username":            username or "",
+        "tier":                "free",
+        "conversation_state":  "new",
+        "temp_data":           {},
+        "brands_monitored":    [],
+        "categories_selected": [],
+        "sizes":               {},
+        "joined_at":           datetime.now(timezone.utc).isoformat(),
+        "last_active_at":      datetime.now(timezone.utc).isoformat(),
     }
     r = supabase.table("users").insert(data).execute()
     return r.data[0]
@@ -108,17 +109,19 @@ def update_user(telegram_id, data):
     data["last_active_at"] = datetime.now(timezone.utc).isoformat()
     supabase.table("users").update(data).eq("telegram_id", telegram_id).execute()
 
-# ── Live deals for welcome screen ────────────────────
+# ── Live deals for welcome screen ─────────────────────
 
 def get_live_deals(limit=3):
     try:
-        r = (supabase.table("price_events")
-             .select("*, products(name, brand)")
-             .eq("direction", "down")
-             .gte("discount_pct", 25)
-             .order("recorded_at", desc=True)
-             .limit(limit * 4)
-             .execute())
+        r = (
+            supabase.table("price_events")
+            .select("*, products(name, brand)")
+            .eq("direction", "down")
+            .gte("discount_pct", 25)
+            .order("recorded_at", desc=True)
+            .limit(limit * 4)
+            .execute()
+        )
         seen, deals = set(), []
         for e in r.data:
             pid = e.get("product_id")
@@ -136,7 +139,7 @@ def format_deals_text(deals):
         return "  🔍 Scanning now — you'll be among the first to know."
     lines = []
     for d in deals:
-        p = d.get("products") or {}
+        p     = d.get("products") or {}
         name  = (p.get("name") or "Product")[:38]
         brand = BRANDS.get(d.get("brand", ""), d.get("brand", "")).upper()
         disc  = int(d.get("discount_pct") or 0)
@@ -147,12 +150,12 @@ def format_deals_text(deals):
 # ── Keyboards ─────────────────────────────────────────
 
 def brands_keyboard(selected, tier="free"):
-    rows = []
+    rows  = []
+    limit = FREE_BRAND_LIMIT if tier == "free" else len(BRANDS)
     for key, label in BRANDS.items():
         tick = "✅ " if key in selected else ""
         rows.append([{"text": f"{tick}{label}", "callback_data": f"brand_{key}"}])
     count = len(selected)
-    limit = FREE_BRAND_LIMIT if tier == "free" else len(BRANDS)
     done  = f"Done → ({count}/{limit} selected)" if count else "← Select at least one brand"
     rows.append([{"text": done, "callback_data": "brands_done"}])
     return rows
@@ -163,14 +166,15 @@ def categories_keyboard(selected):
         tick = "✅ " if key in selected else ""
         row.append({"text": f"{tick}{label}", "callback_data": f"cat_{key}"})
         if len(row) == 2:
-            rows.append(row); row = []
+            rows.append(row)
+            row = []
     if row:
         rows.append(row)
     label = f"Done → ({len(selected)} selected)" if selected else "Done → (all categories)"
     rows.append([{"text": label, "callback_data": "cats_done"}])
     return rows
 
-# ── Conversation steps ────────────────────────────────
+# ── Conversation steps ─────────────────────────────────
 
 def show_welcome(chat_id, user):
     deals = get_live_deals(3)
@@ -201,10 +205,10 @@ def show_brand_selection(chat_id, user, message_id):
     update_user(chat_id, {"conversation_state": "setup_brands"})
 
 def show_category_selection(chat_id, user, message_id):
-    temp      = user.get("temp_data") or {}
+    temp       = user.get("temp_data") or {}
     sel_brands = temp.get("selected_brands", [])
-    selected  = temp.get("selected_categories", [])
-    names     = ", ".join(BRANDS.get(b, b) for b in sel_brands)
+    selected   = temp.get("selected_categories", [])
+    names      = ", ".join(BRANDS.get(b, b) for b in sel_brands)
     text = (
         "<b>Step 2 of 3 — Choose categories</b>\n\n"
         f"Monitoring: <b>{names}</b>\n\n"
@@ -228,8 +232,8 @@ def complete_setup(chat_id, user, size_text):
     temp       = user.get("temp_data") or {}
     brands     = temp.get("selected_brands", [])
     categories = temp.get("selected_categories", [])
+    size       = None if size_text.lower() == "skip" else size_text.strip()
 
-    size = None if size_text.lower() == "skip" else size_text.strip()
     sizes_dict = {}
     if size:
         cats = categories if categories else list(CATEGORIES.keys())
@@ -237,11 +241,11 @@ def complete_setup(chat_id, user, size_text):
             sizes_dict[c] = size
 
     update_user(chat_id, {
-        "conversation_state": "active",
-        "brands_monitored":   brands,
+        "conversation_state":  "active",
+        "brands_monitored":    brands,
         "categories_selected": categories,
-        "sizes":              sizes_dict,
-        "temp_data":          {},
+        "sizes":               sizes_dict,
+        "temp_data":           {},
     })
 
     brand_names = [BRANDS.get(b, b) for b in brands]
@@ -253,17 +257,17 @@ def complete_setup(chat_id, user, size_text):
         f"<b>Brands:</b> {', '.join(brand_names)}\n"
         f"<b>Categories:</b> {', '.join(cat_names)}\n"
         f"<b>Size:</b> {size_label}\n\n"
-        "Khabar checks for deals every 30 minutes. The moment a qualifying "
-        "discount appears, you'll get an alert instantly.\n\n"
-        "Use /settings to update your preferences anytime."
+        "Khabar checks for deals every 30 minutes. The moment something matching "
+        "your preferences goes on sale, you'll get an instant alert.\n\n"
+        "Use /settings anytime to update your preferences."
     )
     send(chat_id, text)
 
-# ── Update router ─────────────────────────────────────
+# ── Update router ──────────────────────────────────────
 
 def process_update(update):
 
-    # ── Button tap ──
+    # Button tap
     if "callback_query" in update:
         cq         = update["callback_query"]
         chat_id    = cq["from"]["id"]
@@ -278,27 +282,24 @@ def process_update(update):
             show_brand_selection(chat_id, user, message_id)
 
         elif data.startswith("brand_"):
-            brand   = data[6:]
-            temp    = user.get("temp_data") or {}
-            sel     = list(temp.get("selected_brands", []))
-            tier    = user.get("tier", "free")
-            limit   = FREE_BRAND_LIMIT if tier == "free" else len(BRANDS)
-
+            brand = data[6:]
+            temp  = user.get("temp_data") or {}
+            sel   = list(temp.get("selected_brands", []))
+            tier  = user.get("tier", "free")
+            limit = FREE_BRAND_LIMIT if tier == "free" else len(BRANDS)
             if brand in sel:
                 sel.remove(brand)
             elif len(sel) < limit:
                 sel.append(brand)
-
             temp["selected_brands"] = sel
             update_user(chat_id, {"temp_data": temp})
-            user = get_user(chat_id)
-
+            user    = get_user(chat_id)
+            sel_now = (user.get("temp_data") or {}).get("selected_brands", [])
             text = (
                 "<b>Step 1 of 3 — Choose brands</b>\n\n"
                 f"Free plan: pick up to <b>{limit} brands</b>.\n"
                 "Upgrade to monitor all 5 brands."
             )
-            sel_now = (user.get("temp_data") or {}).get("selected_brands", [])
             edit(chat_id, message_id, text, brands_keyboard(sel_now, tier))
 
         elif data == "brands_done":
@@ -319,10 +320,10 @@ def process_update(update):
                 sel.append(cat)
             temp["selected_categories"] = sel
             update_user(chat_id, {"temp_data": temp})
-            user = get_user(chat_id)
-            sel_now = (user.get("temp_data") or {}).get("selected_categories", [])
+            user       = get_user(chat_id)
+            sel_now    = (user.get("temp_data") or {}).get("selected_categories", [])
             sel_brands = (user.get("temp_data") or {}).get("selected_brands", [])
-            names = ", ".join(BRANDS.get(b, b) for b in sel_brands)
+            names      = ", ".join(BRANDS.get(b, b) for b in sel_brands)
             text = (
                 "<b>Step 2 of 3 — Choose categories</b>\n\n"
                 f"Monitoring: <b>{names}</b>\n\n"
@@ -336,7 +337,7 @@ def process_update(update):
 
         return
 
-    # ── Text message ──
+    # Text message
     if "message" not in update:
         return
 
@@ -371,47 +372,17 @@ def process_update(update):
              "Deals arrive automatically when Khabar finds them.")
 
 
-# ── Entry point ───────────────────────────────────────
+# ── Entry point ────────────────────────────────────────
 
 def main():
-    print("🤖 Khabar bot poller starting...")
-    supabase_fresh = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    offset = get_offset()
-    next_offset = offset + 1 if offset else 0
-    print(f"  Fetching updates from offset {next_offset}...")
-
-    resp = tg("getUpdates", {"offset": next_offset, "limit": 100, "timeout": 0})
-    if not resp.get("ok"):
-        print(f"  ⚠️  getUpdates failed: {resp}")
-        return
-
-    updates = resp.get("result", [])
-    print(f"  {len(updates)} update(s) to process.")
-
-    for upd in updates:
-        try:
-            process_update(upd)
-        except Exception as e:
-            print(f"  ❌ Error on update {upd.get('update_id')}: {e}")
-        save_offset(upd["update_id"])
-
-    print("  ✅ Done.")
-
-if __name__ == "__main__":
-    def main():
-    import time
     print("🤖 Khabar bot starting (long-poll mode)...")
 
-    offset = get_offset()
+    offset      = get_offset()
     next_offset = offset + 1 if offset else 0
     print(f"  Listening from offset {next_offset}. Waiting for messages...")
 
     while True:
         try:
-            # timeout=25 means: hold connection open 25 sec waiting for updates.
-            # If a message arrives before that, return immediately.
-            # This gives users sub-3-second response times.
             resp = tg("getUpdates", {
                 "offset":  next_offset,
                 "limit":   100,
@@ -429,7 +400,7 @@ if __name__ == "__main__":
                 try:
                     process_update(upd)
                 except Exception as e:
-                    print(f"  ❌ Error processing update {upd.get('update_id')}: {e}")
+                    print(f"  ❌ Error on update {upd.get('update_id')}: {e}")
                 next_offset = upd["update_id"] + 1
                 save_offset(upd["update_id"])
 
