@@ -26,4 +26,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
