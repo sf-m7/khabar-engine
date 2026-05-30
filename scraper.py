@@ -153,18 +153,15 @@ def load_last_prices(supabase, brand_name):
 
 # ── Layer 2: Daily snapshot UPSERT ────────────────────
 
-def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today):
+def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert):
     """
     Writes today's price snapshot to the intelligence warehouse.
 
-    If all variants share the same price (most common for Egyptian fashion brands):
-    → one product-level row (variant_id = NULL)
+    use_insert=True  → first run of the day, no rows exist yet → INSERT
+    use_insert=False → subsequent runs today, rows exist → UPDATE
 
-    If variants have different prices (e.g. size-specific liquidation):
-    → one variant-level row per variant (product_id = NULL)
-
-    Running this 48 times per day on the same product still produces
-    exactly ONE row per day, because of the UPSERT + partial unique index.
+    This avoids ON CONFLICT entirely, which PostgREST cannot reliably
+    handle with partial indexes or generated columns.
     """
     if not variant_records:
         return
@@ -172,10 +169,10 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today)
     prices = [v["price"] for v in variant_records]
 
     if len(set(prices)) == 1:
-        # ── Uniform pricing → product-level snapshot ──
+        # ── Uniform pricing → one product-level snapshot ──
         vd = variant_records[0]
-        supabase.table("price_snapshots").upsert(
-            {
+        if use_insert:
+            supabase.table("price_snapshots").insert({
                 "product_id":       db_product_id,
                 "variant_id":       None,
                 "brand":            brand_name,
@@ -184,17 +181,24 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today)
                 "discount_pct":     vd["discount_pct"],
                 "snapshot_date":    str(today),
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
-            },
-            on_conflict="product_id,snapshot_date",
-        ).execute()
+            }).execute()
+        else:
+            supabase.table("price_snapshots").update({
+                "price":            vd["price"],
+                "compare_at_price": vd["compare_at"],
+                "discount_pct":     vd["discount_pct"],
+                "recorded_at":      datetime.now(timezone.utc).isoformat(),
+            }).eq("product_id", db_product_id) \
+              .eq("snapshot_date", str(today)) \
+              .execute()
     else:
-        # ── Heterogeneous pricing → variant-level snapshots ──
+        # ── Heterogeneous pricing → one snapshot per variant ──
         for vd in variant_records:
             vid = vd.get("variant_db_id")
             if not vid:
                 continue
-            supabase.table("price_snapshots").upsert(
-                {
+            if use_insert:
+                supabase.table("price_snapshots").insert({
                     "product_id":       None,
                     "variant_id":       vid,
                     "brand":            brand_name,
@@ -203,9 +207,16 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today)
                     "discount_pct":     vd["discount_pct"],
                     "snapshot_date":    str(today),
                     "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                },
-                on_conflict="variant_id,snapshot_date",
-            ).execute()
+                }).execute()
+            else:
+                supabase.table("price_snapshots").update({
+                    "price":            vd["price"],
+                    "compare_at_price": vd["compare_at"],
+                    "discount_pct":     vd["discount_pct"],
+                    "recorded_at":      datetime.now(timezone.utc).isoformat(),
+                }).eq("variant_id", vid) \
+                  .eq("snapshot_date", str(today)) \
+                  .execute()
 
 # ── Purge old price_events ─────────────────────────────
 
@@ -235,9 +246,16 @@ def scrape_brand(brand_name, domain):
         return 0
 
     last_prices   = load_last_prices(supabase, brand_name)
-    products_seen = 0
-    price_changes = 0
-    page          = 1
+    # One query to decide snapshot strategy for this entire brand run.
+    # INSERT on first run of day (no rows yet), UPDATE on subsequent runs.
+    check = supabase.table("price_snapshots") \
+        .select("id") \
+        .eq("brand", brand_name) \
+        .eq("snapshot_date", str(today)) \
+        .limit(1) \
+        .execute()
+    use_insert = len(check.data) == 0
+    print(f"  Snapshot strategy: {'INSERT — first run today' if use_insert else 'UPDATE — already ran today'}")
 
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
@@ -355,8 +373,8 @@ def scrape_brand(brand_name, domain):
             main_compare     = variant_records[0]["compare_at"]
             main_discount    = variant_records[0]["discount_pct"]
 
-            # ── Layer 2: UPSERT today's snapshot ──
-            upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today)
+            # ── Layer 2: write today's snapshot ──
+            upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert)
 
             # ── Layer 1: Record price change event if price changed ──
             last_price = last_prices.get(db_product_id)
