@@ -257,6 +257,11 @@ def scrape_brand(brand_name, domain):
     use_insert = len(check.data) == 0
     print(f"  Snapshot strategy: {'INSERT — first run today' if use_insert else 'UPDATE — already ran today'}")
 
+    # Initialize tracking metrics and pagination counters
+    products_seen = 0
+    price_changes = 0
+    page          = 1
+
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
         print(f"  Fetching page {page}...", end=" ")
