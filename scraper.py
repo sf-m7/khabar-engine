@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v4
-# Two-layer data architecture:
-#   Layer 1: price_events  → real-time alerts (30-day rolling, then purged)
-#   Layer 2: price_snapshots → B2B intelligence warehouse (permanent, 1 row/product/day)
+# KHABAR — Scraper v5 (Enterprise Batch Edition)
+# Decoupled Dual-Layer Pipeline:
+#   Layer 1: price_events   → Volatile real-time alerts (Purged >30 days)
+#   Layer 2: price_snapshots → B2B Market Intelligence (Permanent, 1 row/day/target)
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -65,23 +65,18 @@ def normalize_gender(tags, product_type, title):
     return "unisex"
 
 def looks_like_size(value):
-    """Returns True if this variant option looks like a clothing/shoe size."""
     if not value:
         return False
     v = value.strip().lower()
     if v in SIZE_KEYWORDS:
         return True
-    if v.isdigit() and 20 <= int(v) <= 50:   # waist sizes (26–40) and shoe sizes
+    if v.isdigit() and 20 <= int(v) <= 50:
         return True
-    if "/" in v:                               # "28/30" style
+    if "/" in v:
         return True
     return False
 
 def detect_options(variants):
-    """
-    Determines which Shopify option holds sizes and which holds colors.
-    Returns (size_key, color_key) — color_key may be None.
-    """
     sample = variants[:8]
     opt1 = [v.get("option1", "") for v in sample]
     opt2 = [v.get("option2", "") for v in sample]
@@ -108,26 +103,9 @@ def check_domain(domain):
         print(f"  ✗ Domain check failed: {e}")
         return False
 
-# ── Layer 1: Load existing prices for change detection ──
+# ── Layer 1: Load baseline configurations ─────────────
 
 def load_last_prices(supabase, brand_name):
-    """
-    Loads the last known price per product from price_snapshots — not price_events.
-
-    Why: price_events is a history log that can have many rows per product.
-    Querying it hits PostgREST's 1,000-row default limit, meaning products
-    beyond the first 1,000 are treated as "never seen" every single run,
-    generating thousands of false price change events.
-
-    price_snapshots has exactly ONE row per product per day. No cap problem.
-
-    Logic:
-    - Check today's snapshots first (handles intraday comparisons: run 2,3,4...)
-    - Fall back to yesterday's snapshots (handles first run of the day)
-    - If neither exists (fresh start after truncate): return empty dict.
-      All products will be treated as new, baseline gets written,
-      no alerts fire (direction=None for first-seen products).
-    """
     today     = str(date.today())
     yesterday = str(date.today() - timedelta(days=1))
 
@@ -151,25 +129,15 @@ def load_last_prices(supabase, brand_name):
     print("  No snapshots found — first run, building baseline.")
     return {}
 
-# ── Layer 2: Daily snapshot UPSERT ────────────────────
+# ── Layer 2: Pipeline Snapshot Delivery ───────────────
 
 def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert):
-    """
-    Writes today's price snapshot to the intelligence warehouse.
-
-    use_insert=True  → first run of the day, no rows exist yet → INSERT
-    use_insert=False → subsequent runs today, rows exist → UPDATE
-
-    This avoids ON CONFLICT entirely, which PostgREST cannot reliably
-    handle with partial indexes or generated columns.
-    """
     if not variant_records:
         return
 
     prices = [v["price"] for v in variant_records]
 
     if len(set(prices)) == 1:
-        # ── Uniform pricing → one product-level snapshot ──
         vd = variant_records[0]
         if use_insert:
             supabase.table("price_snapshots").insert({
@@ -188,11 +156,8 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
                 "compare_at_price": vd["compare_at"],
                 "discount_pct":     vd["discount_pct"],
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
-            }).eq("product_id", db_product_id) \
-              .eq("snapshot_date", str(today)) \
-              .execute()
+            }).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
     else:
-        # ── Heterogeneous pricing → one snapshot per variant ──
         for vd in variant_records:
             vid = vd.get("variant_db_id")
             if not vid:
@@ -214,26 +179,16 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
                     "compare_at_price": vd["compare_at"],
                     "discount_pct":     vd["discount_pct"],
                     "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                }).eq("variant_id", vid) \
-                  .eq("snapshot_date", str(today)) \
-                  .execute()
-
-# ── Purge old price_events ─────────────────────────────
+                }).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
 
 def purge_old_events(supabase):
-    """
-    Deletes price_events older than 30 days.
-    These rows have already triggered their alerts and are no longer needed.
-    The intelligence warehouse (price_snapshots) holds the permanent record.
-    """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     supabase.table("price_events").delete().lt("recorded_at", cutoff).execute()
     print("  🧹 Purged price_events older than 30 days.")
 
-# ── Main scrape function ───────────────────────────────
+# ── Main Ingestion Engine (Batch Engine) ──────────────
 
 def scrape_brand(brand_name, domain):
-    # Fresh Supabase connection per brand (avoids HTTP/2 session limit)
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     today    = date.today()
 
@@ -245,9 +200,8 @@ def scrape_brand(brand_name, domain):
         print("  ⚠️  Skipping — domain unreachable.")
         return 0
 
-    last_prices   = load_last_prices(supabase, brand_name)
-    # One query to decide snapshot strategy for this entire brand run.
-    # INSERT on first run of day (no rows yet), UPDATE on subsequent runs.
+    last_prices = load_last_prices(supabase, brand_name)
+    
     check = supabase.table("price_snapshots") \
         .select("id") \
         .eq("brand", brand_name) \
@@ -257,7 +211,6 @@ def scrape_brand(brand_name, domain):
     use_insert = len(check.data) == 0
     print(f"  Snapshot strategy: {'INSERT — first run today' if use_insert else 'UPDATE — already ran today'}")
 
-    # Initialize tracking metrics and pagination counters
     products_seen = 0
     price_changes = 0
     page          = 1
@@ -287,6 +240,8 @@ def scrape_brand(brand_name, domain):
 
         print(f"{len(products)} products.")
 
+        # ─── BATCH STAGE 1: Collect & Upsert Products ───
+        batch_products_payload = []
         for product in products:
             shopify_variants = product.get("variants", [])
             if not shopify_variants:
@@ -298,111 +253,122 @@ def scrape_brand(brand_name, domain):
             handle       = product.get("handle", "")
             images       = product.get("images", [])
 
-            # Detect which Shopify option holds sizes vs colors
+            batch_products_payload.append({
+                "brand":               brand_name,
+                "external_id":         str(product["id"]),
+                "name":                title,
+                "category_raw":        product_type or "",
+                "category_normalized": normalize_category(f"{title} {product_type}"),
+                "gender":              normalize_gender(tags, product_type, title),
+                "sizes_available":     [],
+                "url":                 f"https://{domain}/products/{handle}",
+                "image_url":           images[0]["src"] if images else None,
+                "last_seen_at":        datetime.now(timezone.utc).isoformat(),
+                "is_active":           True,
+            })
+
+        if not batch_products_payload:
+            page += 1
+            continue
+
+        products_upsert_result = (
+            supabase.table("products")
+            .upsert(batch_products_payload, on_conflict="brand,external_id")
+            .execute()
+        )
+        
+        product_id_map = {row["external_id"]: row["id"] for row in products_upsert_result.data}
+        products_seen += len(batch_products_payload)
+
+        # ─── BATCH STAGE 2: Collect & Upsert Variants ───
+        batch_variants_payload = []
+        product_variant_tracking = {}
+
+        for product in products:
+            ext_id = str(product["id"])
+            db_product_id = product_id_map.get(ext_id)
+            if not db_product_id:
+                continue
+
+            shopify_variants = product.get("variants", [])
             size_key, color_key = detect_options(shopify_variants)
-
-            # ── Upsert product catalog record ──
-            upsert_result = (
-                supabase.table("products")
-                .upsert(
-                    {
-                        "brand":               brand_name,
-                        "external_id":         str(product["id"]),
-                        "name":                title,
-                        "category_raw":        product_type or "",
-                        "category_normalized": normalize_category(f"{title} {product_type}"),
-                        "gender":              normalize_gender(tags, product_type, title),
-                        "sizes_available":     [],  # deprecated; variants table is now the source
-                        "url":                 f"https://{domain}/products/{handle}",
-                        "image_url":           images[0]["src"] if images else None,
-                        "last_seen_at":        datetime.now(timezone.utc).isoformat(),
-                        "is_active":           True,
-                    },
-                    on_conflict="brand,external_id",
-                )
-                .execute()
-            )
-            db_product_id = upsert_result.data[0]["id"]
-            products_seen += 1
-
-            # ── Upsert variants + build variant_records for snapshot ──
-            variant_records = []
+            product_variant_tracking[db_product_id] = []
 
             for v in shopify_variants:
                 size  = (v.get(size_key) or "").strip()
                 color = (v.get(color_key) or "").strip() if color_key else None
-
-                if not size or size.lower() == "default title":
+                if not size or size.lower() == "default title": 
                     size = None
-
+                
                 price       = float(v.get("price") or 0)
                 compare_raw = v.get("compare_at_price")
                 compare_at  = float(compare_raw) if compare_raw else None
                 available   = bool(v.get("available"))
 
-                if price == 0:
+                if price == 0: 
                     continue
 
                 discount_pct = None
                 if compare_at and compare_at > price:
                     discount_pct = round((compare_at - price) / compare_at * 100, 2)
 
-                # Upsert this variant into the catalog
                 external_sku = f"{domain}_{v['id']}"
-                vr = supabase.table("product_variants").upsert(
-                    {
-                        "product_id":      db_product_id,
-                        "external_sku":    external_sku,
-                        "color":           color or None,
-                        "size":            size or None,
-                        "is_in_stock":     available,
-                        "last_updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    on_conflict="external_sku",
-                ).execute()
-
-                variant_db_id = vr.data[0]["id"] if vr.data else None
-
-                variant_records.append({
-                    "variant_db_id": variant_db_id,
-                    "price":         price,
-                    "compare_at":    compare_at,
-                    "discount_pct":  discount_pct,
+                
+                batch_variants_payload.append({
+                    "product_id":      db_product_id,
+                    "external_sku":    external_sku,
+                    "color":           color or None,
+                    "size":            size or None,
+                    "is_in_stock":     available,
+                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                    # Internal metadata hooks
+                    "_meta_price":        price,
+                    "_meta_compare":      compare_at,
+                    "_meta_discount":     discount_pct,
+                    "_meta_shopify_v":    v
                 })
 
-            if not variant_records:
-                continue
+        if batch_variants_payload:
+            db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants_payload]
+            variants_upsert_result = supabase.table("product_variants").upsert(db_payload, on_conflict="external_sku").execute()
+            
+            variant_sku_to_id = {row["external_sku"]: row["id"] for row in variants_upsert_result.data}
+            for var_rec in batch_variants_payload:
+                var_rec["variant_db_id"] = variant_sku_to_id.get(var_rec["external_sku"])
 
-            # Representative price = first variant (uniform in 95%+ of cases)
-            main_price       = variant_records[0]["price"]
-            main_compare     = variant_records[0]["compare_at"]
-            main_discount    = variant_records[0]["discount_pct"]
+            # ─── BATCH STAGE 3: Structural Layer Evaluation ───
+            for var_rec in batch_variants_payload:
+                p_id = var_rec["product_id"]
+                product_variant_tracking[p_id].append(var_rec)
 
-            # ── Layer 2: write today's snapshot ──
-            upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert)
+            for db_product_id, variant_records in product_variant_tracking.items():
+                if not variant_records: 
+                    continue
+                
+                upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert)
+                
+                main_price    = variant_records[0]["_meta_price"]
+                main_compare  = variant_records[0]["_meta_compare"]
+                main_discount = variant_records[0]["_meta_discount"]
+                last_price    = last_prices.get(db_product_id)
+                
+                if last_price is None or abs(last_price - main_price) > 0.01:
+                    direction = None
+                    if last_price is not None:
+                        direction = "down" if main_price < last_price else "up"
+                        price_changes += 1
+                        for p in products:
+                            if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
+                                log_title = p.get("title", "")
+                                print(f"  💰 {log_title[:35]}: {last_price} → {main_price} EGP [{direction}]")
+                                break
 
-            # ── Layer 1: Record price change event if price changed ──
-            last_price = last_prices.get(db_product_id)
+                    sizes_in_stock = [
+                        v.get(size_key, "") for v in [r["_meta_shopify_v"] for r in variant_records]
+                        if v.get("available") and v.get(size_key)
+                    ]
 
-            if last_price is None or abs(last_price - main_price) > 0.01:
-                direction = None
-                if last_price is not None:
-                    direction = "down" if main_price < last_price else "up"
-                    price_changes += 1
-                    print(
-                        f"  💰 {title[:40]}: {last_price} → {main_price} EGP "
-                        f"[{direction}]"
-                        + (f" ({main_discount}% off)" if main_discount else "")
-                    )
-
-                # In-stock sizes for this change event
-                sizes_in_stock = [
-                    v.get(size_key, "") for v in shopify_variants
-                    if v.get("available") and v.get(size_key)
-                ]
-
-                supabase.table("price_events").insert(
-                    {
+                    supabase.table("price_events").insert({
                         "product_id":       db_product_id,
                         "brand":            brand_name,
                         "price_before":     last_price,
@@ -412,26 +378,17 @@ def scrape_brand(brand_name, domain):
                         "direction":        direction,
                         "sizes_in_stock":   sizes_in_stock,
                         "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                    }
-                ).execute()
+                    }).execute()
 
-                last_prices[db_product_id] = main_price
+                    last_prices[db_product_id] = main_price
 
         page += 1
 
-    print(
-        f"\n  ✅ {brand_name}: {products_seen} products scanned, "
-        f"{price_changes} price changes recorded."
-    )
+    print(f"\n  ✅ {brand_name}: {products_seen} products scanned, {price_changes} price changes recorded.")
     return price_changes
-
-
-# ── Entry point ────────────────────────────────────────
 
 if __name__ == "__main__":
     print("🚀 Khabar scraper starting...")
-
-    # Housekeeping: purge stale alert-layer data at the start of each run
     _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     purge_old_events(_sb)
 
