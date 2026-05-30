@@ -112,23 +112,44 @@ def check_domain(domain):
 
 def load_last_prices(supabase, brand_name):
     """
-    Loads the most recent recorded price per product in one query.
-    Used to detect whether a price has changed since the last scrape.
+    Loads the last known price per product from price_snapshots — not price_events.
+
+    Why: price_events is a history log that can have many rows per product.
+    Querying it hits PostgREST's 1,000-row default limit, meaning products
+    beyond the first 1,000 are treated as "never seen" every single run,
+    generating thousands of false price change events.
+
+    price_snapshots has exactly ONE row per product per day. No cap problem.
+
+    Logic:
+    - Check today's snapshots first (handles intraday comparisons: run 2,3,4...)
+    - Fall back to yesterday's snapshots (handles first run of the day)
+    - If neither exists (fresh start after truncate): return empty dict.
+      All products will be treated as new, baseline gets written,
+      no alerts fire (direction=None for first-seen products).
     """
-    result = (
-        supabase.table("price_events")
-        .select("product_id, price_after, recorded_at")
-        .eq("brand", brand_name)
-        .order("recorded_at", desc=True)
-        .limit(5000)
-        .execute()
-    )
-    prices = {}
-    for row in result.data:
-        pid = row["product_id"]
-        if pid not in prices:
-            prices[pid] = float(row["price_after"])
-    return prices
+    today     = str(date.today())
+    yesterday = str(date.today() - timedelta(days=1))
+
+    for target_date in [today, yesterday]:
+        result = (
+            supabase.table("price_snapshots")
+            .select("product_id, price")
+            .eq("brand", brand_name)
+            .eq("snapshot_date", target_date)
+            .execute()
+        )
+        if result.data:
+            prices = {}
+            for row in result.data:
+                pid = row.get("product_id")
+                if pid:
+                    prices[pid] = float(row["price"])
+            print(f"  Loaded {len(prices)} price baselines from snapshots ({target_date}).")
+            return prices
+
+    print("  No snapshots found — first run, building baseline.")
+    return {}
 
 # ── Layer 2: Daily snapshot UPSERT ────────────────────
 
