@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v5 (Enterprise Batch Edition)
+# KHABAR — Scraper v5 (Enterprise Batch Edition - Hotfix 1)
 # Decoupled Dual-Layer Pipeline:
 #   Layer 1: price_events   → Volatile real-time alerts (Purged >30 days)
 #   Layer 2: price_snapshots → B2B Market Intelligence (Permanent, 1 row/day/target)
@@ -135,7 +135,8 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
     if not variant_records:
         return
 
-    prices = [v["price"] for v in variant_records]
+    # Updated mappings use the clean _meta_ prefix variables from the memory batch arrays
+    prices = [v["_meta_price"] for v in variant_records]
 
     if len(set(prices)) == 1:
         vd = variant_records[0]
@@ -144,17 +145,17 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
                 "product_id":       db_product_id,
                 "variant_id":       None,
                 "brand":            brand_name,
-                "price":            vd["price"],
-                "compare_at_price": vd["compare_at"],
-                "discount_pct":     vd["discount_pct"],
+                "price":            vd["_meta_price"],
+                "compare_at_price": vd["_meta_compare"],
+                "discount_pct":     vd["_meta_discount"],
                 "snapshot_date":    str(today),
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
             }).execute()
         else:
             supabase.table("price_snapshots").update({
-                "price":            vd["price"],
-                "compare_at_price": vd["compare_at"],
-                "discount_pct":     vd["discount_pct"],
+                "price":            vd["_meta_price"],
+                "compare_at_price": vd["_meta_compare"],
+                "discount_pct":     vd["_meta_discount"],
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
             }).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
     else:
@@ -167,17 +168,17 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
                     "product_id":       None,
                     "variant_id":       vid,
                     "brand":            brand_name,
-                    "price":            vd["price"],
-                    "compare_at_price": vd["compare_at"],
-                    "discount_pct":     vd["discount_pct"],
+                    "price":            vd["_meta_price"],
+                    "compare_at_price": vd["_meta_compare"],
+                    "discount_pct":     vd["_meta_discount"],
                     "snapshot_date":    str(today),
                     "recorded_at":      datetime.now(timezone.utc).isoformat(),
                 }).execute()
             else:
                 supabase.table("price_snapshots").update({
-                    "price":            vd["price"],
-                    "compare_at_price": vd["compare_at"],
-                    "discount_pct":     vd["discount_pct"],
+                    "price":            vd["_meta_price"],
+                    "compare_at_price": vd["_meta_compare"],
+                    "discount_pct":     vd["_meta_discount"],
                     "recorded_at":      datetime.now(timezone.utc).isoformat(),
                 }).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
 
@@ -321,7 +322,7 @@ def scrape_brand(brand_name, domain):
                     "size":            size or None,
                     "is_in_stock":     available,
                     "last_updated_at": datetime.now(timezone.utc).isoformat(),
-                    # Internal metadata hooks
+                    # Internal configuration metadata properties
                     "_meta_price":        price,
                     "_meta_compare":      compare_at,
                     "_meta_discount":     discount_pct,
