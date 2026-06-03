@@ -22,9 +22,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Random startup delay
+        run: |
+          DELAY=$((RANDOM % 900 + 60))
+          echo "Sleeping ${DELAY}s before scraping..."
+          sleep $DELAY
+
       - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
