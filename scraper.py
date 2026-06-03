@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v5 (Enterprise Batch Edition - Hotfix 1)
-# Decoupled Dual-Layer Pipeline:
-#   Layer 1: price_events   → Volatile real-time alerts (Purged >30 days)
-#   Layer 2: price_snapshots → B2B Market Intelligence (Permanent, 1 row/day/target)
+# KHABAR — Scraper v6 (Enterprise Transition Core)
+# Adds: Variant-Level Baseline, Automated Stockout/Restock,
+#        Inversion Guardrails, Optimized Alert Ingestion,
+#        365-Day Snapshot Purge Cycles
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -13,8 +13,10 @@ from datetime import datetime, timezone, timedelta, date
 
 sys.stdout.reconfigure(line_buffering=True)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+SUPABASE_URL       = os.environ["SUPABASE_URL"]
+SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 BRANDS = [
     {"name": "town_team",  "domain": "www.townteam.com"},
@@ -23,6 +25,14 @@ BRANDS = [
     {"name": "tree",       "domain": "tree-stores.com"},
     {"name": "dott_jeans", "domain": "dottjeans.com"},
 ]
+
+BRAND_DISPLAY = {
+    "town_team":  "Town Team",
+    "ravin":      "Ravin",
+    "mens_club":  "Men's Club",
+    "tree":       "Tree",
+    "dott_jeans": "Dott Jeans",
+}
 
 CATEGORY_MAP = {
     "tops":        ["shirt", "t-shirt", "tee", "blouse", "top", "polo",
@@ -103,7 +113,81 @@ def check_domain(domain):
         print(f"  ✗ Domain check failed: {e}")
         return False
 
-# ── Layer 1: Load baseline configurations ─────────────
+# ── Optimized Alert delivery ──────────────────────────
+
+def send_telegram(chat_id, text):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"  ⚠️  Telegram send failed for {chat_id}: {e}")
+
+def find_and_alert_users(supabase, brand, category, variant_size,
+                          current_price, discount_pct, product_name, product_url,
+                          variant_baseline):
+    """
+    OPTIMIZED RELATIONAL ALERT DISPATCHER
+    Finds and notifies users matching Brand + Category + Size in a single relational database pass.
+    """
+    if not TELEGRAM_BOT_TOKEN or not variant_baseline:
+        return
+
+    if current_price >= variant_baseline:
+        return
+
+    try:
+        matches = (
+            supabase.table("user_sizes")
+            .select("user_id, users!inner(telegram_id, conversation_state, price_ceiling)")
+            .eq("category", category)
+            .eq("size", variant_size)
+            .execute()
+        )
+        if not matches.data:
+            return
+
+        for row in matches.data:
+            user_info = row.get("users")
+            if not user_info or user_info.get("conversation_state") != "active":
+                continue
+
+            uid = user_info["telegram_id"]
+            ceiling = user_info.get("price_ceiling")
+            if ceiling and current_price > float(ceiling):
+                continue
+
+            brand_check = (
+                supabase.table("user_brands")
+                .select("user_id")
+                .eq("user_id", uid)
+                .eq("brand", brand)
+                .execute()
+            )
+            if not brand_check.data:
+                continue
+
+            honest_discount = round(((variant_baseline - current_price) / variant_baseline) * 100)
+
+            alert = (
+                f"🔥 <b>Deal Alert — {BRAND_DISPLAY.get(brand, brand)}</b>\n\n"
+                f"<b>{product_name}</b>\n"
+                f"Size: <b>{variant_size}</b>\n"
+                f"Was: <s>{int(variant_baseline)} EGP</s>  →  "
+                f"<b>Now: {int(current_price)} EGP</b>\n"
+                f"<b>{honest_discount}% OFF (True Discount)</b>\n\n"
+                f"👉 <a href='{product_url}'>Shop now</a>"
+            )
+            send_telegram(uid, alert)
+
+    except Exception as e:
+        print(f"  ⚠️  Optimized alert system error: {e}")
+
+# ── Layer 1: Load snapshot baselines ──────────────────
 
 def load_last_prices(supabase, brand_name):
     today     = str(date.today())
@@ -135,27 +219,27 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
     if not variant_records:
         return
 
-    # Updated mappings use the clean _meta_ prefix variables from the memory batch arrays
     prices = [v["_meta_price"] for v in variant_records]
 
     if len(set(prices)) == 1:
         vd = variant_records[0]
+        row = {
+            "product_id":       db_product_id,
+            "variant_id":       None,
+            "brand":            brand_name,
+            "price":            vd["_meta_price"],
+            "compare_at_price": vd["_meta_compare"],
+            "discount_pct":     vd["_meta_discount_honest"],
+            "snapshot_date":    str(today),
+            "recorded_at":      datetime.now(timezone.utc).isoformat(),
+        }
         if use_insert:
-            supabase.table("price_snapshots").insert({
-                "product_id":       db_product_id,
-                "variant_id":       None,
-                "brand":            brand_name,
-                "price":            vd["_meta_price"],
-                "compare_at_price": vd["_meta_compare"],
-                "discount_pct":     vd["_meta_discount"],
-                "snapshot_date":    str(today),
-                "recorded_at":      datetime.now(timezone.utc).isoformat(),
-            }).execute()
+            supabase.table("price_snapshots").insert(row).execute()
         else:
             supabase.table("price_snapshots").update({
                 "price":            vd["_meta_price"],
                 "compare_at_price": vd["_meta_compare"],
-                "discount_pct":     vd["_meta_discount"],
+                "discount_pct":     vd["_meta_discount_honest"],
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
             }).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
     else:
@@ -163,29 +247,63 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
             vid = vd.get("variant_db_id")
             if not vid:
                 continue
+            row = {
+                "product_id":       None,
+                "variant_id":       vid,
+                "brand":            brand_name,
+                "price":            vd["_meta_price"],
+                "compare_at_price": vd["_meta_compare"],
+                "discount_pct":     vd["_meta_discount_honest"],
+                "snapshot_date":    str(today),
+                "recorded_at":      datetime.now(timezone.utc).isoformat(),
+            }
             if use_insert:
-                supabase.table("price_snapshots").insert({
-                    "product_id":       None,
-                    "variant_id":       vid,
-                    "brand":            brand_name,
-                    "price":            vd["_meta_price"],
-                    "compare_at_price": vd["_meta_compare"],
-                    "discount_pct":     vd["_meta_discount"],
-                    "snapshot_date":    str(today),
-                    "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                }).execute()
+                supabase.table("price_snapshots").insert(row).execute()
             else:
                 supabase.table("price_snapshots").update({
-                    "price":            vd["_meta_price"],
-                    "compare_at_price": vd["_meta_compare"],
-                    "discount_pct":     vd["_meta_discount"],
-                    "recorded_at":      datetime.now(timezone.utc).isoformat(),
+                    "price":         vd["_meta_price"],
+                    "discount_pct":  vd["_meta_discount_honest"],
+                    "recorded_at":   datetime.now(timezone.utc).isoformat(),
                 }).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
 
 def purge_old_events(supabase):
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    supabase.table("price_events").delete().lt("recorded_at", cutoff).execute()
-    print("  🧹 Purged price_events older than 30 days.")
+    cutoff_events    = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    cutoff_snapshots = str(date.today() - timedelta(days=365))
+    supabase.table("price_events").delete().lt("recorded_at", cutoff_events).execute()
+    supabase.table("price_snapshots").delete().lt("snapshot_date", cutoff_snapshots).execute()
+    print("  🧹 Purged price_events > 30 days and price_snapshots > 365 days.")
+
+# ── Stockout transition log ───────────────────────────
+
+def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
+                               size, color, previous_in_stock, current_in_stock,
+                               current_price, variant_baseline):
+    if previous_in_stock == current_in_stock:
+        return
+
+    event_type = "stockout" if (previous_in_stock and not current_in_stock) else "restock"
+
+    discount_pct = None
+    was_on_discount = False
+    if variant_baseline and current_price < variant_baseline:
+        discount_pct = round(((variant_baseline - current_price) / variant_baseline) * 100, 2)
+        was_on_discount = True
+
+    try:
+        supabase.table("stockout_events").insert({
+            "variant_id":            variant_db_id,
+            "product_id":            product_id,
+            "brand":                 brand,
+            "size":                  size,
+            "color":                 color,
+            "event_type":            event_type,
+            "price_at_event":        current_price,
+            "discount_pct_at_event": discount_pct,
+            "was_on_discount":       was_on_discount,
+            "recorded_at":           datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"  ⚠️  Stockout transition tracking failure: {e}")
 
 # ── Main Ingestion Engine (Batch Engine) ──────────────
 
@@ -210,7 +328,14 @@ def scrape_brand(brand_name, domain):
         .limit(1) \
         .execute()
     use_insert = len(check.data) == 0
-    print(f"  Snapshot strategy: {'INSERT — first run today' if use_insert else 'UPDATE — already ran today'}")
+    print(f"  Snapshot strategy: {'INSERT' if use_insert else 'UPDATE'}")
+
+    existing_variants = (
+        supabase.table("product_variants")
+        .select("external_sku, is_in_stock, size, color, first_observed_price")
+        .execute()
+    )
+    prev_stock_state = {row["external_sku"]: row for row in existing_variants.data}
 
     products_seen = 0
     price_changes = 0
@@ -294,6 +419,11 @@ def scrape_brand(brand_name, domain):
             shopify_variants = product.get("variants", [])
             size_key, color_key = detect_options(shopify_variants)
             product_variant_tracking[db_product_id] = []
+            
+            title = product.get("title", "")
+            handle = product.get("handle", "")
+            product_url = f"https://{domain}/products/{handle}"
+            category = normalize_category(f"{title} {product.get('product_type', '')}")
 
             for v in shopify_variants:
                 size  = (v.get(size_key) or "").strip()
@@ -309,24 +439,36 @@ def scrape_brand(brand_name, domain):
                 if price == 0: 
                     continue
 
-                discount_pct = None
-                if compare_at and compare_at > price:
-                    discount_pct = round((compare_at - price) / compare_at * 100, 2)
-
                 external_sku = f"{domain}_{v['id']}"
-                
+                prev = prev_stock_state.get(external_sku)
+
+                # GUARDRAIL AGAINST PRE-DISCOUNTED ITEMS: Lock original anchor floor on first sight
+                if prev and prev.get("first_observed_price"):
+                    v_baseline = float(prev["first_observed_price"])
+                else:
+                    v_baseline = compare_at if (compare_at and compare_at > price) else price
+
+                discount_honest = None
+                if v_baseline and v_baseline > price:
+                    discount_honest = round(((v_baseline - price) / v_baseline) * 100, 2)
+
                 batch_variants_payload.append({
-                    "product_id":      db_product_id,
-                    "external_sku":    external_sku,
-                    "color":           color or None,
-                    "size":            size or None,
-                    "is_in_stock":     available,
-                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
-                    # Internal configuration metadata properties
-                    "_meta_price":        price,
-                    "_meta_compare":      compare_at,
-                    "_meta_discount":     discount_pct,
-                    "_meta_shopify_v":    v
+                    "product_id":           db_product_id,
+                    "external_sku":         external_sku,
+                    "color":                color or None,
+                    "size":                 size or None,
+                    "is_in_stock":          available,
+                    "first_observed_price": v_baseline, # Fixed variant attribute tier
+                    "last_updated_at":      datetime.now(timezone.utc).isoformat(),
+                    
+                    # Internal configuration meta trackers
+                    "_meta_price":           price,
+                    "_meta_compare":         compare_at,
+                    "_meta_discount_honest": discount_honest,
+                    "_meta_baseline":        v_baseline,
+                    "_meta_size":            size,
+                    "_meta_color":           color,
+                    "_meta_available":       available
                 })
 
         if batch_variants_payload:
@@ -348,26 +490,51 @@ def scrape_brand(brand_name, domain):
                 
                 upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert)
                 
-                main_price    = variant_records[0]["_meta_price"]
-                main_compare  = variant_records[0]["_meta_compare"]
-                main_discount = variant_records[0]["_meta_discount"]
-                last_price    = last_prices.get(db_product_id)
+                # Sizing matrix completion tracking parameters
+                sizes_in_stock = [r["_meta_size"] for r in variant_records if r["_meta_available"] and r["_meta_size"]]
+                
+                for rec in variant_records:
+                    prev_v_state = prev_stock_state.get(rec["external_sku"])
+                    if prev_v_state is not None:
+                        detect_and_write_stockout(
+                            supabase,
+                            variant_db_id        = rec["variant_db_id"],
+                            product_id           = db_product_id,
+                            brand                = brand_name,
+                            size                 = rec["_meta_size"],
+                            color                = rec["_meta_color"],
+                            previous_in_stock    = prev_v_state["is_in_stock"],
+                            current_in_stock     = rec["_meta_available"],
+                            current_price        = rec["_meta_price"],
+                            variant_baseline     = rec["_meta_baseline"]
+                        )
+
+                main_price           = variant_records[0]["_meta_price"]
+                main_compare         = variant_records[0]["_meta_compare"]
+                main_discount_honest = variant_records[0]["_meta_discount_honest"]
+                v_baseline           = variant_records[0]["_meta_baseline"]
+                
+                last_price = last_prices.get(db_product_id)
                 
                 if last_price is None or abs(last_price - main_price) > 0.01:
                     direction = None
                     if last_price is not None:
                         direction = "down" if main_price < last_price else "up"
                         price_changes += 1
-                        for p in products:
-                            if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
-                                log_title = p.get("title", "")
-                                print(f"  💰 {log_title[:35]}: {last_price} → {main_price} EGP [{direction}]")
-                                break
-
-                    sizes_in_stock = [
-                        v.get(size_key, "") for v in [r["_meta_shopify_v"] for r in variant_records]
-                        if v.get("available") and v.get(size_key)
-                    ]
+                        
+                        # Process instantaneous downstream user dispatch alerts
+                        if direction == "down" and v_baseline and main_price < v_baseline:
+                            for p in products:
+                                if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
+                                    product_title = p.get("title", "")
+                                    for rec in variant_records:
+                                        if rec["_meta_size"]:
+                                            find_and_alert_users(
+                                                supabase, brand_name, category, rec["_meta_size"],
+                                                main_price, main_discount_honest, product_title, product_url,
+                                                rec["_meta_baseline"]
+                                            )
+                                    break
 
                     supabase.table("price_events").insert({
                         "product_id":       db_product_id,
@@ -375,7 +542,7 @@ def scrape_brand(brand_name, domain):
                         "price_before":     last_price,
                         "price_after":      main_price,
                         "compare_at_price": main_compare,
-                        "discount_pct":     main_discount,
+                        "discount_pct":     main_discount_honest,
                         "direction":        direction,
                         "sizes_in_stock":   sizes_in_stock,
                         "recorded_at":      datetime.now(timezone.utc).isoformat(),
