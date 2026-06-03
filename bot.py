@@ -150,7 +150,6 @@ def format_deals_text(deals):
     for d in deals:
         p     = d.get("products") or {}
         name  = (p.get("name") or "Product")[:38]
-        # Strip emoji from brand name for display
         brand_raw = d.get("brand", "")
         brand = BRANDS.get(brand_raw, brand_raw).split(" ", 1)[-1].upper()
         disc  = int(d.get("discount_pct") or 0)
@@ -186,12 +185,10 @@ def categories_keyboard(selected):
     return rows
 
 def size_keyboard(category):
-    """Builds size buttons for a specific category, 4 per row."""
     sizes = CATEGORY_SIZES.get(category, ["S", "M", "L", "XL"])
     rows, row = [], []
     for size in sizes:
-        # Use pipe separator to safely encode: sz|category|size
-        safe_size = size.replace("/", "-")  # "S/M" → "S-M" for callback safety
+        safe_size = size.replace("/", "-")  # Callback validation split safety map
         row.append({"text": size, "callback_data": f"sz|{category}|{safe_size}"})
         if len(row) == 4:
             rows.append(row)
@@ -246,16 +243,11 @@ def show_category_selection(chat_id, user, message_id):
     update_user(chat_id, {"conversation_state": "setup_categories"})
 
 def show_size_for_category(chat_id, user, message_id):
-    """
-    Shows size buttons for the next pending category.
-    Called once per selected category in sequence.
-    """
     temp        = user.get("temp_data") or {}
     pending     = temp.get("sizes_pending", [])
     all_cats    = temp.get("selected_categories", [])
     collected   = temp.get("sizes_collected", {})
 
-    # If no pending categories, complete setup
     if not pending:
         complete_setup(chat_id, user, message_id)
         return
@@ -274,12 +266,13 @@ def show_size_for_category(chat_id, user, message_id):
     update_user(chat_id, {"conversation_state": "setup_sizes"})
 
 def complete_setup(chat_id, user, message_id=None):
-    """Finalises setup using collected sizes from temp_data."""
+    """Finalizes setup and populates both JSONB arrays and normalized tables cleanly."""
     temp       = user.get("temp_data") or {}
     brands     = temp.get("selected_brands", [])
     categories = temp.get("selected_categories", [])
     sizes_dict = temp.get("sizes_collected", {})
 
+    # Maintain dual-write to core users profile for total system compatibility
     update_user(chat_id, {
         "conversation_state":  "active",
         "brands_monitored":    brands,
@@ -288,26 +281,36 @@ def complete_setup(chat_id, user, message_id=None):
         "temp_data":           {},
     })
 
-    brand_names = [BRANDS.get(b, b) for b in brands]
-    cat_names   = [CATEGORIES.get(c, c) for c in categories] if categories else ["All categories"]
+    try:
+        # RELATIONAL NORMALIZATION LEVEL 1: Write entries to user_brands table
+        for brand in brands:
+            supabase.table("user_brands").upsert(
+                {"user_id": chat_id, "brand": brand},
+                on_conflict="user_id,brand"
+            ).execute()
 
-    # Build sizes summary
-    if sizes_dict:
-        size_lines = "\n".join(
-            f"  • {CATEGORIES.get(c, c)}: {s}"
-            for c, s in sizes_dict.items()
-        )
-    else:
-        size_lines = "  • All sizes"
+        # RELATIONAL NORMALIZATION LEVEL 2: Write entries to user_sizes table
+        for category, size in sizes_dict.items():
+            # Restore standard presentation string values (e.g., "S-M" back to "S/M") safely
+            clean_size = size.replace("-", "/")
+            supabase.table("user_sizes").upsert(
+                {"user_id": chat_id, "category": category, "size": clean_size},
+                on_conflict="user_id,category"
+            ).execute()
+
+    except Exception as e:
+        print(f"  ❌ Relational normalization database write failed: {e}")
+
+    # Build clear UI summary details to print back to the Telegram screen
+    brand_names = [BRANDS.get(b, b) for b in brands]
+    size_lines = "\n".join(f"  • {CATEGORIES.get(c, c)}: {s.replace('-', '/')}" for c, s in sizes_dict.items()) if sizes_dict else "  • All sizes"
 
     text = (
         "✅ <b>You're all set!</b>\n\n"
         f"<b>Brands:</b> {', '.join(brand_names)}\n"
-        f"<b>Categories:</b> {', '.join(cat_names)}\n"
-        f"<b>Sizes:</b>\n{size_lines}\n\n"
-        "Khabar checks for deals every 30 minutes. The moment something matching "
-        "your preferences goes on sale, you'll get an instant alert.\n\n"
-        "Use /settings anytime to update your preferences."
+        f"<b>Sizes Mapped:</b>\n{size_lines}\n\n"
+        "Khabar is now monitoring the landscape. The moment a genuine markdown matches "
+        "your profile settings, you will receive an instant push notification alert."
     )
     send(chat_id, text)
 
@@ -381,121 +384,4 @@ def process_update(update):
                 f"Monitoring: <b>{names}</b>\n\n"
                 "Select categories, or tap Done for everything."
             )
-            edit(chat_id, message_id, text, categories_keyboard(sel_now))
-
-        # ── Categories confirmed → start size flow ──
-        elif data == "cats_done":
-            user = get_user(chat_id)
-            temp = user.get("temp_data") or {}
-            selected_cats = temp.get("selected_categories", [])
-
-            # If no categories selected, use all categories for size prompts
-            cats_to_size = selected_cats if selected_cats else list(CATEGORIES.keys())
-
-            temp["sizes_pending"]   = list(cats_to_size)
-            temp["sizes_collected"] = {}
-            update_user(chat_id, {"temp_data": temp})
-            user = get_user(chat_id)
-            show_size_for_category(chat_id, user, message_id)
-
-        # ── Size selected for a category ──
-        elif data.startswith("sz|"):
-            parts    = data.split("|")          # ["sz", category, size_value]
-            category = parts[1]
-            size_val = parts[2]
-
-            temp      = user.get("temp_data") or {}
-            pending   = list(temp.get("sizes_pending", []))
-            collected = dict(temp.get("sizes_collected", {}))
-
-            # Record size (restore "/" in display values like "S-M" → "S/M")
-            if size_val != "skip":
-                collected[category] = size_val.replace("-", "/")
-
-            # Remove this category from pending
-            if category in pending:
-                pending.remove(category)
-
-            temp["sizes_pending"]   = pending
-            temp["sizes_collected"] = collected
-            update_user(chat_id, {"temp_data": temp})
-            user = get_user(chat_id)
-
-            if pending:
-                show_size_for_category(chat_id, user, message_id)
-            else:
-                complete_setup(chat_id, user, message_id)
-
-        return
-
-    # ── Text message ──
-    if "message" not in update:
-        return
-
-    msg      = update["message"]
-    chat_id  = msg["chat"]["id"]
-    username = msg.get("from", {}).get("username", "")
-    text     = msg.get("text", "").strip()
-    if not text:
-        return
-
-    user = get_user(chat_id)
-
-    if text.startswith("/start"):
-        user = user or create_user(chat_id, username)
-        show_welcome(chat_id, user)
-
-    elif text.startswith("/settings"):
-        user = user or create_user(chat_id, username)
-        update_user(chat_id, {"conversation_state": "new", "temp_data": {}})
-        show_welcome(chat_id, get_user(chat_id))
-
-    elif not user or user.get("conversation_state") in ("new", None):
-        send(chat_id, "Send /start to set up your deal alerts 👋")
-
-    else:
-        send(chat_id,
-             "✅ Your alerts are active!\n\n"
-             "Use /settings to update your preferences.\n"
-             "Deals arrive automatically when Khabar finds them.")
-
-
-# ── Entry point ────────────────────────────────────────
-
-def main():
-    print("🤖 Khabar bot starting (long-poll mode)...")
-
-    offset      = get_offset()
-    next_offset = offset + 1 if offset else 0
-    print(f"  Listening from offset {next_offset}. Waiting for messages...")
-
-    while True:
-        try:
-            resp = tg("getUpdates", {
-                "offset":  next_offset,
-                "limit":   100,
-                "timeout": 25,
-            })
-
-            if not resp.get("ok"):
-                print(f"  ⚠️  getUpdates error: {resp}")
-                time.sleep(5)
-                continue
-
-            updates = resp.get("result", [])
-
-            for upd in updates:
-                try:
-                    process_update(upd)
-                except Exception as e:
-                    print(f"  ❌ Error on update {upd.get('update_id')}: {e}")
-                next_offset = upd["update_id"] + 1
-                save_offset(upd["update_id"])
-
-        except Exception as e:
-            print(f"  ⚠️  Poll loop error: {e}")
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()
+            edit(chat_id, message_id, text, categories_keyboard(sel
