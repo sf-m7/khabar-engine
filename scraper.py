@@ -2,7 +2,7 @@
 # KHABAR — Scraper v9 (Enterprise Resilience Core)
 # Adds: Exponential Backoff, HTTP Adapters, Brand Fault 
 #       Isolation, Transactional Retry Shields, and
-#       Session Cookie Priming.
+#       LC Waikiki ASP.NET MVC Bypassing.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -294,21 +294,22 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt"
+        "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt",
+        "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    # --- THE FIX: GET VISITOR COOKIES FIRST ---
     try:
-        # Hit the front door so the server hands our session an ASP.NET anti-bot cookie
         session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
     except:
-        pass # If this drops, we still try the API anyway
+        pass 
 
-    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId&CategoryTreeId=9&FilteringType=26&Layout=three-column&m_5=10"
+    # THE FIX: Exact messy string from your browser log
+    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId,xhrKeys,CategoryTreeId,FilteringType,xhrKeys&CategoryTreeId=9&FilteringType=26&Layout=three-column&m_5=10"
     
     while True:
         try:
-            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers)
+            # We must pass data="" so requests formats it as a proper POST with a Content-Length
+            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers, data="")
             
             try:
                 data = res.json()
@@ -320,6 +321,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             items = catalog.get("Items") or []
             
             if not items: 
+                # ASP.NET AJAX quirk: Page 1 often returns 0 items intentionally because it expects HTML.
+                if page == 1:
+                    print(f"  ⚠️ LCW returned 0 items on page 1. Skipping to page 2 (ASP.NET AJAX quirk).")
+                    page += 1
+                    continue
+                
                 print(f"  ⚠️ LCW returned 0 items on page {page}. Ending pagination loop.")
                 break
                 
@@ -423,8 +430,6 @@ def scrape_brand(brand_name, domain):
     print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
     
     # ── BRAND ISOLATION ZONE ──
-    # If any catastrophic error occurs in a specific brand's code logic or network,
-    # it is caught here. The script logs it, quarantines the brand, and continues.
     try:
         if not check_domain(session, domain): 
             print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
