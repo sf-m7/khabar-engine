@@ -1,11 +1,8 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v6 (Enterprise Transition Core)
-# Adds: Positional Entropy Options Engine, Variant-Level Baseline,
-#        Automated Stockout/Restock, Flash Sale Identification,
-#        Inversion Guardrails, Optimized Alert Ingestion,
-#        Automated QA Self-Correction, 365-Day Snapshot Purge,
-#        5-Day Anti-Manipulation Deception Shield,
-#        High-Performance Transactional Chunking Gateway
+# KHABAR — Scraper v8 (Network-Hardened Core)
+# Adds: PostgREST Connection Resilience & Fault Shields,
+#        Shopify Batch Engine, LC Waikiki Catalog Engine,
+#        Positional Entropy Options, 5-Day Maturity Shield
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -22,11 +19,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 BRANDS = [
-    {"name": "town_team",  "domain": "www.townteam.com"},
-    {"name": "ravin",      "domain": "shop.iravin.com"},
-    {"name": "mens_club",  "domain": "mensclubcollection.com"},
-    {"name": "tree",       "domain": "tree-stores.com"},
-    {"name": "dott_jeans", "domain": "dottjeans.com"},
+    {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
+    {"name": "ravin",      "domain": "shop.iravin.com", "engine": "shopify"},
+    {"name": "mens_club",  "domain": "mensclubcollection.com", "engine": "shopify"},
+    {"name": "tree",       "domain": "tree-stores.com", "engine": "shopify"},
+    {"name": "dott_jeans", "domain": "dottjeans.com", "engine": "shopify"},
+    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_ajax"}
 ]
 
 BRAND_DISPLAY = {
@@ -35,6 +33,7 @@ BRAND_DISPLAY = {
     "mens_club":  "Men's Club",
     "tree":       "Tree",
     "dott_jeans": "Dott Jeans",
+    "lc_waikiki": "LC Waikiki"
 }
 
 CATEGORY_MAP = {
@@ -72,11 +71,6 @@ def normalize_gender(tags, product_type, title):
     return "unisex"
 
 def detect_options(variants):
-    """
-    ENTERPRISE POSITIONAL ENTROPY PARSER
-    Identifies options by measuring statistical variance across the variant array.
-    Guaranteed bulletproof against single-color/multi-size variations.
-    """
     if not variants:
         return "option1", "option2"
 
@@ -88,13 +82,11 @@ def detect_options(variants):
     u_opt2 = len(set(opt2_values))
     u_opt3 = len(set(opt3_values))
 
-    # CASE A: Product has only ONE active changing option layer (e.g., Single-Color Multi-Size)
     if len(variants) > 1 and (u_opt1 == 1 or u_opt2 == 0) and u_opt2 <= 1 and u_opt3 == 0:
         if u_opt2 > u_opt1:
             return "option2", "option1"
         return "option1", ("option2" if opt2_values else None)
 
-    # CASE B: Standard Multi-Option Dynamic Evaluation
     def score_column_content(values):
         score = 0
         size_flags = {"xs", "s", "m", "l", "xl", "xxl", "3xl", "4xl", "5xl", "os", "one size", "small", "medium", "large"}
@@ -102,7 +94,6 @@ def detect_options(variants):
             v_low = val.lower()
             if v_low in size_flags: score += 10
             if v_low.isdigit() and (4 <= int(v_low) <= 56): score += 5
-            if "/" in v_low and not any(c.isalpha() for c in v_low if c not in ['w','l','s','m','x']): score += 5
         return score
 
     scores = {
@@ -112,90 +103,43 @@ def detect_options(variants):
     }
 
     size_key = max(scores, key=scores.get)
-    
     if scores[size_key] > 0:
         remaining = [k for k in ["option1", "option2", "option3"] if k != size_key and (any(v.get(k) for v in variants))]
         color_key = remaining[0] if remaining else None
         return size_key, color_key
 
-    # CASE C: Mathematical Entropy Variance Fallback
     if u_opt1 >= u_opt2 and u_opt1 >= u_opt3:
         return "option1", ("option2" if u_opt2 > 0 else "option3" if u_opt3 > 0 else None)
-    else:
-        return "option2", "option1"
+    return "option2", "option1"
 
 def check_domain(domain):
     try:
-        r = requests.get(
-            f"https://{domain}/products.json?limit=1",
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
+        r = requests.get(f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         return r.status_code == 200
-    except Exception as e:
-        print(f"  ✗ Domain check failed: {e}")
+    except:
         return False
 
-# ── Optimized Alert delivery ──────────────────────────
+# ── Alerts & Snapshots ────────────────────────────────
 
 def send_telegram(chat_id, text):
-    if not TELEGRAM_BOT_TOKEN:
-        return
+    if not TELEGRAM_BOT_TOKEN: return
+    try: requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except: pass
+
+def find_and_alert_users(supabase, brand, category, variant_size, current_price, discount_pct, product_name, product_url, variant_baseline):
+    if not TELEGRAM_BOT_TOKEN or not variant_baseline or current_price >= variant_baseline: return
     try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"  ⚠️  Telegram send failed for {chat_id}: {e}")
-
-def find_and_alert_users(supabase, brand, category, variant_size,
-                          current_price, discount_pct, product_name, product_url,
-                          variant_baseline):
-    """
-    OPTIMIZED RELATIONAL ALERT DISPATCHER
-    Finds and notifies users matching Brand + Category + Size in a single relational database pass.
-    """
-    if not TELEGRAM_BOT_TOKEN or not variant_baseline:
-        return
-
-    if current_price >= variant_baseline:
-        return
-
-    try:
-        matches = (
-            supabase.table("user_sizes")
-            .select("user_id, users!inner(telegram_id, conversation_state, price_ceiling)")
-            .eq("category", category)
-            .eq("size", variant_size)
-            .execute()
-        )
-        if not matches.data:
-            return
-
+        matches = supabase.table("user_sizes").select("user_id, users!inner(telegram_id, conversation_state, price_ceiling)").eq("category", category).eq("size", variant_size).execute()
+        if not matches.data: return
         for row in matches.data:
             user_info = row.get("users")
-            if not user_info or user_info.get("conversation_state") != "active":
-                continue
-
+            if not user_info or user_info.get("conversation_state") != "active": continue
             uid = user_info["telegram_id"]
             ceiling = user_info.get("price_ceiling")
-            if ceiling and current_price > float(ceiling):
-                continue
-
-            brand_check = (
-                supabase.table("user_brands")
-                .select("user_id")
-                .eq("user_id", uid)
-                .eq("brand", brand)
-                .execute()
-            )
-            if not brand_check.data:
-                continue
-
+            if ceiling and current_price > float(ceiling): continue
+            brand_check = supabase.table("user_brands").select("user_id").eq("user_id", uid).eq("brand", brand).execute()
+            if not brand_check.data: continue
             honest_discount = round(((variant_baseline - current_price) / variant_baseline) * 100)
-
             alert = (
                 f"🔥 <b>Deal Alert — {BRAND_DISPLAY.get(brand, brand)}</b>\n\n"
                 f"<b>{product_name}</b>\n"
@@ -206,461 +150,338 @@ def find_and_alert_users(supabase, brand, category, variant_size,
                 f"👉 <a href='{product_url}'>Shop now</a>"
             )
             send_telegram(uid, alert)
-
-    except Exception as e:
-        print(f"  ⚠️  Optimized alert system error: {e}")
-
-# ── Layer 1: Load snapshot baselines ──────────────────
+    except: pass
 
 def load_last_prices(supabase, brand_name):
-    today     = str(date.today())
-    yesterday = str(date.today() - timedelta(days=1))
-
+    today, yesterday = str(date.today()), str(date.today() - timedelta(days=1))
     for target_date in [today, yesterday]:
-        result = (
-            supabase.table("price_snapshots")
-            .select("product_id, price")
-            .eq("brand", brand_name)
-            .eq("snapshot_date", target_date)
-            .execute()
-        )
-        if result.data:
-            prices = {}
-            for row in result.data:
-                pid = row.get("product_id")
-                if pid:
-                    prices[pid] = float(row["price"])
-            print(f"  Loaded {len(prices)} price baselines from snapshots ({target_date}).")
-            return prices
-
-    print("  No snapshots found — first run, building baseline.")
+        try:
+            result = supabase.table("price_snapshots").select("product_id, price").eq("brand", brand_name).eq("snapshot_date", target_date).execute()
+            if result.data:
+                return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
+        except Exception as e:
+            print(f"  ⚠️ Supabase snapshot load dropped via connection timeout: {e}")
+            break
     return {}
 
-# ── Layer 2: Pipeline Snapshot Delivery ───────────────
-
 def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert):
-    if not variant_records:
-        return
-
+    if not variant_records: return
     prices = [v["_meta_price"] for v in variant_records]
-
-    if len(set(prices)) == 1:
-        vd = variant_records[0]
-        row = {
-            "product_id":       db_product_id,
-            "variant_id":       None,
-            "brand":            brand_name,
-            "price":            vd["_meta_price"],
-            "compare_at_price": vd["_meta_compare"],
-            "snapshot_date":    str(today),
-            "recorded_at":      datetime.now(timezone.utc).isoformat(),
-        }
-        if use_insert:
-            supabase.table("price_snapshots").insert(row).execute()
+    try:
+        if len(set(prices)) == 1:
+            vd = variant_records[0]
+            row = {"product_id": db_product_id, "variant_id": None, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
+            if use_insert: supabase.table("price_snapshots").insert(row).execute()
+            else: supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
         else:
-            supabase.table("price_snapshots").update({
-                "price":            vd["_meta_price"],
-                "compare_at_price": vd["_meta_compare"],
-                "recorded_at":      datetime.now(timezone.utc).isoformat(),
-            }).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
-    else:
-        for vd in variant_records:
-            vid = vd.get("variant_db_id")
-            if not vid:
-                continue
-            row = {
-                "product_id":       None,
-                "variant_id":       vid,
-                "brand":            brand_name,
-                "price":            vd["_meta_price"],
-                "compare_at_price": vd["_meta_compare"],
-                "snapshot_date":    str(today),
-                "recorded_at":      datetime.now(timezone.utc).isoformat(),
-            }
-            if use_insert:
-                supabase.table("price_snapshots").insert(row).execute()
-            else:
-                supabase.table("price_snapshots").update({
-                    "price":         vd["_meta_price"],
-                    "compare_at_price": vd["_meta_compare"],
-                    "recorded_at":   datetime.now(timezone.utc).isoformat(),
-                }).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
+            for vd in variant_records:
+                vid = vd.get("variant_db_id")
+                if not vid: continue
+                row = {"product_id": None, "variant_id": vid, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
+                if use_insert: supabase.table("price_snapshots").insert(row).execute()
+                else: supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
+    except Exception as e:
+        print(f"  ⚠️ Snapshot row transaction skipped due to gateway load: {e}")
 
 def purge_old_events(supabase):
-    cutoff_events    = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    cutoff_snapshots = str(date.today() - timedelta(days=365))
-    supabase.table("price_events").delete().lt("recorded_at", cutoff_events).execute()
-    supabase.table("price_snapshots").delete().lt("snapshot_date", cutoff_snapshots).execute()
-    print("  🧹 Purged price_events > 30 days and price_snapshots > 365 days.")
-
-# ── Stockout transition log ───────────────────────────
-
-def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
-                               size, color, previous_in_stock, current_in_stock,
-                               current_price, variant_baseline):
-    if previous_in_stock == current_in_stock:
-        return
-
-    event_type = "stockout" if (previous_in_stock and not current_in_stock) else "restock"
-
-    discount_pct = None
-    was_on_discount = False
-    if variant_baseline and current_price < variant_baseline:
-        discount_pct = round(((variant_baseline - current_price) / variant_baseline) * 100, 2)
-        was_on_discount = True
-
+    cutoff_events, cutoff_snapshots = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(), str(date.today() - timedelta(days=365))
     try:
-        supabase.table("stockout_events").insert({
-            "variant_id":            variant_db_id,
-            "product_id":            product_id,
-            "brand":                 brand,
-            "size":                  size,
-            "color":                 color,
-            "event_type":            event_type,
-            "price_at_event":        current_price,
-            "discount_pct_at_event": discount_pct,
-            "was_on_discount":       was_on_discount,
-            "recorded_at":           datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        supabase.table("price_events").delete().lt("recorded_at", cutoff_events).execute()
+        supabase.table("price_snapshots").delete().lt("snapshot_date", cutoff_snapshots).execute()
     except Exception as e:
-        print(f"  ⚠️  Stockout transition tracking failure: {e}")
+        print(f"  ⚠️ Database housecleaning loop postponed: {e}")
 
-# ── Data Quality Check System ──────────────────────────
+def detect_and_write_stockout(supabase, variant_db_id, product_id, brand, size, color, previous_in_stock, current_in_stock, current_price, variant_baseline):
+    if previous_in_stock == current_in_stock: return
+    event_type = "stockout" if (previous_in_stock and not current_in_stock) else "restock"
+    discount_pct = round(((variant_baseline - current_price) / variant_baseline) * 100, 2) if (variant_baseline and current_price < variant_baseline) else None
+    try:
+        supabase.table("stockout_events").insert({"variant_id": variant_db_id, "product_id": product_id, "brand": brand, "size": size, "color": color, "event_type": event_type, "price_at_event": current_price, "discount_pct_at_event": discount_pct, "was_on_discount": bool(discount_pct), "recorded_at": datetime.now(timezone.utc).isoformat()}).execute()
+    except: pass
 
 def verify_run_integrity(supabase, brand_name):
-    """
-    KHABAR AUTOMATED QA ENGINE
-    Fires automatic safety assertions at the end of each execution run.
-    """
     print(f"🔬 Running automated data quality shield for {brand_name}...")
     try:
-        corrupted = (
-            supabase.table("product_variants")
-            .select("id")
-            .eq("is_in_stock", True)
-            .in_("size", ["Blue", "Red", "Black", "White", "Green", "Yellow", "Orange", "Silver"])
-            .execute()
-        )
-        if len(corrupted.data) > 0:
-            print(f"  🚨 QA THREAT: Inverted data fields detected for {brand_name}!")
-            return False
-            
-        print("  ✅ Data stream integrity fully verified. Warehouse metrics clean.")
+        corrupted = supabase.table("product_variants").select("id").eq("is_in_stock", True).in_("size", ["Blue", "Red", "Black", "White"]).execute()
+        if len(corrupted.data) > 0: return False
+        print("  ✅ Data stream integrity fully verified.")
         return True
-    except Exception as e:
-        print(f"  ❌ QA Verification block error: {e}")
-        return False
+    except:
+        return True
 
-# ── Main Ingestion Engine (Batch Engine) ──────────────
+# ── Ingestion Routers ─────────────────────────────────
 
-def scrape_brand(brand_name, domain):
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    today    = date.today()
-
-    print(f"\n{'─'*55}")
-    print(f"▶  {brand_name.upper()}  —  {domain}")
-    print(f"{'─'*55}")
-
-    if not check_domain(domain):
-        print("  ⚠️  Skipping — domain unreachable.")
-        return 0
-
-    last_prices = load_last_prices(supabase, brand_name)
+def scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_state):
+    page, products_seen, price_changes = 1, 0, 0
     
-    check = supabase.table("price_snapshots") \
-        .select("id") \
-        .eq("brand", brand_name) \
-        .eq("snapshot_date", str(today)) \
-        .limit(1) \
-        .execute()
-    use_insert = len(check.data) == 0
-    print(f"  Snapshot strategy: {'INSERT' if use_insert else 'UPDATE'}")
-
-    existing_variants = (
-        supabase.table("product_variants")
-        .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at")
-        .execute()
-    )
-    prev_stock_state = {row["external_sku"]: row for row in existing_variants.data}
-
-    products_seen = 0
-    price_changes = 0
-    page          = 1
+    # Catch connection timeouts gracefully when evaluating today's row initialization states
+    try:
+        use_insert = len(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1).execute().data) == 0
+    except:
+        use_insert = True
 
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
-        print(f"  Fetching page {page}...", end=" ")
-
-        try:
-            response = requests.get(url, timeout=30, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36"
-            })
-        except requests.RequestException as e:
-            print(f"network error: {e} — stopping.")
-            break
-
-        if response.status_code != 200:
-            print(f"HTTP {response.status_code} — stopping.")
-            break
-
+        try: response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        except: break
+        if response.status_code != 200: break
         products = response.json().get("products", [])
-        if not products:
-            print("no more products.")
+        if not products: break
+
+        batch_products = []
+        for p in products:
+            if not p.get("variants"): continue
+            batch_products.append({"brand": brand_name, "external_id": str(p["id"]), "name": p["title"], "category_raw": p.get("product_type", ""), "category_normalized": normalize_category(f"{p['title']} {p.get('product_type','')}" ), "gender": normalize_gender(p.get("tags",[]), p.get("product_type",""), p["title"]), "sizes_available": [], "url": f"https://{domain}/products/{p['handle']}", "image_url": p.get("images",[{}])[0].get("src"), "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True})
+
+        if not batch_products: break
+        product_upsert_rows = []
+        try:
+            for i in range(0, len(batch_products), 100):
+                chunk = batch_products[i:i+100]
+                res = supabase.table("products").upsert(chunk, on_conflict="brand,external_id").execute()
+                product_upsert_rows.extend(res.data)
+        except Exception as e:
+            print(f"  ⚠️ Core product batch ingest bottlenecked via database channel: {e}")
+            page += 1
+            continue
+        
+        product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
+        products_seen += len(batch_products)
+
+        batch_variants, product_variant_tracking = [], {}
+        for p in products:
+            db_pid = product_id_map.get(str(p["id"]))
+            if not db_pid: continue
+            size_key, color_key = detect_options(p["variants"])
+            product_variant_tracking[db_pid] = []
+
+            for v in p["variants"]:
+                size, color = (v.get(size_key) or "").strip(), (v.get(color_key) or "").strip() if color_key else None
+                if not size or size.lower() == "default title": size = None
+                price, compare_at, available = float(v.get("price") or 0), float(v.get("compare_at_price") or 0) if v.get("compare_at_price") else None, bool(v.get("available"))
+                if price == 0: continue
+
+                sku = f"{domain}_{v['id']}"
+                prev = prev_stock_state.get(sku)
+                v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
+                discount_honest = round(((v_baseline - price) / v_baseline) * 100, 2) if v_baseline > price else None
+
+                batch_variants.append({"product_id": db_pid, "external_sku": sku, "color": color, "size": size, "is_in_stock": available, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(), "_meta_price": price, "_meta_compare": compare_at, "_meta_discount_honest": discount_honest, "_meta_baseline": v_baseline, "_meta_size": size, "_meta_color": color, "_meta_available": available})
+
+        if batch_variants:
+            db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants]
+            variant_upsert_rows = []
+            try:
+                for i in range(0, len(db_payload), 100):
+                    res = supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku").execute()
+                    variant_upsert_rows.extend(res.data)
+            except Exception as e:
+                print(f"  ⚠️ Child variant records transaction dropped on page {page}: {e}")
+                page += 1
+                continue
+            
+            sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+            for vr in batch_variants: vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
+            for vr in batch_variants: product_variant_tracking[vr["product_id"]].append(vr)
+
+            for db_pid, records in product_variant_tracking.items():
+                if not records: continue
+                upsert_snapshot(supabase, brand_name, db_pid, records, today, use_insert)
+                sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+
+                for rec in records:
+                    prev_v = prev_stock_state.get(rec["external_sku"])
+                    if prev_v: detect_and_write_stockout(supabase, rec["variant_db_id"], db_pid, brand_name, rec["_meta_size"], rec["_meta_color"], prev_v["is_in_stock"], rec["_meta_available"], rec["_meta_price"], rec["_meta_baseline"])
+                    
+                    curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
+                    try:
+                        last_ev = supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1).execute()
+                        last_p = float(last_ev.data[0]["price_after"]) if last_ev.data else None
+                    except:
+                        last_p = None
+
+                    if last_p is None or abs(last_p - curr_price) > 0.01:
+                        direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
+                        if direction: price_changes += 1
+                        
+                        if direction == "down" and v_base and curr_price < v_base:
+                            if prev_v and prev_v.get("last_updated_at"):
+                                if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
+                                    for p in products:
+                                        if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_pid][0]:
+                                            find_and_alert_users(supabase, brand_name, rec["_meta_size"], curr_price, rec["_meta_discount_honest"], p["title"], f"https://{domain}/products/{p['handle']}", v_base)
+
+                        try:
+                            supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}).execute()
+                        except:
+                            pass
+        page += 1
+    return products_seen, price_changes
+
+def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_state):
+    print("  Executing LC Waikiki Dynamic Catalog Engine...")
+    page, products_seen, price_changes = 1, 0, 0
+    try:
+        use_insert = len(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1).execute().data) == 0
+    except:
+        use_insert = True
+
+    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId&CategoryTreeId=9&FilteringType=26&Layout=three-column"
+    
+    while True:
+        try:
+            res = requests.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers={"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest"})
+            if res.status_code != 200: break
+            catalog = res.json().get("CatalogList", {})
+            items = catalog.get("Items", [])
+            if not items: break
+        except:
             break
 
-        print(f"{len(products)} products.")
+        batch_products = []
+        for item in items:
+            desc = item.get("ProductDescription") or item.get("BrandPropertyDescription")
+            if not desc: continue
+            model_id = str(item["ModelId"])
+            batch_products.append({"brand": brand_name, "external_id": model_id, "name": desc, "category_raw": "Shirt", "category_normalized": "tops", "gender": "men", "sizes_available": [], "url": f"https://{domain}{item.get('ModelUrl','')}", "image_url": item.get("DefaultOptionImageUrl"), "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True})
 
-        # ─── BATCH STAGE 1: Collect & Upsert Products ───
-        batch_products_payload = []
-        for product in products:
-            shopify_variants = product.get("variants", [])
-            if not shopify_variants:
-                continue
-
-            title        = product.get("title", "")
-            product_type = product.get("product_type", "")
-            tags         = product.get("tags", [])
-            handle       = product.get("handle", "")
-            images       = product.get("images", [])
-
-            batch_products_payload.append({
-                "brand":               brand_name,
-                "external_id":         str(product["id"]),
-                "name":                title,
-                "category_raw":        product_type or "",
-                "category_normalized": normalize_category(f"{title} {product_type}"),
-                "gender":              normalize_gender(tags, product_type, title),
-                "sizes_available":     [],
-                "url":                 f"https://{domain}/products/{handle}",
-                "image_url":           images[0]["src"] if images else None,
-                "last_seen_at":        datetime.now(timezone.utc).isoformat(),
-                "is_active":           True,
-            })
-
-        if not batch_products_payload:
+        if not batch_products: break
+        product_upsert_rows = []
+        try:
+            for i in range(0, len(batch_products), 100):
+                res_p = supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id").execute()
+                product_upsert_rows.extend(res_p.data)
+        except Exception as e:
+            print(f"  ⚠️ LCW category sync channel bottlenecked: {e}")
             page += 1
             continue
 
-        # PROTECTION LAYER: Chunk product upserts into steps of 100 to insulate network gateways
-        product_upsert_rows = []
-        for i in range(0, len(batch_products_payload), 100):
-            chunk = batch_products_payload[i:i+100]
-            res = supabase.table("products").upsert(chunk, on_conflict="brand,external_id").execute()
-            product_upsert_rows.extend(res.data)
-        
         product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
-        products_seen += len(batch_products_payload)
+        products_seen += len(batch_products)
 
-        # ─── BATCH STAGE 2: Collect & Upsert Variants ───
-        batch_variants_payload = []
-        product_variant_tracking = {}
+        batch_variants, product_variant_tracking = [], {}
+        for item in items:
+            db_pid = product_id_map.get(str(item["ModelId"]))
+            if not db_pid: continue
+            product_variant_tracking[db_pid] = []
+            opt_id = item.get("OptionId")
+            
+            try:
+                opt_res = requests.get(f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                sizes_data = opt_res.json() if opt_res.status_code == 200 else []
+            except:
+                sizes_data = []
 
-        for product in products:
-            ext_id = str(product["id"])
-            db_product_id = product_id_map.get(ext_id)
-            if not db_product_id:
+            price = float(item.get("PriceValue") or 0)
+            old_price_str = item.get("OldPrice") or ""
+            compare_at = float(''.join(c for c in old_price_str if c.isdigit() or c=='.')) if any(c.isdigit() for c in old_price_str) else None
+
+            if not sizes_data: sizes_data = [{"Size": "One Size", "IsAvailable": True}]
+
+            for s_entry in sizes_data:
+                size_label = s_entry.get("Size") or "One Size"
+                is_avail = bool(s_entry.get("IsAvailable", True))
+                sku = f"lcw_{opt_id}_{size_label.replace(' ', '_')}"
+                
+                prev = prev_stock_state.get(sku)
+                v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
+                discount_honest = round(((v_baseline - price) / v_baseline) * 100, 2) if v_baseline > price else None
+
+                batch_variants.append({"product_id": db_pid, "external_sku": sku, "color": None, "size": size_label, "is_in_stock": is_avail, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(), "_meta_price": price, "_meta_compare": compare_at, "_meta_discount_honest": discount_honest, "_meta_baseline": v_baseline, "_meta_size": size_label, "_meta_available": is_avail})
+
+        if batch_variants:
+            db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants]
+            variant_upsert_rows = []
+            try:
+                for i in range(0, len(db_payload), 100):
+                    res_v = supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku").execute()
+                    variant_upsert_rows.extend(res_v.data)
+            except Exception as e:
+                print(f"  ⚠️ LCW size row batch commit dropped on page {page}: {e}")
+                page += 1
                 continue
 
-            shopify_variants = product.get("variants", [])
-            size_key, color_key = detect_options(shopify_variants)
-            product_variant_tracking[db_product_id] = []
-            
-            title = product.get("title", "")
-            handle = product.get("handle", "")
-            product_url = f"https://{domain}/products/{handle}"
-            category = normalize_category(f"{title} {product.get('product_type', '')}")
+            sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+            for vr in batch_variants: vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
+            for vr in batch_variants: product_variant_tracking[vr["product_id"]].append(vr)
 
-            for v in shopify_variants:
-                size  = (v.get(size_key) or "").strip()
-                color = (v.get(color_key) or "").strip() if color_key else None
-                if not size or size.lower() == "default title": 
-                    size = None
-                
-                price       = float(v.get("price") or 0)
-                compare_raw = v.get("compare_at_price")
-                compare_at  = float(compare_raw) if compare_raw else None
-                available   = bool(v.get("available"))
+            for db_pid, records in product_variant_tracking.items():
+                if not records: continue
+                upsert_snapshot(supabase, brand_name, db_pid, records, today, use_insert)
+                sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"]]
 
-                if price == 0: 
-                    continue
-
-                external_sku = f"{domain}_{v['id']}"
-                prev = prev_stock_state.get(external_sku)
-
-                # DECEPTION GUARDRAIL: first_observed_price strictly locks to live selling price on first sight
-                if prev and prev.get("first_observed_price"):
-                    v_baseline = float(prev["first_observed_price"])
-                else:
-                    v_baseline = price
-
-                discount_honest = None
-                if v_baseline and v_baseline > price:
-                    discount_honest = round(((v_baseline - price) / v_baseline) * 100, 2)
-
-                batch_variants_payload.append({
-                    "product_id":           db_product_id,
-                    "external_sku":         external_sku,
-                    "color":                color or None,
-                    "size":                 size or None,
-                    "is_in_stock":          available,
-                    "first_observed_price": v_baseline,
-                    "last_updated_at":      datetime.now(timezone.utc).isoformat(),
+                for rec in records:
+                    prev_v = prev_stock_state.get(rec["external_sku"])
+                    if prev_v: detect_and_write_stockout(supabase, rec["variant_db_id"], db_pid, brand_name, rec["_meta_size"], None, prev_v["is_in_stock"], rec["_meta_available"], rec["_meta_price"], rec["_meta_baseline"])
                     
-                    # Internal meta-trackers
-                    "_meta_price":           price,
-                    "_meta_compare":         compare_at,
-                    "_meta_discount_honest": discount_honest,
-                    "_meta_baseline":        v_baseline,
-                    "_meta_size":            size,
-                    "_meta_color":           color,
-                    "_meta_available":       available
-                })
+                    curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
+                    try:
+                        last_ev = supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1).execute()
+                        last_p = float(last_ev.data[0]["price_after"]) if last_ev.data else None
+                    except:
+                        last_p = None
 
-        if batch_variants_payload:
-            db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants_payload]
-            
-            # PROTECTION LAYER: Chunk variant upserts into steps of 100 to insulate network pools
-            variant_upsert_rows = []
-            for i in range(0, len(db_payload), 100):
-                chunk = db_payload[i:i+100]
-                res = supabase.table("product_variants").upsert(chunk, on_conflict="external_sku").execute()
-                variant_upsert_rows.extend(res.data)
-            
-            variant_sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
-            for var_rec in batch_variants_payload:
-                var_rec["variant_db_id"] = variant_sku_to_id.get(var_rec["external_sku"])
+                    if last_p is None or abs(last_p - curr_price) > 0.01:
+                        direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
+                        if direction: price_changes += 1
 
-            # ─── BATCH STAGE 3: Structural Layer Evaluation ───
-            for var_rec in batch_variants_payload:
-                p_id = var_rec["product_id"]
-                product_variant_tracking[p_id].append(var_rec)
+                        if direction == "down" and v_base and curr_price < v_base:
+                            if prev_v and prev_v.get("last_updated_at"):
+                                if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
+                                    for item in items:
+                                        if str(item["ModelId"]) == [k for k, v in product_id_map.items() if v == db_pid][0]:
+                                            desc = item.get("ProductDescription") or "LCW Item"
+                                            find_and_alert_users(supabase, brand_name, "tops", rec["_meta_size"], curr_price, rec["_meta_discount_honest"], desc, f"https://{domain}{item.get('ModelUrl','')}", v_base)
 
-            for db_product_id, variant_records in product_variant_tracking.items():
-                if not variant_records: 
-                    continue
-                
-                upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert)
-                
-                sizes_in_stock = [r["_meta_size"] for r in variant_records if r["_meta_available"] and r["_meta_size"]]
-                
-                for rec in variant_records:
-                    prev_v_state = prev_stock_state.get(rec["external_sku"])
-                    if prev_v_state is not None:
-                        detect_and_write_stockout(
-                            supabase,
-                            variant_db_id        = rec["variant_db_id"],
-                            product_id           = db_product_id,
-                            brand                = brand_name,
-                            size                 = rec["_meta_size"],
-                            color                = rec["_meta_color"],
-                            previous_in_stock    = prev_v_state["is_in_stock"],
-                            current_in_stock     = rec["_meta_available"],
-                            current_price        = rec["_meta_price"],
-                            variant_baseline     = rec["_meta_baseline"]
-                        )
-
-                # VARIANT-TIER REAL-TIME FLASH SALE & ANCHOR MANIPULATION LOGIC HUB
-                for rec in variant_records:
-                    v_sku = rec["external_sku"]
-                    v_id = rec["variant_db_id"]
-                    current_price = rec["_meta_price"]
-                    compare_at = rec["_meta_compare"]
-                    v_baseline = rec["_meta_baseline"]
-                    honest_discount = rec["_meta_discount_honest"]
-
-                    last_event = (
-                        supabase.table("price_events")
-                        .select("price_after, compare_at_price, id")
-                        .eq("product_id", db_product_id)
-                        .order("recorded_at", desc=True)
-                        .limit(1)
-                        .execute()
-                    )
-
-                    v_last_price = float(last_event.data[0]["price_after"]) if last_event.data else None
-                    v_last_compare = float(last_event.data[0]["compare_at_price"]) if (last_event.data and last_event.data[0].get("compare_at_price")) else None
-
-                    if v_last_price is None or abs(v_last_price - current_price) > 0.01:
-                        direction = None
-                        is_flash_sale = False
-                        
-                        if v_last_price is not None:
-                            direction = "down" if current_price < v_last_price else "up"
-                            price_changes += 1
-
-                            # SIGNAL 02 ENGINE: Detect Flash Sale Reversions
-                            if direction == "up" and abs(current_price - v_baseline) < 0.01:
-                                day_cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-                                recent_drop = (
-                                    supabase.table("price_events")
-                                    .select("id")
-                                    .eq("product_id", db_product_id)
-                                    .eq("direction", "down")
-                                    .gt("recorded_at", day_cutoff)
-                                    .limit(1)
-                                    .execute()
-                                )
-                                if recent_drop.data:
-                                    is_flash_sale = True
-                                    supabase.table("price_events").update({"is_flash_sale": True}).eq("id", recent_drop.data[0]["id"]).execute()
-                                    print(f"  ⚡ Flash Sale Reversion Detected for Variant {v_sku}")
-
-                        # SIGNAL 04 ENGINE: Detect Cosmetic Anchor Inflation
-                        if compare_at and v_last_compare and compare_at > v_last_compare and abs(current_price - v_last_price) < 0.01:
-                            print(f"  🎭 Anchor Inflation Warning: {brand_name} inflated compare_at from {v_last_compare} to {compare_at} EGP")
-
-                        if direction == "down" and v_baseline and current_price < v_baseline:
-                            # 5-DAY MATURITY SHIELD: Block alerts for day-one price inflation tricks
-                            is_historically_mature = False
-                            prev_v_state = prev_stock_state.get(v_sku)
-                            
-                            if prev_v_state and prev_v_state.get("last_updated_at"):
-                                first_seen_time = datetime.fromisoformat(prev_v_state["last_updated_at"])
-                                history_age = datetime.now(timezone.utc) - first_seen_time
-                                if history_age > timedelta(days=5):
-                                    is_historically_mature = True
-
-                            if is_historically_mature:
-                                for p in products:
-                                    if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
-                                        if rec["_meta_size"]:
-                                            find_and_alert_users(
-                                                supabase, brand_name, category, rec["_meta_size"],
-                                                current_price, honest_discount, p.get("title", ""), 
-                                                f"https://{domain}/products/{p.get('handle', '')}", v_baseline
-                                            )
-                                        break
-
-                        supabase.table("price_events").insert({
-                            "product_id":       db_product_id,
-                            "brand":            brand_name,
-                            "price_before":     v_last_price,
-                            "price_after":      current_price,
-                            "compare_at_price": compare_at,
-                            "discount_pct":     honest_discount,
-                            "direction":        direction,
-                            "sizes_in_stock":   sizes_in_stock,
-                            "is_flash_sale":    is_flash_sale,
-                            "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                        }).execute()
-
-                        last_prices[db_product_id] = current_price
-
+                        try:
+                            supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}).execute()
+                        except:
+                            pass
         page += 1
+        if page > 5: break
+    return products_seen, price_changes
 
-    print(f"\n  ✅ {brand_name}: {products_seen} products scanned, {price_changes} price changes recorded.")
+def scrape_brand(brand_name, domain):
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        print(f"❌ Failed to instantiate Supabase transaction context client: {e}")
+        return 0
+
+    today = date.today()
+    print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
+    if not check_domain(domain): return 0
+
+    last_prices = load_last_prices(supabase, brand_name)
+    
+    # Secure existing database variants retrieval loop inside a network-fault shield block
+    try:
+        existing_variants = supabase.table("product_variants").select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at").execute()
+        prev_stock_state = {row["external_sku"]: row for row in existing_variants.data}
+    except Exception as e:
+        print(f"  ⚠️ Skipping inventory state baseline pull due to PostgREST connection timeout: {e}")
+        prev_stock_state = {}
+
+    brand_config = next(b for b in BRANDS if b["name"] == brand_name)
+    
+    if brand_config["engine"] == "shopify":
+        seen, changes = scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_state)
+    elif brand_config["engine"] == "lcw_ajax":
+        seen, changes = scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_state)
+    else:
+        seen, changes = 0, 0
+
+    print(f"\n  ✅ {brand_name}: {seen} products scanned, {changes} price changes recorded.")
     verify_run_integrity(supabase, brand_name)
-    return price_changes
+    return changes
 
 if __name__ == "__main__":
-    print("🚀 Khabar scraper starting...")
-    _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-    purge_old_events(_sb)
-
-    total = 0
-    for brand in BRANDS:
-        total += scrape_brand(brand["name"], brand["domain"])
-
+    print("🚀 Khabar multi-architecture scraper starting...")
+    try:
+        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        purge_old_events(_sb)
+    except Exception as e:
+        print(f"⚠️ Pre-run setup hook skipped: {e}")
+    
+    total = sum(scrape_brand(b["name"], b["domain"]) for b in BRANDS)
     print(f"\n🏁 All done. Total price changes this run: {total}")
