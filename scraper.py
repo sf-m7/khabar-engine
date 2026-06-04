@@ -2,7 +2,7 @@
 # KHABAR — Scraper v9 (Enterprise Resilience Core)
 # Adds: Exponential Backoff, HTTP Adapters, Brand Fault 
 #       Isolation, Transactional Retry Shields, and
-#       LC Waikiki ASP.NET MVC Bypassing.
+#       Strict Regional Cookie Priming.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -295,21 +295,27 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt",
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Origin": f"https://{domain}",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
+    # --- THE ULTIMATE FIX: The Warehouse Cookie Primer ---
     try:
-        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
-    except:
-        pass 
+        print("  [Network] Priming regional warehouse cookies...")
+        # Hit the regional homepage to lock the EG warehouse state
+        session.get(f"https://{domain}/en-US/EG", headers={"User-Agent": headers["User-Agent"], "Accept-Language": "en-US,en;q=0.9"}, timeout=15)
+        # Hit the target category to lock the menu state
+        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"], "Accept-Language": "en-US,en;q=0.9"}, timeout=15)
+    except Exception as e:
+        print(f"  ⚠️ Session prime warning: {e}")
 
-    # THE FIX: Exact messy string from your browser log
+    # Explicit query matching
     lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId,xhrKeys,CategoryTreeId,FilteringType,xhrKeys&CategoryTreeId=9&FilteringType=26&Layout=three-column&m_5=10"
     
     while True:
         try:
-            # We must pass data="" so requests formats it as a proper POST with a Content-Length
-            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers, data="")
+            # Removed data="" completely so requests performs a pure POST without an empty body
+            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers)
             
             try:
                 data = res.json()
@@ -321,13 +327,15 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             items = catalog.get("Items") or []
             
             if not items: 
-                # ASP.NET AJAX quirk: Page 1 often returns 0 items intentionally because it expects HTML.
+                # Check what the server actually thinks we asked for
+                print(f"  ⚠️ LCW returned 0 items on page {page}.")
+                print(f"  ⚠️ Debug ResponseKey: {data.get('ResponseKey')}")
+                
+                # ASP.NET AJAX quirk: Page 1 often returns 0 items intentionally
                 if page == 1:
-                    print(f"  ⚠️ LCW returned 0 items on page 1. Skipping to page 2 (ASP.NET AJAX quirk).")
+                    print("  ⚠️ Skipping to page 2...")
                     page += 1
                     continue
-                
-                print(f"  ⚠️ LCW returned 0 items on page {page}. Ending pagination loop.")
                 break
                 
         except Exception as e:
@@ -429,7 +437,6 @@ def scrape_brand(brand_name, domain):
     today = date.today()
     print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
     
-    # ── BRAND ISOLATION ZONE ──
     try:
         if not check_domain(session, domain): 
             print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
