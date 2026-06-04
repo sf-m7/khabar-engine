@@ -4,7 +4,8 @@
 #        Automated Stockout/Restock, Flash Sale Identification,
 #        Inversion Guardrails, Optimized Alert Ingestion,
 #        Automated QA Self-Correction, 365-Day Snapshot Purge,
-#        5-Day Anti-Manipulation Deception Shield
+#        5-Day Anti-Manipulation Deception Shield,
+#        High-Performance Transactional Chunking Gateway
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -442,13 +443,14 @@ def scrape_brand(brand_name, domain):
             page += 1
             continue
 
-        products_upsert_result = (
-            supabase.table("products")
-            .upsert(batch_products_payload, on_conflict="brand,external_id")
-            .execute()
-        )
+        # PROTECTION LAYER: Chunk product upserts into steps of 100 to insulate network gateways
+        product_upsert_rows = []
+        for i in range(0, len(batch_products_payload), 100):
+            chunk = batch_products_payload[i:i+100]
+            res = supabase.table("products").upsert(chunk, on_conflict="brand,external_id").execute()
+            product_upsert_rows.extend(res.data)
         
-        product_id_map = {row["external_id"]: row["id"] for row in products_upsert_result.data}
+        product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
         products_seen += len(batch_products_payload)
 
         # ─── BATCH STAGE 2: Collect & Upsert Variants ───
@@ -518,9 +520,15 @@ def scrape_brand(brand_name, domain):
 
         if batch_variants_payload:
             db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants_payload]
-            variants_upsert_result = supabase.table("product_variants").upsert(db_payload, on_conflict="external_sku").execute()
             
-            variant_sku_to_id = {row["external_sku"]: row["id"] for row in variants_upsert_result.data}
+            # PROTECTION LAYER: Chunk variant upserts into steps of 100 to insulate network pools
+            variant_upsert_rows = []
+            for i in range(0, len(db_payload), 100):
+                chunk = db_payload[i:i+100]
+                res = supabase.table("product_variants").upsert(chunk, on_conflict="external_sku").execute()
+                variant_upsert_rows.extend(res.data)
+            
+            variant_sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
             for var_rec in batch_variants_payload:
                 var_rec["variant_db_id"] = variant_sku_to_id.get(var_rec["external_sku"])
 
