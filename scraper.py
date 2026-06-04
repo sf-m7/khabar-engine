@@ -2,7 +2,7 @@
 # KHABAR — Scraper v9 (Enterprise Resilience Core)
 # Adds: Exponential Backoff, HTTP Adapters, Brand Fault 
 #       Isolation, Transactional Retry Shields, and
-#       LC Waikiki Soft-404 Bypassing.
+#       Session Cookie Priming.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -271,8 +271,9 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                         if direction == "down" and v_base and curr_price < v_base:
                             if prev_v and prev_v.get("last_updated_at"):
                                 if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
+                                    target_ext_id = next((k for k, v in product_id_map.items() if v == db_pid), None)
                                     for p in products:
-                                        if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_pid][0]:
+                                        if target_ext_id and str(p["id"]) == target_ext_id:
                                             find_and_alert_users(supabase, session, brand_name, rec["_meta_size"], curr_price, p["title"], f"https://{domain}/products/{p['handle']}", v_base)
 
                         safe_db_execute(supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}))
@@ -289,29 +290,34 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     except:
         use_insert = True
 
-    # Updated URL with strict parameter matching (m_5=10)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt"
+    }
+
+    # --- THE FIX: GET VISITOR COOKIES FIRST ---
+    try:
+        # Hit the front door so the server hands our session an ASP.NET anti-bot cookie
+        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
+    except:
+        pass # If this drops, we still try the API anyway
+
     lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId&CategoryTreeId=9&FilteringType=26&Layout=three-column&m_5=10"
     
     while True:
         try:
-            # Full Chrome browser disguise headers
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt"
-            }
             res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers)
             
-            # Bypass strict HTTP code checking. If it parses as JSON, we take it!
             try:
                 data = res.json()
             except Exception as e:
                 print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}. Not JSON.")
                 break
                 
-            catalog = data.get("CatalogList", {})
-            items = catalog.get("Items", [])
+            catalog = data.get("CatalogList") or {}
+            items = catalog.get("Items") or []
             
             if not items: 
                 print(f"  ⚠️ LCW returned 0 items on page {page}. Ending pagination loop.")
@@ -394,8 +400,9 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                         if direction == "down" and v_base and curr_price < v_base:
                             if prev_v and prev_v.get("last_updated_at"):
                                 if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
+                                    target_ext_id = next((k for k, v in product_id_map.items() if v == db_pid), None)
                                     for item in items:
-                                        if str(item["ModelId"]) == [k for k, v in product_id_map.items() if v == db_pid][0]:
+                                        if target_ext_id and str(item["ModelId"]) == target_ext_id:
                                             desc = item.get("ProductDescription") or "LCW Item"
                                             find_and_alert_users(supabase, session, brand_name, "tops", rec["_meta_size"], curr_price, desc, f"https://{domain}{item.get('ModelUrl','')}", v_base)
 
