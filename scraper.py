@@ -3,7 +3,8 @@
 # Adds: Positional Entropy Options Engine, Variant-Level Baseline,
 #        Automated Stockout/Restock, Flash Sale Identification,
 #        Inversion Guardrails, Optimized Alert Ingestion,
-#        Automated QA Self-Correction, 365-Day Snapshot Purge
+#        Automated QA Self-Correction, 365-Day Snapshot Purge,
+#        5-Day Anti-Manipulation Deception Shield
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -250,7 +251,6 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
             "brand":            brand_name,
             "price":            vd["_meta_price"],
             "compare_at_price": vd["_meta_compare"],
-            "discount_pct":     vd["_meta_discount_honest"],
             "snapshot_date":    str(today),
             "recorded_at":      datetime.now(timezone.utc).isoformat(),
         }
@@ -260,7 +260,6 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
             supabase.table("price_snapshots").update({
                 "price":            vd["_meta_price"],
                 "compare_at_price": vd["_meta_compare"],
-                "discount_pct":     vd["_meta_discount_honest"],
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
             }).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
     else:
@@ -274,7 +273,6 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
                 "brand":            brand_name,
                 "price":            vd["_meta_price"],
                 "compare_at_price": vd["_meta_compare"],
-                "discount_pct":     vd["_meta_discount_honest"],
                 "snapshot_date":    str(today),
                 "recorded_at":      datetime.now(timezone.utc).isoformat(),
             }
@@ -283,7 +281,7 @@ def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
             else:
                 supabase.table("price_snapshots").update({
                     "price":         vd["_meta_price"],
-                    "discount_pct":  vd["_meta_discount_honest"],
+                    "compare_at_price": vd["_meta_compare"],
                     "recorded_at":   datetime.now(timezone.utc).isoformat(),
                 }).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
 
@@ -379,7 +377,7 @@ def scrape_brand(brand_name, domain):
 
     existing_variants = (
         supabase.table("product_variants")
-        .select("external_sku, is_in_stock, size, color, first_observed_price")
+        .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at")
         .execute()
     )
     prev_stock_state = {row["external_sku"]: row for row in existing_variants.data}
@@ -489,10 +487,11 @@ def scrape_brand(brand_name, domain):
                 external_sku = f"{domain}_{v['id']}"
                 prev = prev_stock_state.get(external_sku)
 
+                # DECEPTION GUARDRAIL: first_observed_price strictly locks to live selling price on first sight
                 if prev and prev.get("first_observed_price"):
                     v_baseline = float(prev["first_observed_price"])
                 else:
-                    v_baseline = compare_at if (compare_at and compare_at > price) else price
+                    v_baseline = price
 
                 discount_honest = None
                 if v_baseline and v_baseline > price:
@@ -563,7 +562,6 @@ def scrape_brand(brand_name, domain):
                     v_baseline = rec["_meta_baseline"]
                     honest_discount = rec["_meta_discount_honest"]
 
-                    # FIXED KEY LOOKUP: Restricts matching history exclusively to the unique variant level
                     last_event = (
                         supabase.table("price_events")
                         .select("price_after, compare_at_price, id")
@@ -606,15 +604,26 @@ def scrape_brand(brand_name, domain):
                             print(f"  🎭 Anchor Inflation Warning: {brand_name} inflated compare_at from {v_last_compare} to {compare_at} EGP")
 
                         if direction == "down" and v_baseline and current_price < v_baseline:
-                            for p in products:
-                                if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
-                                    if rec["_meta_size"]:
-                                        find_and_alert_users(
-                                            supabase, brand_name, category, rec["_meta_size"],
-                                            current_price, honest_discount, p.get("title", ""), 
-                                            f"https://{domain}/products/{p.get('handle', '')}", v_baseline
-                                        )
-                                    break
+                            # 5-DAY MATURITY SHIELD: Block alerts for day-one price inflation tricks
+                            is_historically_mature = False
+                            prev_v_state = prev_stock_state.get(v_sku)
+                            
+                            if prev_v_state and prev_v_state.get("last_updated_at"):
+                                first_seen_time = datetime.fromisoformat(prev_v_state["last_updated_at"])
+                                history_age = datetime.now(timezone.utc) - first_seen_time
+                                if history_age > timedelta(days=5):
+                                    is_historically_mature = True
+
+                            if is_historically_mature:
+                                for p in products:
+                                    if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
+                                        if rec["_meta_size"]:
+                                            find_and_alert_users(
+                                                supabase, brand_name, category, rec["_meta_size"],
+                                                current_price, honest_discount, p.get("title", ""), 
+                                                f"https://{domain}/products/{p.get('handle', '')}", v_baseline
+                                            )
+                                        break
 
                         supabase.table("price_events").insert({
                             "product_id":       db_product_id,
