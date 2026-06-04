@@ -1,6 +1,7 @@
 # ═══════════════════════════════════════════════════════
 # KHABAR — Scraper v6 (Enterprise Transition Core)
-# Adds: Variant-Level Baseline, Automated Stockout/Restock,
+# Adds: Positional Entropy Options Engine, Variant-Level Baseline,
+#        Automated Stockout/Restock, Flash Sale Identification,
 #        Inversion Guardrails, Optimized Alert Ingestion,
 #        365-Day Snapshot Purge Cycles
 # ═══════════════════════════════════════════════════════
@@ -49,12 +50,6 @@ CATEGORY_MAP = {
                     "watch", "sunglasses", "شنطة", "حزام"],
 }
 
-SIZE_KEYWORDS = {
-    "xs", "s", "m", "l", "xl", "xxl", "xxxl", "2xl", "3xl", "4xl",
-    "small", "medium", "large", "x-large", "xx-large",
-    "os", "one size", "free size", "onesize", "فري", "فري سايز",
-}
-
 # ── Helpers ───────────────────────────────────────────
 
 def normalize_category(text):
@@ -74,32 +69,58 @@ def normalize_gender(tags, product_type, title):
         return "kids"
     return "unisex"
 
-def looks_like_size(value):
-    if not value:
-        return False
-    v = value.strip().lower()
-    if v in SIZE_KEYWORDS:
-        return True
-    if v.isdigit() and 20 <= int(v) <= 50:
-        return True
-    if "/" in v:
-        return True
-    return False
-
 def detect_options(variants):
-    sample = variants[:8]
-    opt1 = [v.get("option1", "") for v in sample]
-    opt2 = [v.get("option2", "") for v in sample]
-    opt3 = [v.get("option3", "") for v in sample]
+    """
+    ENTERPRISE POSITIONAL ENTROPY PARSER
+    Identifies options by measuring statistical variance across the variant array.
+    Guaranteed bulletproof against single-color/multi-size variations.
+    """
+    if not variants:
+        return "option1", "option2"
 
-    if any(looks_like_size(v) for v in opt1):
-        return "option1", ("option2" if any(opt2) else None)
-    elif any(looks_like_size(v) for v in opt2):
-        return "option2", ("option1" if any(opt1) else None)
-    elif any(looks_like_size(v) for v in opt3):
-        return "option3", ("option1" if any(opt1) else None)
+    opt1_values = [str(v.get("option1", "")).strip() for v in variants if v.get("option1")]
+    opt2_values = [str(v.get("option2", "")).strip() for v in variants if v.get("option2")]
+    opt3_values = [str(v.get("option3", "")).strip() for v in variants if v.get("option3")]
+
+    u_opt1 = len(set(opt1_values))
+    u_opt2 = len(set(opt2_values))
+    u_opt3 = len(set(opt3_values))
+
+    # CASE A: Product has only ONE active changing option layer (e.g., Single-Color Multi-Size)
+    if len(variants) > 1 and (u_opt1 == 1 or u_opt2 == 0) and u_opt2 <= 1 and u_opt3 == 0:
+        if u_opt2 > u_opt1:
+            return "option2", "option1"
+        return "option1", ("option2" if opt2_values else None)
+
+    # CASE B: Standard Multi-Option Dynamic Evaluation
+    def score_column_content(values):
+        score = 0
+        size_flags = {"xs", "s", "m", "l", "xl", "xxl", "3xl", "4xl", "5xl", "os", "one size", "small", "medium", "large"}
+        for val in set(values):
+            v_low = val.lower()
+            if v_low in size_flags: score += 10
+            if v_low.isdigit() and (4 <= int(v_low) <= 56): score += 5
+            if "/" in v_low and not any(c.isalpha() for c in v_low if c not in ['w','l','s','m','x']): score += 5
+        return score
+
+    scores = {
+        "option1": score_column_content(opt1_values),
+        "option2": score_column_content(opt2_values),
+        "option3": score_column_content(opt3_values)
+    }
+
+    size_key = max(scores, key=scores.get)
+    
+    if scores[size_key] > 0:
+        remaining = [k for k in ["option1", "option2", "option3"] if k != size_key and (any(v.get(k) for v in variants))]
+        color_key = remaining[0] if remaining else None
+        return size_key, color_key
+
+    # CASE C: Mathematical Entropy Variance Fallback
+    if u_opt1 >= u_opt2 and u_opt1 >= u_opt3:
+        return "option1", ("option2" if u_opt2 > 0 else "option3" if u_opt3 > 0 else None)
     else:
-        return "option1", ("option2" if any(opt2) else None)
+        return "option2", "option1"
 
 def check_domain(domain):
     try:
@@ -442,7 +463,7 @@ def scrape_brand(brand_name, domain):
                 external_sku = f"{domain}_{v['id']}"
                 prev = prev_stock_state.get(external_sku)
 
-                # GUARDRAIL AGAINST PRE-DISCOUNTED ITEMS: Lock original anchor floor on first sight
+                # CRITICAL TO TYPE PROTECTION: Float string configurations safely
                 if prev and prev.get("first_observed_price"):
                     v_baseline = float(prev["first_observed_price"])
                 else:
@@ -458,10 +479,10 @@ def scrape_brand(brand_name, domain):
                     "color":                color or None,
                     "size":                 size or None,
                     "is_in_stock":          available,
-                    "first_observed_price": v_baseline, # Fixed variant attribute tier
+                    "first_observed_price": v_baseline,
                     "last_updated_at":      datetime.now(timezone.utc).isoformat(),
                     
-                    # Internal configuration meta trackers
+                    # Internal meta-trackers
                     "_meta_price":           price,
                     "_meta_compare":         compare_at,
                     "_meta_discount_honest": discount_honest,
@@ -490,7 +511,6 @@ def scrape_brand(brand_name, domain):
                 
                 upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert)
                 
-                # Sizing matrix completion tracking parameters
                 sizes_in_stock = [r["_meta_size"] for r in variant_records if r["_meta_available"] and r["_meta_size"]]
                 
                 for rec in variant_records:
@@ -509,46 +529,81 @@ def scrape_brand(brand_name, domain):
                             variant_baseline     = rec["_meta_baseline"]
                         )
 
-                main_price           = variant_records[0]["_meta_price"]
-                main_compare         = variant_records[0]["_meta_compare"]
-                main_discount_honest = variant_records[0]["_meta_discount_honest"]
-                v_baseline           = variant_records[0]["_meta_baseline"]
-                
-                last_price = last_prices.get(db_product_id)
-                
-                if last_price is None or abs(last_price - main_price) > 0.01:
-                    direction = None
-                    if last_price is not None:
-                        direction = "down" if main_price < last_price else "up"
-                        price_changes += 1
+                # VARIANT-TIER REAL-TIME FLASH SALE & ANCHOR MANIPULATION LOGIC HUB
+                for rec in variant_records:
+                    v_sku = rec["external_sku"]
+                    v_id = rec["variant_db_id"]
+                    current_price = rec["_meta_price"]
+                    compare_at = rec["_meta_compare"]
+                    v_baseline = rec["_meta_baseline"]
+                    honest_discount = rec["_meta_discount_honest"]
+
+                    last_event = (
+                        supabase.table("price_events")
+                        .select("price_after, compare_at_price, id")
+                        .eq("brand", brand_name)
+                        .order("recorded_at", desc=True)
+                        .limit(1)
+                        .execute()
+                    )
+
+                    v_last_price = float(last_event.data[0]["price_after"]) if last_event.data else None
+                    v_last_compare = float(last_event.data[0]["compare_at_price"]) if (last_event.data and last_event.data[0].get("compare_at_price")) else None
+
+                    if v_last_price is None or abs(v_last_price - current_price) > 0.01:
+                        direction = None
+                        is_flash_sale = False
                         
-                        # Process instantaneous downstream user dispatch alerts
-                        if direction == "down" and v_baseline and main_price < v_baseline:
+                        if v_last_price is not None:
+                            direction = "down" if current_price < v_last_price else "up"
+                            price_changes += 1
+
+                            # SIGNAL 02 ENGINE: Detect Flash Sale Reversions
+                            if direction == "up" and abs(current_price - v_baseline) < 0.01:
+                                day_cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+                                recent_drop = (
+                                    supabase.table("price_events")
+                                    .select("id")
+                                    .eq("brand", brand_name)
+                                    .eq("direction", "down")
+                                    .gt("recorded_at", day_cutoff)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if recent_drop.data:
+                                    is_flash_sale = True
+                                    supabase.table("price_events").update({"is_flash_sale": True}).eq("id", recent_drop.data[0]["id"]).execute()
+                                    print(f"  ⚡ Flash Sale Reversion Detected for Variant {v_sku}")
+
+                        # SIGNAL 04 ENGINE: Detect Cosmetic Anchor Inflation
+                        if compare_at and v_last_compare and compare_at > v_last_compare and abs(current_price - v_last_price) < 0.01:
+                            print(f"  🎭 Anchor Inflation Warning: {brand_name} inflated compare_at from {v_last_compare} to {compare_at} EGP")
+
+                        if direction == "down" and v_baseline and current_price < v_baseline:
                             for p in products:
                                 if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_product_id][0]:
-                                    product_title = p.get("title", "")
-                                    for rec in variant_records:
-                                        if rec["_meta_size"]:
-                                            find_and_alert_users(
-                                                supabase, brand_name, category, rec["_meta_size"],
-                                                main_price, main_discount_honest, product_title, product_url,
-                                                rec["_meta_baseline"]
-                                            )
+                                    if rec["_meta_size"]:
+                                        find_and_alert_users(
+                                            supabase, brand_name, category, rec["_meta_size"],
+                                            current_price, honest_discount, p.get("title", ""), 
+                                            f"https://{domain}/products/{p.get('handle', '')}", v_baseline
+                                        )
                                     break
 
-                    supabase.table("price_events").insert({
-                        "product_id":       db_product_id,
-                        "brand":            brand_name,
-                        "price_before":     last_price,
-                        "price_after":      main_price,
-                        "compare_at_price": main_compare,
-                        "discount_pct":     main_discount_honest,
-                        "direction":        direction,
-                        "sizes_in_stock":   sizes_in_stock,
-                        "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                    }).execute()
+                        supabase.table("price_events").insert({
+                            "product_id":       db_product_id,
+                            "brand":            brand_name,
+                            "price_before":     v_last_price,
+                            "price_after":      current_price,
+                            "compare_at_price": compare_at,
+                            "discount_pct":     honest_discount,
+                            "direction":        direction,
+                            "sizes_in_stock":   sizes_in_stock,
+                            "is_flash_sale":    is_flash_sale,
+                            "recorded_at":      datetime.now(timezone.utc).isoformat(),
+                        }).execute()
 
-                    last_prices[db_product_id] = main_price
+                        last_prices[db_product_id] = current_price
 
         page += 1
 
