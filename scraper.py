@@ -21,12 +21,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 BRANDS = [
+    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_ajax"},
     {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
     {"name": "ravin",      "domain": "shop.iravin.com", "engine": "shopify"},
     {"name": "mens_club",  "domain": "mensclubcollection.com", "engine": "shopify"},
     {"name": "tree",       "domain": "tree-stores.com", "engine": "shopify"},
-    {"name": "dott_jeans", "domain": "dottjeans.com", "engine": "shopify"},
-    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_ajax"}
+    {"name": "dott_jeans", "domain": "dottjeans.com", "engine": "shopify"}
 ]
 
 BRAND_DISPLAY = {
@@ -208,7 +208,8 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         batch_products = []
         for p in products:
             if not p.get("variants"): continue
-            batch_products.append({"brand": brand_name, "external_id": str(p["id"]), "name": p["title"], "category_raw": p.get("product_type", ""), "category_normalized": normalize_category(f"{p['title']} {p.get('product_type','')}" ), "gender": normalize_gender(p.get("tags",[]), p.get("product_type",""), p["title"]), "sizes_available": [], "url": f"https://{domain}/products/{p['handle']}", "image_url": p.get("images",[{}])[0].get("src"), "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True})
+            safe_image = p.get("images")[0].get("src") if p.get("images") and len(p.get("images")) > 0 else None
+            batch_products.append({"brand": brand_name, "external_id": str(p["id"]), "name": p["title"], "category_raw": p.get("product_type", ""), "category_normalized": normalize_category(f"{p['title']} {p.get('product_type','')}" ), "gender": normalize_gender(p.get("tags",[]), p.get("product_type",""), p["title"]), "sizes_available": [], "url": f"https://{domain}/products/{p['handle']}", "image_url": safe_image, "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True})
 
         if not batch_products: break
         product_upsert_rows = []
