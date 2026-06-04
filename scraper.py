@@ -288,10 +288,29 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     
     while True:
         try:
-            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers={"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest"})
-            if res.status_code != 200: break
-            items = res.json().get("CatalogList", {}).get("Items", [])
-            if not items: break
+            # Full Chrome browser disguise headers
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt"
+            }
+            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers)
+            
+            # Print the exact error if the firewall blocks us
+            if res.status_code != 200: 
+                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}")
+                print(f"  ⚠️ Raw Response: {res.text[:250]}")
+                break
+                
+            catalog = res.json().get("CatalogList", {})
+            items = catalog.get("Items", [])
+            
+            # Print an error if the layout changed
+            if not items: 
+                print(f"  ⚠️ LCW returned 200 OK, but no Items found. JSON keys: {list(res.json().keys())}")
+                break
+                
         except Exception as e:
             print(f"  ⚠️ LCW Page {page} Network Fault: {e}")
             break
