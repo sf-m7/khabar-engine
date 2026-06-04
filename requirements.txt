@@ -1,2 +1,4 @@
-requests
-supabase
+requests>=2.31.0
+supabase>=2.3.0
+urllib3>=2.0.0
+httpx>=0.25.0
