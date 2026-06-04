@@ -317,6 +317,18 @@ def complete_setup(chat_id, user, message_id=None):
 # ── Update router ──────────────────────────────────────
 
 def process_update(update):
+    # ── Text messaging commands ──
+    if "message" in update and "text" in update["message"]:
+        msg      = update["message"]
+        chat_id  = msg["chat"]["id"]
+        text     = msg["text"]
+        username = msg["from"].get("username", "")
+
+        user = get_user(chat_id) or create_user(chat_id, username)
+
+        if text == "/start":
+            show_welcome(chat_id, user)
+        return
 
     # ── Button tap ──
     if "callback_query" in update:
@@ -384,4 +396,57 @@ def process_update(update):
                 f"Monitoring: <b>{names}</b>\n\n"
                 "Select categories, or tap Done for everything."
             )
-            edit(chat_id, message_id, text, categories_keyboard(sel
+            edit(chat_id, message_id, text, categories_keyboard(sel_now))
+
+        # ── Categories confirmed ──
+        elif data == "cats_done":
+            user = get_user(chat_id)
+            temp = user.get("temp_data") or {}
+            sel  = temp.get("selected_categories", [])
+            
+            # If no category explicitly picked, default configuration maps to ALL options automatically
+            if not sel:
+                sel = list(CATEGORIES.keys())
+                temp["selected_categories"] = sel
+
+            temp["sizes_pending"]   = list(sel)
+            temp["sizes_collected"] = {}
+            update_user(chat_id, {"temp_data": temp})
+            user = get_user(chat_id)
+            show_size_for_category(chat_id, user, message_id)
+
+        # ── Size selection processing ──
+        elif data.startswith("sz|"):
+            _, cat, size = data.split("|")
+            temp      = user.get("temp_data") or {}
+            pending   = list(temp.get("sizes_pending", []))
+            collected = temp.get("sizes_collected", {})
+
+            if cat in pending:
+                pending.remove(cat)
+            
+            if size != "skip":
+                collected[cat] = size
+
+            temp["sizes_pending"]   = pending
+            temp["sizes_collected"] = collected
+            update_user(chat_id, {"temp_data": temp})
+            user = get_user(chat_id)
+            show_size_for_category(chat_id, user, message_id)
+
+# ── Long-poll main loop worker thread ─────────────────
+
+if __name__ == "__main__":
+    print("🚀 Khabar Telegram Bot router operational...")
+    offset = get_offset()
+    while True:
+        try:
+            updates = tg("getUpdates", {"offset": offset + 1, "timeout": 30})
+            if "result" in updates:
+                for up in updates["result"]:
+                    offset = up["update_id"]
+                    save_offset(offset)
+                    process_update(up)
+        except Exception as e:
+            print(f"Loop cooling failure: {e}")
+            time.sleep(3)
