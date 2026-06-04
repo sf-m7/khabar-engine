@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v9 (Enterprise Resilience Core)
-# Adds: Exponential Backoff, HTTP Adapters, Brand Fault 
-#       Isolation, Transactional Retry Shields, and
-#       Strict Regional Cookie Priming.
+# KHABAR — Scraper v10 (Enterprise Resilience Core)
+# Adds: Exponential Backoff, Brand Fault Isolation,
+#       Regional Cookie Priming, and ASP.NET MVC 
+#       Form-Urlencoded Payload Bypassing.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -51,7 +51,6 @@ CATEGORY_MAP = {
 # ── Resilience & Network Handlers ──────────────────────
 
 def get_resilient_session():
-    """Creates an HTTP session that automatically retries on target server drops."""
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
@@ -60,7 +59,6 @@ def get_resilient_session():
     return session
 
 def safe_db_execute(query, retries=3):
-    """Wraps Supabase transactions in an exponential backoff loop to absorb network drops."""
     delay = 2
     for attempt in range(retries):
         try:
@@ -78,8 +76,7 @@ def safe_db_execute(query, retries=3):
 def normalize_category(text):
     text = text.lower()
     for category, keywords in CATEGORY_MAP.items():
-        if any(kw in text for kw in keywords):
-            return category
+        if any(kw in text for kw in keywords): return category
     return "uncategorized"
 
 def normalize_gender(tags, product_type, title):
@@ -121,10 +118,8 @@ def detect_options(variants):
     return "option2", "option1"
 
 def check_domain(session, domain):
-    try:
-        return session.get(f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
-    except:
-        return False
+    try: return session.get(f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
+    except: return False
 
 # ── Alerts & Snapshots ────────────────────────────────
 
@@ -162,8 +157,7 @@ def load_last_prices(supabase, brand_name):
     today, yesterday = str(date.today()), str(date.today() - timedelta(days=1))
     for target_date in [today, yesterday]:
         result = safe_db_execute(supabase.table("price_snapshots").select("product_id, price").eq("brand", brand_name).eq("snapshot_date", target_date))
-        if result and result.data:
-            return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
+        if result and result.data: return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
     return {}
 
 def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert):
@@ -296,42 +290,45 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt",
         "Origin": f"https://{domain}",
-        "Accept-Language": "en-US,en;q=0.9"
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" # Exact browser header
     }
 
-    # --- THE ULTIMATE FIX: The Warehouse Cookie Primer ---
     try:
         print("  [Network] Priming regional warehouse cookies...")
-        # Hit the regional homepage to lock the EG warehouse state
-        session.get(f"https://{domain}/en-US/EG", headers={"User-Agent": headers["User-Agent"], "Accept-Language": "en-US,en;q=0.9"}, timeout=15)
-        # Hit the target category to lock the menu state
-        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"], "Accept-Language": "en-US,en;q=0.9"}, timeout=15)
-    except Exception as e:
-        print(f"  ⚠️ Session prime warning: {e}")
+        session.get(f"https://{domain}/en-US/EG", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
+        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
+    except:
+        pass 
 
-    # Explicit query matching
-    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId,xhrKeys,CategoryTreeId,FilteringType,xhrKeys&CategoryTreeId=9&FilteringType=26&Layout=three-column&m_5=10"
+    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData"
     
     while True:
         try:
-            # Removed data="" completely so requests performs a pure POST without an empty body
-            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers)
+            # Native Form-Urlencoded POST body mapping
+            payload = {
+                "xhrKeys": "CategoryTreeId,xhrKeys,CategoryTreeId,FilteringType,xhrKeys",
+                "CategoryTreeId": 9,
+                "FilteringType": 26,
+                "PageIndex": page,
+                "Layout": "three-column",
+                "m_5": 10
+            }
+            
+            res = session.post(lcw_url, data=payload, params=payload, timeout=30, headers=headers)
             
             try:
                 data = res.json()
-            except Exception as e:
-                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}. Not JSON.")
+            except:
+                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}.")
                 break
                 
             catalog = data.get("CatalogList") or {}
             items = catalog.get("Items") or []
             
             if not items: 
-                # Check what the server actually thinks we asked for
                 print(f"  ⚠️ LCW returned 0 items on page {page}.")
                 print(f"  ⚠️ Debug ResponseKey: {data.get('ResponseKey')}")
-                
-                # ASP.NET AJAX quirk: Page 1 often returns 0 items intentionally
                 if page == 1:
                     print("  ⚠️ Skipping to page 2...")
                     page += 1
