@@ -1,13 +1,15 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v8 (Network-Hardened Core)
-# Adds: PostgREST Connection Resilience & Fault Shields,
-#        Shopify Batch Engine, LC Waikiki Catalog Engine,
-#        Positional Entropy Options, 5-Day Maturity Shield
+# KHABAR — Scraper v9 (Enterprise Resilience Core)
+# Adds: Exponential Backoff, HTTP Adapters, Brand Fault 
+#       Isolation, and Transactional Retry Shields.
 # ═══════════════════════════════════════════════════════
 
 import os
 import sys
+import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from supabase import create_client
 from datetime import datetime, timezone, timedelta, date
 
@@ -37,19 +39,38 @@ BRAND_DISPLAY = {
 }
 
 CATEGORY_MAP = {
-    "tops":        ["shirt", "t-shirt", "tee", "blouse", "top", "polo",
-                    "sweatshirt", "tank", "henley", "تيشيرت", "بلوزة"],
-    "bottoms":     ["jeans", "trouser", "pant", "short", "skirt", "legging",
-                    "chino", "denim", "jogger", "بنطلون", "جينز"],
-    "dresses":     ["dress", "jumpsuit", "playsuit", "kaftan", "abaya",
-                    "maxi", "midi", "فستان", "عباية"],
-    "outerwear":   ["jacket", "coat", "blazer", "hoodie", "cardigan",
-                    "sweater", "pullover", "جاكيت", "بلوفر"],
-    "footwear":    ["shoe", "sneaker", "sandal", "boot", "flat",
-                    "loafer", "slipper", "حذاء", "سنيكر"],
-    "accessories": ["bag", "belt", "scarf", "hat", "cap", "jewelry",
-                    "watch", "sunglasses", "شنطة", "حزام"],
+    "tops":        ["shirt", "t-shirt", "tee", "blouse", "top", "polo", "sweatshirt", "tank", "henley", "تيشيرت", "بلوزة"],
+    "bottoms":     ["jeans", "trouser", "pant", "short", "skirt", "legging", "chino", "denim", "jogger", "بنطلون", "جينز"],
+    "dresses":     ["dress", "jumpsuit", "playsuit", "kaftan", "abaya", "maxi", "midi", "فستان", "عباية"],
+    "outerwear":   ["jacket", "coat", "blazer", "hoodie", "cardigan", "sweater", "pullover", "جاكيت", "بلوفر"],
+    "footwear":    ["shoe", "sneaker", "sandal", "boot", "flat", "loafer", "slipper", "حذاء", "سنيكر"],
+    "accessories": ["bag", "belt", "scarf", "hat", "cap", "jewelry", "watch", "sunglasses", "شنطة", "حزام"],
 }
+
+# ── Resilience & Network Handlers ──────────────────────
+
+def get_resilient_session():
+    """Creates an HTTP session that automatically retries on target server drops."""
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+def safe_db_execute(query, retries=3):
+    """Wraps Supabase transactions in an exponential backoff loop to absorb network drops."""
+    delay = 2
+    for attempt in range(retries):
+        try:
+            return query.execute()
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"  ❌ Supabase transaction permanently failed: {e}")
+                return None
+            print(f"  ⚠️ Supabase connection dropped. Retrying in {delay}s... (Attempt {attempt+1}/{retries})")
+            time.sleep(delay)
+            delay *= 2
 
 # ── Helpers ───────────────────────────────────────────
 
@@ -62,168 +83,124 @@ def normalize_category(text):
 
 def normalize_gender(tags, product_type, title):
     text = f"{' '.join(tags)} {product_type} {title}".lower()
-    if any(w in text for w in ["women", "woman", "female", "ladies", "girl", "نسائي"]):
-        return "women"
-    if any(w in text for w in ["men", "man", "male", "gents", "رجالي"]):
-        return "men"
-    if any(w in text for w in ["kid", "child", "baby", "infant", "أطفال"]):
-        return "kids"
+    if any(w in text for w in ["women", "woman", "female", "ladies", "girl", "نسائي"]): return "women"
+    if any(w in text for w in ["men", "man", "male", "gents", "رجالي"]): return "men"
+    if any(w in text for w in ["kid", "child", "baby", "infant", "أطفال"]): return "kids"
     return "unisex"
 
 def detect_options(variants):
-    if not variants:
-        return "option1", "option2"
-
+    if not variants: return "option1", "option2"
     opt1_values = [str(v.get("option1", "")).strip() for v in variants if v.get("option1")]
     opt2_values = [str(v.get("option2", "")).strip() for v in variants if v.get("option2")]
     opt3_values = [str(v.get("option3", "")).strip() for v in variants if v.get("option3")]
 
-    u_opt1 = len(set(opt1_values))
-    u_opt2 = len(set(opt2_values))
-    u_opt3 = len(set(opt3_values))
+    u_opt1, u_opt2, u_opt3 = len(set(opt1_values)), len(set(opt2_values)), len(set(opt3_values))
 
     if len(variants) > 1 and (u_opt1 == 1 or u_opt2 == 0) and u_opt2 <= 1 and u_opt3 == 0:
-        if u_opt2 > u_opt1:
-            return "option2", "option1"
+        if u_opt2 > u_opt1: return "option2", "option1"
         return "option1", ("option2" if opt2_values else None)
 
-    def score_column_content(values):
+    def score_col(values):
         score = 0
-        size_flags = {"xs", "s", "m", "l", "xl", "xxl", "3xl", "4xl", "5xl", "os", "one size", "small", "medium", "large"}
+        size_flags = {"xs", "s", "m", "l", "xl", "xxl", "3xl", "4xl", "os", "one size", "small", "medium", "large"}
         for val in set(values):
             v_low = val.lower()
             if v_low in size_flags: score += 10
             if v_low.isdigit() and (4 <= int(v_low) <= 56): score += 5
         return score
 
-    scores = {
-        "option1": score_column_content(opt1_values),
-        "option2": score_column_content(opt2_values),
-        "option3": score_column_content(opt3_values)
-    }
-
+    scores = {"option1": score_col(opt1_values), "option2": score_col(opt2_values), "option3": score_col(opt3_values)}
     size_key = max(scores, key=scores.get)
     if scores[size_key] > 0:
         remaining = [k for k in ["option1", "option2", "option3"] if k != size_key and (any(v.get(k) for v in variants))]
-        color_key = remaining[0] if remaining else None
-        return size_key, color_key
+        return size_key, (remaining[0] if remaining else None)
 
     if u_opt1 >= u_opt2 and u_opt1 >= u_opt3:
         return "option1", ("option2" if u_opt2 > 0 else "option3" if u_opt3 > 0 else None)
     return "option2", "option1"
 
-def check_domain(domain):
+def check_domain(session, domain):
     try:
-        r = requests.get(f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        return r.status_code == 200
+        return session.get(f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
     except:
         return False
 
 # ── Alerts & Snapshots ────────────────────────────────
 
-def send_telegram(chat_id, text):
+def send_telegram(session, chat_id, text):
     if not TELEGRAM_BOT_TOKEN: return
-    try: requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+    try: session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
     except: pass
 
-def find_and_alert_users(supabase, brand, category, variant_size, current_price, discount_pct, product_name, product_url, variant_baseline):
+def find_and_alert_users(supabase, session, brand, category, variant_size, current_price, product_name, product_url, variant_baseline):
     if not TELEGRAM_BOT_TOKEN or not variant_baseline or current_price >= variant_baseline: return
-    try:
-        matches = supabase.table("user_sizes").select("user_id, users!inner(telegram_id, conversation_state, price_ceiling)").eq("category", category).eq("size", variant_size).execute()
-        if not matches.data: return
-        for row in matches.data:
-            user_info = row.get("users")
-            if not user_info or user_info.get("conversation_state") != "active": continue
-            uid = user_info["telegram_id"]
-            ceiling = user_info.get("price_ceiling")
-            if ceiling and current_price > float(ceiling): continue
-            brand_check = supabase.table("user_brands").select("user_id").eq("user_id", uid).eq("brand", brand).execute()
-            if not brand_check.data: continue
-            honest_discount = round(((variant_baseline - current_price) / variant_baseline) * 100)
-            alert = (
-                f"🔥 <b>Deal Alert — {BRAND_DISPLAY.get(brand, brand)}</b>\n\n"
-                f"<b>{product_name}</b>\n"
-                f"Size: <b>{variant_size}</b>\n"
-                f"Was: <s>{int(variant_baseline)} EGP</s>  →  "
-                f"<b>Now: {int(current_price)} EGP</b>\n"
-                f"<b>{honest_discount}% OFF (True Discount)</b>\n\n"
-                f"👉 <a href='{product_url}'>Shop now</a>"
-            )
-            send_telegram(uid, alert)
-    except: pass
+    matches = safe_db_execute(supabase.table("user_sizes").select("user_id, users!inner(telegram_id, conversation_state, price_ceiling)").eq("category", category).eq("size", variant_size))
+    if not matches or not matches.data: return
+    
+    for row in matches.data:
+        user_info = row.get("users")
+        if not user_info or user_info.get("conversation_state") != "active": continue
+        uid = user_info["telegram_id"]
+        ceiling = user_info.get("price_ceiling")
+        if ceiling and current_price > float(ceiling): continue
+        brand_check = safe_db_execute(supabase.table("user_brands").select("user_id").eq("user_id", uid).eq("brand", brand))
+        if not brand_check or not brand_check.data: continue
+        
+        honest_discount = round(((variant_baseline - current_price) / variant_baseline) * 100)
+        alert = (
+            f"🔥 <b>Deal Alert — {BRAND_DISPLAY.get(brand, brand)}</b>\n\n"
+            f"<b>{product_name}</b>\n"
+            f"Size: <b>{variant_size}</b>\n"
+            f"Was: <s>{int(variant_baseline)} EGP</s>  →  <b>Now: {int(current_price)} EGP</b>\n"
+            f"<b>{honest_discount}% OFF (True Discount)</b>\n\n"
+            f"👉 <a href='{product_url}'>Shop now</a>"
+        )
+        send_telegram(session, uid, alert)
 
 def load_last_prices(supabase, brand_name):
     today, yesterday = str(date.today()), str(date.today() - timedelta(days=1))
     for target_date in [today, yesterday]:
-        try:
-            result = supabase.table("price_snapshots").select("product_id, price").eq("brand", brand_name).eq("snapshot_date", target_date).execute()
-            if result.data:
-                return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
-        except Exception as e:
-            print(f"  ⚠️ Supabase snapshot load dropped via connection timeout: {e}")
-            break
+        result = safe_db_execute(supabase.table("price_snapshots").select("product_id, price").eq("brand", brand_name).eq("snapshot_date", target_date))
+        if result and result.data:
+            return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
     return {}
 
 def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert):
     if not variant_records: return
     prices = [v["_meta_price"] for v in variant_records]
-    try:
-        if len(set(prices)) == 1:
-            vd = variant_records[0]
-            row = {"product_id": db_product_id, "variant_id": None, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
-            if use_insert: supabase.table("price_snapshots").insert(row).execute()
-            else: supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("product_id", db_product_id).eq("snapshot_date", str(today)).execute()
-        else:
-            for vd in variant_records:
-                vid = vd.get("variant_db_id")
-                if not vid: continue
-                row = {"product_id": None, "variant_id": vid, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
-                if use_insert: supabase.table("price_snapshots").insert(row).execute()
-                else: supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("variant_id", vid).eq("snapshot_date", str(today)).execute()
-    except Exception as e:
-        print(f"  ⚠️ Snapshot row transaction skipped due to gateway load: {e}")
+    if len(set(prices)) == 1:
+        vd = variant_records[0]
+        row = {"product_id": db_product_id, "variant_id": None, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
+        if use_insert: safe_db_execute(supabase.table("price_snapshots").insert(row))
+        else: safe_db_execute(supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("product_id", db_product_id).eq("snapshot_date", str(today)))
+    else:
+        for vd in variant_records:
+            vid = vd.get("variant_db_id")
+            if not vid: continue
+            row = {"product_id": None, "variant_id": vid, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
+            if use_insert: safe_db_execute(supabase.table("price_snapshots").insert(row))
+            else: safe_db_execute(supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("variant_id", vid).eq("snapshot_date", str(today)))
 
-def purge_old_events(supabase):
-    cutoff_events, cutoff_snapshots = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(), str(date.today() - timedelta(days=365))
-    try:
-        supabase.table("price_events").delete().lt("recorded_at", cutoff_events).execute()
-        supabase.table("price_snapshots").delete().lt("snapshot_date", cutoff_snapshots).execute()
-    except Exception as e:
-        print(f"  ⚠️ Database housecleaning loop postponed: {e}")
-
-def detect_and_write_stockout(supabase, variant_db_id, product_id, brand, size, color, previous_in_stock, current_in_stock, current_price, variant_baseline):
-    if previous_in_stock == current_in_stock: return
-    event_type = "stockout" if (previous_in_stock and not current_in_stock) else "restock"
-    discount_pct = round(((variant_baseline - current_price) / variant_baseline) * 100, 2) if (variant_baseline and current_price < variant_baseline) else None
-    try:
-        supabase.table("stockout_events").insert({"variant_id": variant_db_id, "product_id": product_id, "brand": brand, "size": size, "color": color, "event_type": event_type, "price_at_event": current_price, "discount_pct_at_event": discount_pct, "was_on_discount": bool(discount_pct), "recorded_at": datetime.now(timezone.utc).isoformat()}).execute()
-    except: pass
-
-def verify_run_integrity(supabase, brand_name):
-    print(f"🔬 Running automated data quality shield for {brand_name}...")
-    try:
-        corrupted = supabase.table("product_variants").select("id").eq("is_in_stock", True).in_("size", ["Blue", "Red", "Black", "White"]).execute()
-        if len(corrupted.data) > 0: return False
-        print("  ✅ Data stream integrity fully verified.")
-        return True
-    except:
-        return True
+def detect_and_write_stockout(supabase, variant_db_id, product_id, brand, size, color, prev_stock, curr_stock, curr_price, baseline):
+    if prev_stock == curr_stock: return
+    event_type = "stockout" if (prev_stock and not curr_stock) else "restock"
+    discount_pct = round(((baseline - curr_price) / baseline) * 100, 2) if (baseline and curr_price < baseline) else None
+    safe_db_execute(supabase.table("stockout_events").insert({"variant_id": variant_db_id, "product_id": product_id, "brand": brand, "size": size, "color": color, "event_type": event_type, "price_at_event": curr_price, "discount_pct_at_event": discount_pct, "was_on_discount": bool(discount_pct), "recorded_at": datetime.now(timezone.utc).isoformat()}))
 
 # ── Ingestion Routers ─────────────────────────────────
 
-def scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_state):
+def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state):
     page, products_seen, price_changes = 1, 0, 0
-    
-    # Catch connection timeouts gracefully when evaluating today's row initialization states
-    try:
-        use_insert = len(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1).execute().data) == 0
-    except:
-        use_insert = True
+    check_insert = safe_db_execute(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1))
+    use_insert = len(check_insert.data) == 0 if (check_insert and check_insert.data is not None) else True
 
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
-        try: response = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        except: break
+        try: response = session.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        except Exception as e:
+            print(f"  ⚠️ HTTP fault on page {page}: {e}")
+            break
+            
         if response.status_code != 200: break
         products = response.json().get("products", [])
         if not products: break
@@ -235,15 +212,9 @@ def scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_
 
         if not batch_products: break
         product_upsert_rows = []
-        try:
-            for i in range(0, len(batch_products), 100):
-                chunk = batch_products[i:i+100]
-                res = supabase.table("products").upsert(chunk, on_conflict="brand,external_id").execute()
-                product_upsert_rows.extend(res.data)
-        except Exception as e:
-            print(f"  ⚠️ Core product batch ingest bottlenecked via database channel: {e}")
-            page += 1
-            continue
+        for i in range(0, len(batch_products), 100):
+            res = safe_db_execute(supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id"))
+            if res and res.data: product_upsert_rows.extend(res.data)
         
         product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
         products_seen += len(batch_products)
@@ -264,21 +235,15 @@ def scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_
                 sku = f"{domain}_{v['id']}"
                 prev = prev_stock_state.get(sku)
                 v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
-                discount_honest = round(((v_baseline - price) / v_baseline) * 100, 2) if v_baseline > price else None
 
-                batch_variants.append({"product_id": db_pid, "external_sku": sku, "color": color, "size": size, "is_in_stock": available, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(), "_meta_price": price, "_meta_compare": compare_at, "_meta_discount_honest": discount_honest, "_meta_baseline": v_baseline, "_meta_size": size, "_meta_color": color, "_meta_available": available})
+                batch_variants.append({"product_id": db_pid, "external_sku": sku, "color": color, "size": size, "is_in_stock": available, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(), "_meta_price": price, "_meta_compare": compare_at, "_meta_baseline": v_baseline, "_meta_size": size, "_meta_color": color, "_meta_available": available})
 
         if batch_variants:
             db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants]
             variant_upsert_rows = []
-            try:
-                for i in range(0, len(db_payload), 100):
-                    res = supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku").execute()
-                    variant_upsert_rows.extend(res.data)
-            except Exception as e:
-                print(f"  ⚠️ Child variant records transaction dropped on page {page}: {e}")
-                page += 1
-                continue
+            for i in range(0, len(db_payload), 100):
+                res = safe_db_execute(supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku"))
+                if res and res.data: variant_upsert_rows.extend(res.data)
             
             sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
             for vr in batch_variants: vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
@@ -294,11 +259,8 @@ def scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_
                     if prev_v: detect_and_write_stockout(supabase, rec["variant_db_id"], db_pid, brand_name, rec["_meta_size"], rec["_meta_color"], prev_v["is_in_stock"], rec["_meta_available"], rec["_meta_price"], rec["_meta_baseline"])
                     
                     curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                    try:
-                        last_ev = supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1).execute()
-                        last_p = float(last_ev.data[0]["price_after"]) if last_ev.data else None
-                    except:
-                        last_p = None
+                    last_ev = safe_db_execute(supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1))
+                    last_p = float(last_ev.data[0]["price_after"]) if (last_ev and last_ev.data) else None
 
                     if last_p is None or abs(last_p - curr_price) > 0.01:
                         direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
@@ -309,52 +271,41 @@ def scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_
                                 if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
                                     for p in products:
                                         if str(p["id"]) == [k for k, v in product_id_map.items() if v == db_pid][0]:
-                                            find_and_alert_users(supabase, brand_name, rec["_meta_size"], curr_price, rec["_meta_discount_honest"], p["title"], f"https://{domain}/products/{p['handle']}", v_base)
+                                            find_and_alert_users(supabase, session, brand_name, rec["_meta_size"], curr_price, p["title"], f"https://{domain}/products/{p['handle']}", v_base)
 
-                        try:
-                            supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}).execute()
-                        except:
-                            pass
+                        safe_db_execute(supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}))
         page += 1
     return products_seen, price_changes
 
-def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_state):
+def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     print("  Executing LC Waikiki Dynamic Catalog Engine...")
     page, products_seen, price_changes = 1, 0, 0
-    try:
-        use_insert = len(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1).execute().data) == 0
-    except:
-        use_insert = True
+    check_insert = safe_db_execute(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1))
+    use_insert = len(check_insert.data) == 0 if (check_insert and check_insert.data is not None) else True
 
     lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId&CategoryTreeId=9&FilteringType=26&Layout=three-column"
     
     while True:
         try:
-            res = requests.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers={"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest"})
+            res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers={"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest"})
             if res.status_code != 200: break
-            catalog = res.json().get("CatalogList", {})
-            items = catalog.get("Items", [])
+            items = res.json().get("CatalogList", {}).get("Items", [])
             if not items: break
-        except:
+        except Exception as e:
+            print(f"  ⚠️ LCW Page {page} Network Fault: {e}")
             break
 
         batch_products = []
         for item in items:
             desc = item.get("ProductDescription") or item.get("BrandPropertyDescription")
             if not desc: continue
-            model_id = str(item["ModelId"])
-            batch_products.append({"brand": brand_name, "external_id": model_id, "name": desc, "category_raw": "Shirt", "category_normalized": "tops", "gender": "men", "sizes_available": [], "url": f"https://{domain}{item.get('ModelUrl','')}", "image_url": item.get("DefaultOptionImageUrl"), "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True})
+            batch_products.append({"brand": brand_name, "external_id": str(item["ModelId"]), "name": desc, "category_raw": "Shirt", "category_normalized": "tops", "gender": "men", "sizes_available": [], "url": f"https://{domain}{item.get('ModelUrl','')}", "image_url": item.get("DefaultOptionImageUrl"), "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True})
 
         if not batch_products: break
         product_upsert_rows = []
-        try:
-            for i in range(0, len(batch_products), 100):
-                res_p = supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id").execute()
-                product_upsert_rows.extend(res_p.data)
-        except Exception as e:
-            print(f"  ⚠️ LCW category sync channel bottlenecked: {e}")
-            page += 1
-            continue
+        for i in range(0, len(batch_products), 100):
+            res_p = safe_db_execute(supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id"))
+            if res_p and res_p.data: product_upsert_rows.extend(res_p.data)
 
         product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
         products_seen += len(batch_products)
@@ -367,16 +318,14 @@ def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_stat
             opt_id = item.get("OptionId")
             
             try:
-                opt_res = requests.get(f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                sizes_data = opt_res.json() if opt_res.status_code == 200 else []
+                opt_res = session.get(f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                sizes_data = opt_res.json() if opt_res.status_code == 200 else [{"Size": "One Size", "IsAvailable": True}]
             except:
-                sizes_data = []
+                sizes_data = [{"Size": "One Size", "IsAvailable": True}]
 
             price = float(item.get("PriceValue") or 0)
             old_price_str = item.get("OldPrice") or ""
             compare_at = float(''.join(c for c in old_price_str if c.isdigit() or c=='.')) if any(c.isdigit() for c in old_price_str) else None
-
-            if not sizes_data: sizes_data = [{"Size": "One Size", "IsAvailable": True}]
 
             for s_entry in sizes_data:
                 size_label = s_entry.get("Size") or "One Size"
@@ -385,21 +334,15 @@ def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_stat
                 
                 prev = prev_stock_state.get(sku)
                 v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
-                discount_honest = round(((v_baseline - price) / v_baseline) * 100, 2) if v_baseline > price else None
 
-                batch_variants.append({"product_id": db_pid, "external_sku": sku, "color": None, "size": size_label, "is_in_stock": is_avail, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(), "_meta_price": price, "_meta_compare": compare_at, "_meta_discount_honest": discount_honest, "_meta_baseline": v_baseline, "_meta_size": size_label, "_meta_available": is_avail})
+                batch_variants.append({"product_id": db_pid, "external_sku": sku, "color": None, "size": size_label, "is_in_stock": is_avail, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(), "_meta_price": price, "_meta_compare": compare_at, "_meta_baseline": v_baseline, "_meta_size": size_label, "_meta_available": is_avail})
 
         if batch_variants:
             db_payload = [{k: v for k, v in row.items() if not k.startswith('_meta_')} for row in batch_variants]
             variant_upsert_rows = []
-            try:
-                for i in range(0, len(db_payload), 100):
-                    res_v = supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku").execute()
-                    variant_upsert_rows.extend(res_v.data)
-            except Exception as e:
-                print(f"  ⚠️ LCW size row batch commit dropped on page {page}: {e}")
-                page += 1
-                continue
+            for i in range(0, len(db_payload), 100):
+                res_v = safe_db_execute(supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku"))
+                if res_v and res_v.data: variant_upsert_rows.extend(res_v.data)
 
             sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
             for vr in batch_variants: vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
@@ -415,11 +358,8 @@ def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_stat
                     if prev_v: detect_and_write_stockout(supabase, rec["variant_db_id"], db_pid, brand_name, rec["_meta_size"], None, prev_v["is_in_stock"], rec["_meta_available"], rec["_meta_price"], rec["_meta_baseline"])
                     
                     curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                    try:
-                        last_ev = supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1).execute()
-                        last_p = float(last_ev.data[0]["price_after"]) if last_ev.data else None
-                    except:
-                        last_p = None
+                    last_ev = safe_db_execute(supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1))
+                    last_p = float(last_ev.data[0]["price_after"]) if (last_ev and last_ev.data) else None
 
                     if last_p is None or abs(last_p - curr_price) > 0.01:
                         direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
@@ -431,12 +371,9 @@ def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_stat
                                     for item in items:
                                         if str(item["ModelId"]) == [k for k, v in product_id_map.items() if v == db_pid][0]:
                                             desc = item.get("ProductDescription") or "LCW Item"
-                                            find_and_alert_users(supabase, brand_name, "tops", rec["_meta_size"], curr_price, rec["_meta_discount_honest"], desc, f"https://{domain}{item.get('ModelUrl','')}", v_base)
+                                            find_and_alert_users(supabase, session, brand_name, "tops", rec["_meta_size"], curr_price, desc, f"https://{domain}{item.get('ModelUrl','')}", v_base)
 
-                        try:
-                            supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}).execute()
-                        except:
-                            pass
+                        safe_db_execute(supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}))
         page += 1
         if page > 5: break
     return products_seen, price_changes
@@ -444,44 +381,51 @@ def scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_stat
 def scrape_brand(brand_name, domain):
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        session = get_resilient_session()
     except Exception as e:
-        print(f"❌ Failed to instantiate Supabase transaction context client: {e}")
+        print(f"❌ Initialization failed for {brand_name}: {e}")
         return 0
 
     today = date.today()
     print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
-    if not check_domain(domain): return 0
-
-    last_prices = load_last_prices(supabase, brand_name)
     
-    # Secure existing database variants retrieval loop inside a network-fault shield block
+    # ── BRAND ISOLATION ZONE ──
+    # If any catastrophic error occurs in a specific brand's code logic or network,
+    # it is caught here. The script logs it, quarantines the brand, and continues.
     try:
-        existing_variants = supabase.table("product_variants").select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at").execute()
-        prev_stock_state = {row["external_sku"]: row for row in existing_variants.data}
+        if not check_domain(session, domain): 
+            print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
+            return 0
+
+        existing_variants = safe_db_execute(supabase.table("product_variants").select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at"))
+        prev_stock_state = {row["external_sku"]: row for row in existing_variants.data} if (existing_variants and existing_variants.data) else {}
+
+        brand_config = next(b for b in BRANDS if b["name"] == brand_name)
+        
+        if brand_config["engine"] == "shopify":
+            seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state)
+        elif brand_config["engine"] == "lcw_ajax":
+            seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state)
+        else:
+            seen, changes = 0, 0
+
+        print(f"\n  ✅ {brand_name}: {seen} products scanned, {changes} price changes recorded.")
+        return changes
+
     except Exception as e:
-        print(f"  ⚠️ Skipping inventory state baseline pull due to PostgREST connection timeout: {e}")
-        prev_stock_state = {}
-
-    brand_config = next(b for b in BRANDS if b["name"] == brand_name)
-    
-    if brand_config["engine"] == "shopify":
-        seen, changes = scrape_shopify(supabase, brand_name, domain, today, last_prices, prev_stock_state)
-    elif brand_config["engine"] == "lcw_ajax":
-        seen, changes = scrape_lcw(supabase, brand_name, domain, today, last_prices, prev_stock_state)
-    else:
-        seen, changes = 0, 0
-
-    print(f"\n  ✅ {brand_name}: {seen} products scanned, {changes} price changes recorded.")
-    verify_run_integrity(supabase, brand_name)
-    return changes
+        print(f"\n  🚨 CRITICAL FAILURE in {brand_name.upper()} pipeline: {e}")
+        print(f"  ⚠️ Quarantining {brand_name} fault. Moving safely to next brand.")
+        return 0
 
 if __name__ == "__main__":
-    print("🚀 Khabar multi-architecture scraper starting...")
+    print("🚀 Khabar Network-Hardened Scraper starting...")
     try:
         _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        purge_old_events(_sb)
+        cutoff_ev, cutoff_snap = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(), str(date.today() - timedelta(days=365))
+        safe_db_execute(_sb.table("price_events").delete().lt("recorded_at", cutoff_ev))
+        safe_db_execute(_sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap))
     except Exception as e:
-        print(f"⚠️ Pre-run setup hook skipped: {e}")
+        print(f"⚠️ Pre-run housecleaning dropped: {e}")
     
     total = sum(scrape_brand(b["name"], b["domain"]) for b in BRANDS)
     print(f"\n🏁 All done. Total price changes this run: {total}")
