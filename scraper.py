@@ -1,7 +1,8 @@
 # ═══════════════════════════════════════════════════════
 # KHABAR — Scraper v9 (Enterprise Resilience Core)
 # Adds: Exponential Backoff, HTTP Adapters, Brand Fault 
-#       Isolation, and Transactional Retry Shields.
+#       Isolation, Transactional Retry Shields, and
+#       LC Waikiki Soft-404 Bypassing.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -281,10 +282,15 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     print("  Executing LC Waikiki Dynamic Catalog Engine...")
     page, products_seen, price_changes = 1, 0, 0
-    check_insert = safe_db_execute(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1))
-    use_insert = len(check_insert.data) == 0 if (check_insert and check_insert.data is not None) else True
+    
+    try:
+        check_insert = safe_db_execute(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1))
+        use_insert = len(check_insert.data) == 0 if (check_insert and check_insert.data is not None) else True
+    except:
+        use_insert = True
 
-    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId&CategoryTreeId=9&FilteringType=26&Layout=three-column"
+    # Updated URL with strict parameter matching (m_5=10)
+    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId&CategoryTreeId=9&FilteringType=26&Layout=three-column&m_5=10"
     
     while True:
         try:
@@ -297,18 +303,18 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             }
             res = session.post(f"{lcw_url}&PageIndex={page}", timeout=30, headers=headers)
             
-            # Print the exact error if the firewall blocks us
-            if res.status_code != 200: 
-                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}")
-                print(f"  ⚠️ Raw Response: {res.text[:250]}")
+            # Bypass strict HTTP code checking. If it parses as JSON, we take it!
+            try:
+                data = res.json()
+            except Exception as e:
+                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}. Not JSON.")
                 break
                 
-            catalog = res.json().get("CatalogList", {})
+            catalog = data.get("CatalogList", {})
             items = catalog.get("Items", [])
             
-            # Print an error if the layout changed
             if not items: 
-                print(f"  ⚠️ LCW returned 200 OK, but no Items found. JSON keys: {list(res.json().keys())}")
+                print(f"  ⚠️ LCW returned 0 items on page {page}. Ending pagination loop.")
                 break
                 
         except Exception as e:
