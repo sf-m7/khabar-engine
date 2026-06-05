@@ -1,8 +1,7 @@
 # ═══════════════════════════════════════════════════════
 # KHABAR — Scraper v10 (Enterprise Resilience Core)
 # Adds: Exponential Backoff, Brand Fault Isolation,
-#       Regional Cookie Priming, and ASP.NET MVC 
-#       Form-Urlencoded Payload Bypassing.
+#       Regional Cookie Priming, and Raw AJAX Routing.
 # ═══════════════════════════════════════════════════════
 
 import os
@@ -284,43 +283,34 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     except:
         use_insert = True
 
+    # Removed forced Content-Type. Let requests process it as a clean empty-body POST.
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"https://{domain}/en/men-clothing-t-9?product-type=shirt",
         "Origin": f"https://{domain}",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" # Exact browser header
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
     try:
         print("  [Network] Priming regional warehouse cookies...")
-        session.get(f"https://{domain}/en-US/EG", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
-        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers={"User-Agent": headers["User-Agent"]}, timeout=15)
+        session.get(f"https://{domain}/en-US/EG", headers=headers, timeout=15)
+        session.get(f"https://{domain}/en/men-clothing-t-9?product-type=shirt", headers=headers, timeout=15)
     except:
         pass 
 
-    lcw_url = "https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData"
-    
     while True:
         try:
-            # Native Form-Urlencoded POST body mapping
-            payload = {
-                "xhrKeys": "CategoryTreeId,xhrKeys,CategoryTreeId,FilteringType,xhrKeys",
-                "CategoryTreeId": 9,
-                "FilteringType": 26,
-                "PageIndex": page,
-                "Layout": "three-column",
-                "m_5": 10
-            }
+            # Absolute hardcoded URL string matching the exact browser trace. No requests 'data' or 'params' variables.
+            target_url = f"https://{domain}/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId,xhrKeys,CategoryTreeId,FilteringType,xhrKeys&CategoryTreeId=9&FilteringType=26&PageIndex={page}&Layout=three-column&m_5=10"
             
-            res = session.post(lcw_url, data=payload, params=payload, timeout=30, headers=headers)
+            res = session.post(target_url, timeout=30, headers=headers)
             
             try:
                 data = res.json()
-            except:
-                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}.")
+            except Exception as e:
+                print(f"  ⚠️ LCW Firewall Blocked Page {page}. HTTP Code: {res.status_code}. Not JSON.")
                 break
                 
             catalog = data.get("CatalogList") or {}
@@ -329,10 +319,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not items: 
                 print(f"  ⚠️ LCW returned 0 items on page {page}.")
                 print(f"  ⚠️ Debug ResponseKey: {data.get('ResponseKey')}")
-                if page == 1:
-                    print("  ⚠️ Skipping to page 2...")
-                    page += 1
-                    continue
                 break
                 
         except Exception as e:
