@@ -372,6 +372,12 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers):
     """
     Fetches one page of products for a given LCW category.
     Returns the parsed JSON dict or None on failure.
+
+    IMPORTANT — must be POST, not GET.
+    Confirmed via browser Network tab: Request Method = POST.
+    LCW returns HTTP 404 for GET requests even with correct query params.
+    The Content-Type: application/json header is also required.
+    Session cookies (set during priming) are carried automatically.
     """
     url = (
         f"https://{domain}/en/ajax/ProductList/ProductListPageData"
@@ -380,8 +386,11 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers):
         f"&PageIndex={page_index}"
         f"&Layout=three-column"
     )
+    # Merge in Content-Type — required for POST to be accepted
+    post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        res = session.get(url, timeout=30, headers=headers)
+        # POST with empty JSON body — LCW only reads query params for category listing
+        res = session.post(url, json={}, timeout=30, headers=post_headers)
         if res.status_code != 200:
             print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
@@ -421,11 +430,20 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "Referer": f"https://{domain}/en/women-t-1",
     }
 
-    # Prime session cookies — LCW needs a warm session to return product data
+    # Prime session cookies — LCW needs a warm session to return product data.
+    # We hit the homepage (not a category page) because the homepage issues ALL
+    # the required cookies in one response: visitorId, GeoSettings, ASP.NET_SessionId,
+    # guestSessionId. The session object stores them automatically and sends them
+    # on every subsequent request, including the POST API calls.
     try:
-        session.get(f"https://{domain}/en/women-t-1", headers=headers, timeout=15)
-    except Exception:
-        pass
+        print("  [LCW] Priming session cookies via homepage...")
+        prime_headers = {**headers}
+        prime_headers.pop("Content-Type", None)  # homepage is a GET
+        session.get(f"https://{domain}", headers=prime_headers, timeout=20)
+        session.get(f"https://{domain}/en/women-t-1", headers=prime_headers, timeout=15)
+        print("  [LCW] Session primed.")
+    except Exception as e:
+        print(f"  [LCW] Cookie priming failed (non-fatal): {e}")
 
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
