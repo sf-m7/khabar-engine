@@ -21,6 +21,18 @@ SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# ── Webshare residential proxy ────────────────────────────────────────────────
+# LCW's API is protected by Akamai Bot Manager, which blocks datacenter IPs.
+# Webshare rotating residential proxy gives GitHub Actions a real home-user IP.
+# Credentials stored as GitHub Secrets: WEBSHARE_PROXY_USERNAME / PASSWORD.
+# Endpoint p.webshare.io:80 is Webshare's backbone — IP rotates each request.
+WEBSHARE_USER  = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
+WEBSHARE_PASS  = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
+WEBSHARE_PROXY = {
+    "http":  f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
+    "https": f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
+} if WEBSHARE_USER and WEBSHARE_PASS else None
+
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_ajax"},
     {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
@@ -358,7 +370,7 @@ def lcw_fetch_sizes(session, domain, opt_id, headers):
     """
     try:
         url = f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}"
-        res = session.get(url, timeout=10, headers=headers)
+        res = session.get(url, timeout=10, headers=headers, proxies=WEBSHARE_PROXY)
         if res.status_code == 200:
             data = res.json()
             # The response is either a list directly or wrapped in a key
@@ -698,15 +710,32 @@ def scrape_brand(brand_name, domain):
             print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
             return 0
 
-        existing_variants = safe_db_execute(supabase.table("product_variants").select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at"))
-        prev_stock_state = {row["external_sku"]: row for row in existing_variants.data} if (existing_variants and existing_variants.data) else {}
+        # Paginate past Supabase 1,000-row cap, filtered to this brand only.
+        all_variant_rows, offset = [], 0
+        while True:
+            chunk = safe_db_execute(
+                supabase.table("product_variants")
+                .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at")
+                .eq("brand", brand_name)
+                .range(offset, offset + 999)
+            )
+            rows = chunk.data if (chunk and chunk.data) else []
+            all_variant_rows.extend(rows)
+            if len(rows) < 1000:
+                break
+            offset += 1000
+        prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
 
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
         
         if brand_config["engine"] == "shopify":
             seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state)
-        elif brand_config["engine"] == "lcw_ajax":
-            seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state)
+        elif brand_config["engine"] == "lcw_proxy":
+            if not WEBSHARE_PROXY:
+                print("  ⚠️ WEBSHARE credentials not set. Skipping LCW.")
+                seen, changes = 0, 0
+            else:
+                seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state)
         else:
             seen, changes = 0, 0
 
