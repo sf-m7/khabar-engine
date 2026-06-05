@@ -4,6 +4,7 @@
 #       Regional Cookie Priming, and Raw AJAX Routing.
 # ═══════════════════════════════════════════════════════
 
+import json
 import os
 import sys
 import time
@@ -368,16 +369,24 @@ def lcw_fetch_sizes(session, domain, opt_id, headers):
         pass
     return [{"Size": "One Size", "IsAvailable": True}]
 
-def lcw_fetch_page(session, domain, category_id, page_index, headers):
+def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None):
     """
     Fetches one page of products for a given LCW category.
     Returns the parsed JSON dict or None on failure.
 
-    IMPORTANT — must be POST, not GET.
-    Confirmed via browser Network tab: Request Method = POST.
-    LCW returns HTTP 404 for GET requests even with correct query params.
-    The Content-Type: application/json header is also required.
-    Session cookies (set during priming) are carried automatically.
+    HOW LCW PAGINATION WORKS (confirmed from browser Payload tab):
+    LCW does NOT use standard offset/page pagination.
+    It uses a "show me what I haven't seen yet" pattern via LastSeenOptionIdsJson.
+    - Page 1: LastSeenOptionIdsJson = "[]"  (empty — haven't seen anything yet)
+    - Page 2: LastSeenOptionIdsJson = "[id1,id2,...id103]"  (all IDs from page 1)
+    - Page 3: LastSeenOptionIdsJson = "[id1,...id206]"  (all IDs from pages 1+2)
+    PageIndex is still sent in the query string alongside this.
+
+    The request body also requires CategoryParameterList (empty = no filters)
+    and FilterListJson (empty = no filters).
+
+    MUST be POST with Content-Type: application/json.
+    Session cookies from priming are required and carried automatically.
     """
     url = (
         f"https://{domain}/en/ajax/ProductList/ProductListPageData"
@@ -386,11 +395,15 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers):
         f"&PageIndex={page_index}"
         f"&Layout=three-column"
     )
-    # Merge in Content-Type — required for POST to be accepted
+    # Build the request body exactly as the browser sends it
+    body = {
+        "CategoryParameterList": [],   # empty = no active filters
+        "FilterListJson": "[]",        # empty = no active filters
+        "LastSeenOptionIdsJson": json.dumps(seen_ids or []),  # accumulating seen IDs
+    }
     post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        # POST with empty JSON body — LCW only reads query params for category listing
-        res = session.post(url, json={}, timeout=30, headers=post_headers)
+        res = session.post(url, json=body, timeout=30, headers=post_headers)
         if res.status_code != 200:
             print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
@@ -449,7 +462,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
 
-        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers)
+        # seen_ids accumulates across pages — passed as LastSeenOptionIdsJson each call
+        seen_ids = []
+
+        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[])
         if not first_data:
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping category.")
             continue
@@ -464,7 +480,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 data = first_data
             else:
                 time.sleep(1.5)  # Polite delay — avoids triggering LCW rate limits
-                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers)
+                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids)
                 if not data:
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
                     continue
@@ -473,6 +489,13 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not items:
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
                 break
+
+            # Collect OptionIds from this page into seen_ids so next page call
+            # sends them as LastSeenOptionIdsJson — this is LCW's pagination mechanism
+            for _item in items:
+                _opt = _item.get("OptionId")
+                if _opt and _opt not in seen_ids:
+                    seen_ids.append(_opt)
 
             # ── Build product batch ──────────────────────────────────────────
             batch_products = []
