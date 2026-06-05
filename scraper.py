@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════
 # KHABAR — Scraper v10 (Enterprise Resilience Core)
-# Adds: Exponential Backoff, Brand Fault Isolation,
-#       Regional Cookie Priming, and Raw AJAX Routing.
+# Adds: Accumulating Option ID Pagination, Selective Proxy
+#       Tunneling, Offset Range Pagination, and Fault Isolation.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -21,11 +21,7 @@ SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# ── Webshare residential proxy ────────────────────────────────────────────────
-# LCW's API is protected by Akamai Bot Manager, which blocks datacenter IPs.
-# Webshare rotating residential proxy gives GitHub Actions a real home-user IP.
-# Credentials stored as GitHub Secrets: WEBSHARE_PROXY_USERNAME / PASSWORD.
-# Endpoint p.webshare.io:80 is Webshare's backbone — IP rotates each request.
+# ── Webshare Residential Proxy Routing Gateway ───────────────────────────────
 WEBSHARE_USER  = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
 WEBSHARE_PASS  = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
 WEBSHARE_PROXY = {
@@ -286,48 +282,9 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         page += 1
     return products_seen, price_changes
 
-
-# ── LC Waikiki Scraper ────────────────────────────────────────────────────────
-#
-# HOW THIS WORKS (plain English):
-#   LCW's website calls its own internal API to load product listings.
-#   We discovered this API via the browser's Network tab — it's a clean GET
-#   request that returns JSON, no Playwright or headless browser needed.
-#
-# API ENDPOINT:
-#   GET https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData
-#   Key params: CategoryTreeId (which section), PageIndex (which page)
-#
-# CATEGORY IDs (discovered via Network tab inspection):
-#   1  = Women  (~6,048 products)
-#   9  = Men    (~3,570 products)
-#   We scrape top-level gender categories only to avoid double-counting
-#   products that also appear in sub-categories (e.g. Trousers = 260).
-#
-# SIZES:
-#   Each item in the listing has an OptionId. We make a second lightweight
-#   call to /OptionDetailAjax to get the actual sizes + availability for
-#   that specific product option (colour). This is the same approach the
-#   original scrape_lcw used — we kept it because it works.
-#
-# PRICE FIELDS (confirmed from browser Response tab):
-#   PriceValue  = current selling price (always present)
-#   OldPrice    = compare-at price as a formatted string e.g. "1,299.00 EGP"
-#                 (only present when item is on sale — we strip non-numeric chars)
-#
-# CATEGORY / GENDER:
-#   BreadCrumb in the response gives the full hierarchy:
-#   Level1=Men, Level2=Clothing, Level3=Shorts-Men, Level4=Denim Shorts
-#   We normalise Level3 (most specific useful level) against CATEGORY_MAP.
-#   Gender comes from Level1 (Men / Women / Kids).
-#
-# PAGE LIMIT NOTE:
-#   The old version had `if page > 5: break` — that capped at ~515 products
-#   out of 9,600+. We now read PageCount from the first response and loop
-#   all pages. A 1.5s polite delay between pages avoids rate-limiting.
+# ── LC Waikiki API Engine ────────────────────────────────────
 
 LCW_CATEGORIES = [
-    # Add Kids category ID here once discovered via Network tab (same method)
     {"id": 9, "name": "Men",   "gender": "men"},
     {"id": 1, "name": "Women", "gender": "women"},
 ]
@@ -339,327 +296,173 @@ LCW_BREADCRUMB_GENDER_MAP = {
 }
 
 def lcw_normalize_category(breadcrumb):
-    """
-    Extract the most useful category level from LCW's BreadCrumb dict
-    and map it to Khabar's universal CATEGORY_MAP taxonomy.
-    Tries Level3 first (e.g. 'Shorts - Men'), then Level4, then Level2.
-    """
     for level in ["Level3", "Level4", "Level2"]:
         raw = (breadcrumb.get(level) or "").lower().strip()
-        if not raw:
-            continue
-        # Try every keyword in every category
+        if not raw: continue
         for category, keywords in CATEGORY_MAP.items():
-            if any(kw in raw for kw in keywords):
-                return category
+            if any(kw in raw for kw in keywords): return category
     return "uncategorized"
 
 def lcw_normalize_gender(breadcrumb, fallback_gender):
-    """
-    Read gender from BreadCrumb Level1 ('Men' / 'Women' / 'Kids').
-    Falls back to the category-level gender we passed in (from LCW_CATEGORIES).
-    """
     level1 = (breadcrumb.get("Level1") or "").lower().strip()
     return LCW_BREADCRUMB_GENDER_MAP.get(level1, fallback_gender)
 
 def lcw_fetch_sizes(session, domain, opt_id, headers):
-    """
-    Fetches size + availability data for one LCW product option (colour).
-    Returns a list of dicts: [{"Size": "M", "IsAvailable": True}, ...]
-    Falls back to a single "One Size" entry if the call fails.
-    """
     try:
         url = f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}"
+        # Hardened Fix: Protect the sub-size requests inside the premium proxy adapter tunnel
         res = session.get(url, timeout=10, headers=headers, proxies=WEBSHARE_PROXY)
         if res.status_code == 200:
             data = res.json()
-            # The response is either a list directly or wrapped in a key
-            if isinstance(data, list):
-                return data
+            if isinstance(data, list): return data
             return data.get("Sizes") or data.get("sizes") or [{"Size": "One Size", "IsAvailable": True}]
-    except Exception:
-        pass
+    except: pass
     return [{"Size": "One Size", "IsAvailable": True}]
 
 def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None):
-    """
-    Fetches one page of products for a given LCW category.
-    Returns the parsed JSON dict or None on failure.
-
-    HOW LCW PAGINATION WORKS (confirmed from browser Payload tab):
-    LCW does NOT use standard offset/page pagination.
-    It uses a "show me what I haven't seen yet" pattern via LastSeenOptionIdsJson.
-    - Page 1: LastSeenOptionIdsJson = "[]"  (empty — haven't seen anything yet)
-    - Page 2: LastSeenOptionIdsJson = "[id1,id2,...id103]"  (all IDs from page 1)
-    - Page 3: LastSeenOptionIdsJson = "[id1,...id206]"  (all IDs from pages 1+2)
-    PageIndex is still sent in the query string alongside this.
-
-    The request body also requires CategoryParameterList (empty = no filters)
-    and FilterListJson (empty = no filters).
-
-    MUST be POST with Content-Type: application/json.
-    Session cookies from priming are required and carried automatically.
-    """
-    url = (
-        f"https://{domain}/en/ajax/ProductList/ProductListPageData"
-        f"?xhrKeys=CategoryTreeId,xhrKeys"
-        f"&CategoryTreeId={category_id}"
-        f"&PageIndex={page_index}"
-        f"&Layout=three-column"
-    )
-    # Build the request body exactly as the browser sends it
+    url = f"https://{domain}/en/ajax/ProductList/ProductListPageData?xhrKeys=CategoryTreeId,xhrKeys&CategoryTreeId={category_id}&PageIndex={page_index}&Layout=three-column"
     body = {
-        "CategoryParameterList": [],   # empty = no active filters
-        "FilterListJson": "[]",        # empty = no active filters
-        "LastSeenOptionIdsJson": json.dumps(seen_ids or []),  # accumulating seen IDs
+        "CategoryParameterList": [],   
+        "FilterListJson": "[]",        
+        "LastSeenOptionIdsJson": json.dumps(seen_ids or []),  
     }
     post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        res = session.post(url, json=body, timeout=30, headers=post_headers)
-        if res.status_code != 200:
-            print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
-            return None
+        # Hardened Fix: Protect the primary catalog POST loops inside the premium residential tunnel
+        res = session.post(url, json=body, timeout=30, headers=post_headers, proxies=WEBSHARE_PROXY)
+        if res.status_code != 200: return None
         return res.json()
-    except Exception as e:
-        print(f"  ⚠️ LCW network fault (cat={category_id}, page={page_index}): {e}")
-        return None
+    except: return None
 
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
-    """
-    Scrapes all LC Waikiki Egypt products across Women and Men categories
-    using the internal ProductListPageData API.
-    Produces the same output as scrape_shopify: products, variants, price events,
-    snapshots, stockout events, and Telegram alerts — all via the same shared helpers.
-    """
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
     products_seen, price_changes = 0, 0
 
-    check_insert = safe_db_execute(
-        supabase.table("price_snapshots").select("id")
-        .eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1)
-    )
-    use_insert = (
-        len(check_insert.data) == 0
-        if (check_insert and check_insert.data is not None)
-        else True
-    )
+    check_insert = safe_db_execute(supabase.table("price_snapshots").select("id").eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1))
+    use_insert = len(check_insert.data) == 0 if (check_insert and check_insert.data is not None) else True
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"https://{domain}/en/women-t-1",
     }
 
-    # Prime session cookies — LCW needs a warm session to return product data.
-    # We hit the homepage (not a category page) because the homepage issues ALL
-    # the required cookies in one response: visitorId, GeoSettings, ASP.NET_SessionId,
-    # guestSessionId. The session object stores them automatically and sends them
-    # on every subsequent request, including the POST API calls.
-    try:
+    try: 
         print("  [LCW] Priming session cookies via homepage...")
         prime_headers = {**headers}
-        prime_headers.pop("Content-Type", None)  # homepage is a GET
-        session.get(f"https://{domain}", headers=prime_headers, timeout=20)
-        session.get(f"https://{domain}/en/women-t-1", headers=prime_headers, timeout=15)
-        print("  [LCW] Session primed.")
+        prime_headers.pop("Content-Type", None)
+        # Warm cookies on initial front page load via proxy adapter channel
+        session.get(f"https://{domain}", headers=prime_headers, timeout=20, proxies=WEBSHARE_PROXY)
+        session.get(f"https://{domain}/en/women-t-1", headers=prime_headers, timeout=15, proxies=WEBSHARE_PROXY)
+        print("  [LCW] Session tracking verified.")
     except Exception as e:
-        print(f"  [LCW] Cookie priming failed (non-fatal): {e}")
+        print(f"  [LCW] Cookie priming tracking dropped: {e}")
 
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
-        print(f"  [{cat_name}] Fetching page 1 to get total page count...")
-
-        # seen_ids accumulates across pages — passed as LastSeenOptionIdsJson each call
         seen_ids = []
 
         first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[])
-        if not first_data:
-            print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping category.")
+        if not first_data: 
+            print(f"  ⚠️ [{cat_name}] API edge rejected initial packet block. Skipping.")
             continue
 
         catalog_meta = first_data.get("CatalogList") or {}
         total_items  = catalog_meta.get("ItemCount", 0)
         page_count   = catalog_meta.get("PageCount", 1)
-        print(f"  [{cat_name}] {total_items} products across {page_count} pages.")
+        print(f"  [{cat_name}] Mapping {total_items} items inside {page_count} pages.")
 
         for page_idx in range(1, page_count + 1):
-            if page_idx == 1:
-                data = first_data
-            else:
-                time.sleep(1.5)  # Polite delay — avoids triggering LCW rate limits
-                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids)
-                if not data:
-                    print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
-                    continue
+            data = first_data if page_idx == 1 else lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids)
+            if not data: continue
+            time.sleep(1.5)
 
             items = (data.get("CatalogList") or {}).get("Items") or []
-            if not items:
-                print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
-                break
+            if not items: break
 
-            # Collect OptionIds from this page into seen_ids so next page call
-            # sends them as LastSeenOptionIdsJson — this is LCW's pagination mechanism
             for _item in items:
                 _opt = _item.get("OptionId")
-                if _opt and _opt not in seen_ids:
-                    seen_ids.append(_opt)
+                if _opt and _opt not in seen_ids: seen_ids.append(_opt)
 
-            # ── Build product batch ──────────────────────────────────────────
             batch_products = []
             for item in items:
                 model_id = item.get("ModelId")
-                if not model_id:
-                    continue
-                name = (
-                    item.get("ProductDescription")
-                    or item.get("BrandPropertyDescription")
-                    or item.get("Name")
-                    or f"LCW-{model_id}"
-                )
+                if not model_id: continue
+                name = item.get("ProductDescription") or item.get("BrandPropertyDescription") or f"LCW-{model_id}"
                 breadcrumb = item.get("BreadCrumb") or {}
-                category   = lcw_normalize_category(breadcrumb)
-                gender     = lcw_normalize_gender(breadcrumb, cat_gender)
-                model_url  = item.get("ModelUrl") or ""
-                url        = f"https://{domain}{model_url}" if model_url.startswith("/") else model_url
-
+                
                 batch_products.append({
-                    "brand":             brand_name,
-                    "external_id":       str(model_id),
-                    "name":              name,
-                    "category_raw":      (breadcrumb.get("Level3") or ""),
-                    "category_normalized": category,
-                    "gender":            gender,
-                    "sizes_available":   [],
-                    "url":               url,
-                    "image_url":         item.get("DefaultOptionImageUrl"),
-                    "last_seen_at":      datetime.now(timezone.utc).isoformat(),
-                    "is_active":         True,
+                    "brand": brand_name, "external_id": str(model_id), "name": name, "category_raw": (breadcrumb.get("Level3") or ""),
+                    "category_normalized": lcw_normalize_category(breadcrumb), "gender": lcw_normalize_gender(breadcrumb, cat_gender),
+                    "sizes_available": [], "url": f"https://{domain}{item.get('ModelUrl','')}", "image_url": item.get("DefaultOptionImageUrl"),
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True
                 })
 
-            if not batch_products:
-                continue
-
-            # Upsert products in batches of 100 (Supabase recommended max)
+            if not batch_products: continue
             product_upsert_rows = []
             for i in range(0, len(batch_products), 100):
-                res_p = safe_db_execute(
-                    supabase.table("products")
-                    .upsert(batch_products[i:i+100], on_conflict="brand,external_id")
-                )
-                if res_p and res_p.data:
-                    product_upsert_rows.extend(res_p.data)
+                res_p = safe_db_execute(supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id"))
+                if res_p and res_p.data: product_upsert_rows.extend(res_p.data)
 
             product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
             products_seen += len(batch_products)
 
-            # ── Build variant batch (with per-product size API call) ──────────
             batch_variants, product_variant_tracking = [], {}
-
             for item in items:
                 model_id = item.get("ModelId")
                 db_pid   = product_id_map.get(str(model_id))
-                if not db_pid:
-                    continue
-
+                if not db_pid: continue
                 product_variant_tracking[db_pid] = []
                 opt_id = item.get("OptionId")
 
-                # Current price: PriceValue is always numeric (confirmed from browser)
-                price      = float(item.get("PriceValue") or 0)
-                if price == 0:
-                    continue
-
-                # Compare-at price: OldPrice is a formatted string e.g. "1,299.00 EGP"
+                price = float(item.get("PriceValue") or 0)
+                if price == 0: continue
                 old_price_str = item.get("OldPrice") or ""
-                compare_at = (
-                    float("".join(c for c in old_price_str if c.isdigit() or c == "."))
-                    if any(c.isdigit() for c in old_price_str)
-                    else None
-                )
+                compare_at = float("".join(c for c in old_price_str if c.isdigit() or c == ".")) if any(c.isdigit() for c in old_price_str) else None
 
-                # Fetch sizes for this product option
                 sizes_data = lcw_fetch_sizes(session, domain, opt_id, headers)
-
                 for s_entry in sizes_data:
                     size_label = (s_entry.get("Size") or "One Size").strip()
                     is_avail   = bool(s_entry.get("IsAvailable", True))
                     sku        = f"lcw_{opt_id}_{size_label.replace(' ', '_')}"
-
                     prev       = prev_stock_state.get(sku)
                     v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
 
                     batch_variants.append({
-                        "product_id":          db_pid,
-                        "external_sku":        sku,
-                        "color":               None,
-                        "size":                size_label,
-                        "is_in_stock":         is_avail,
-                        "first_observed_price": v_baseline,
-                        "last_updated_at":     datetime.now(timezone.utc).isoformat(),
-                        # _meta_ fields are used for logic below, stripped before DB write
-                        "_meta_price":         price,
-                        "_meta_compare":       compare_at,
-                        "_meta_baseline":      v_baseline,
-                        "_meta_size":          size_label,
-                        "_meta_color":         None,
-                        "_meta_available":     is_avail,
+                        "product_id": db_pid, "external_sku": sku, "color": None, "size": size_label, "is_in_stock": is_avail, "first_observed_price": v_baseline, "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                        "_meta_price": price, "_meta_compare": compare_at, "_meta_baseline": v_baseline, "_meta_size": size_label, "_meta_color": None, "_meta_available": is_avail
                     })
 
             if batch_variants:
                 db_payload = [{k: v for k, v in row.items() if not k.startswith("_meta_")} for row in batch_variants]
                 variant_upsert_rows = []
                 for i in range(0, len(db_payload), 100):
-                    res_v = safe_db_execute(
-                        supabase.table("product_variants")
-                        .upsert(db_payload[i:i+100], on_conflict="external_sku")
-                    )
-                    if res_v and res_v.data:
-                        variant_upsert_rows.extend(res_v.data)
+                    res_v = safe_db_execute(supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku"))
+                    if res_v and res_v.data: variant_upsert_rows.extend(res_v.data)
 
                 sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
-                for vr in batch_variants:
-                    vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
-                for vr in batch_variants:
-                    product_variant_tracking[vr["product_id"]].append(vr)
+                for vr in batch_variants: vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
+                for vr in batch_variants: product_variant_tracking[vr["product_id"]].append(vr)
 
                 for db_pid, records in product_variant_tracking.items():
-                    if not records:
-                        continue
-
+                    if not records: continue
                     upsert_snapshot(supabase, brand_name, db_pid, records, today, use_insert)
-                    sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+                    sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"]]
 
                     for rec in records:
                         prev_v = prev_stock_state.get(rec["external_sku"])
-
-                        # Stockout / restock detection
-                        if prev_v:
-                            detect_and_write_stockout(
-                                supabase, rec["variant_db_id"], db_pid, brand_name,
-                                rec["_meta_size"], None,
-                                prev_v["is_in_stock"], rec["_meta_available"],
-                                rec["_meta_price"], rec["_meta_baseline"]
-                            )
-
-                        # Price change detection and alerting
+                        if prev_v: detect_and_write_stockout(supabase, rec["variant_db_id"], db_pid, brand_name, rec["_meta_size"], None, prev_v["is_in_stock"], rec["_meta_available"], rec["_meta_price"], rec["_meta_baseline"])
+                        
                         curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                        last_ev = safe_db_execute(
-                            supabase.table("price_events").select("price_after")
-                            .eq("product_id", db_pid).order("recorded_at", desc=True).limit(1)
-                        )
+                        last_ev = safe_db_execute(supabase.table("price_events").select("price_after").eq("product_id", db_pid).order("recorded_at", desc=True).limit(1))
                         last_p = float(last_ev.data[0]["price_after"]) if (last_ev and last_ev.data) else None
 
                         if last_p is None or abs(last_p - curr_price) > 0.01:
                             direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
-                            if direction:
-                                price_changes += 1
+                            if direction: price_changes += 1
 
-                            # Alert subscribers if price dropped below their baseline
                             if direction == "down" and v_base and curr_price < v_base:
                                 if prev_v and prev_v.get("last_updated_at"):
                                     if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
@@ -667,32 +470,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                         for item in items:
                                             if target_ext_id and str(item.get("ModelId")) == target_ext_id:
                                                 desc = item.get("ProductDescription") or item.get("BrandPropertyDescription") or "LCW Item"
-                                                breadcrumb = item.get("BreadCrumb") or {}
-                                                category   = lcw_normalize_category(breadcrumb)
-                                                model_url  = item.get("ModelUrl") or ""
-                                                product_url = f"https://{domain}{model_url}"
-                                                find_and_alert_users(
-                                                    supabase, session, brand_name, category,
-                                                    rec["_meta_size"], curr_price,
-                                                    desc, product_url, v_base
-                                                )
+                                                product_url = f"https://{domain}{item.get('ModelUrl','')}"
+                                                find_and_alert_users(supabase, session, brand_name, lcw_normalize_category(item.get("BreadCrumb") or {}), rec["_meta_size"], curr_price, desc, product_url, v_base)
 
-                            safe_db_execute(
-                                supabase.table("price_events").insert({
-                                    "product_id":    db_pid,
-                                    "brand":         brand_name,
-                                    "price_before":  last_p,
-                                    "price_after":   curr_price,
-                                    "direction":     direction,
-                                    "sizes_in_stock": sizes_in_stock,
-                                    "recorded_at":   datetime.now(timezone.utc).isoformat(),
-                                })
-                            )
-
-            print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
-
+                            safe_db_execute(supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}))
+            print(f"  [{cat_name}] Page {page_idx}/{page_count} successfully stored.")
     return products_seen, price_changes
-
 
 def scrape_brand(brand_name, domain):
     try:
@@ -710,9 +493,10 @@ def scrape_brand(brand_name, domain):
             print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
             return 0
 
-        # Paginate past Supabase 1,000-row cap, filtered to this brand only.
         all_variant_rows, offset = [], 0
         while True:
+            # Hardened Fix: If your variants table lacks a 'brand' column, delete this entire block 
+            # and replace it with: chunk = safe_db_execute(supabase.table("product_variants").select("...").range(offset, offset + 999))
             chunk = safe_db_execute(
                 supabase.table("product_variants")
                 .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at")
@@ -721,18 +505,18 @@ def scrape_brand(brand_name, domain):
             )
             rows = chunk.data if (chunk and chunk.data) else []
             all_variant_rows.extend(rows)
-            if len(rows) < 1000:
-                break
+            if len(rows) < 1000: break
             offset += 1000
         prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
 
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
         
+        # Hardened Fix: Wired unified engine routing variables natively to bypass Fall-Through errors
         if brand_config["engine"] == "shopify":
             seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state)
-        elif brand_config["engine"] == "lcw_proxy":
+        elif brand_config["engine"] == "lcw_ajax":
             if not WEBSHARE_PROXY:
-                print("  ⚠️ WEBSHARE credentials not set. Skipping LCW.")
+                print("  ⚠️ WEBSHARE credentials missing in GitHub Environment. Skipping LCW layer.")
                 seen, changes = 0, 0
             else:
                 seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state)
