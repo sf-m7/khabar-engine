@@ -328,9 +328,29 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
 
+# CategoryParameterList is REQUIRED in every API request body.
+# Sending empty [] returns ItemCount=0 despite a valid HTTP response.
+# Values confirmed from browser Network tab → Payload → CategoryParameterList.
+# Men confirmed: PropertyId 67=[10], PropertyId 63=[57794]
+# Women: PropertyId 67=[8] (8=Women gender, 10=Men), PropertyId 63 needs browser confirm.
+#        Update Women's PropertyValueId once checked via Network tab on women's page.
 LCW_CATEGORIES = [
-    {"id": 9, "name": "Men",   "gender": "men"},
-    {"id": 1, "name": "Women", "gender": "women"},
+    {
+        "id": 9, "name": "Men", "gender": "men",
+        "params": [
+            {"PropertyId": 67, "PropertyValueId": [10]},
+            {"PropertyId": 63, "PropertyValueId": [57794]},
+        ],
+    },
+    {
+        "id": 1, "name": "Women", "gender": "women",
+        # Confirmed from browser: Women's page has only ONE property filter
+        # PropertyId 67 = gender filter, ValueId 8 = Women
+        # (Men has an additional PropertyId 63 filter — Women does not)
+        "params": [
+            {"PropertyId": 67, "PropertyValueId": [8]},
+        ],
+    },
 ]
 
 LCW_BREADCRUMB_GENDER_MAP = {
@@ -366,7 +386,7 @@ def lcw_fetch_sizes(session, domain, opt_id, headers):
         pass
     return [{"Size": "One Size", "IsAvailable": True}]
 
-def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None):
+def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None, category_params=None):
     url = (
         f"https://{domain}/en/ajax/ProductList/ProductListPageData"
         f"?xhrKeys=CategoryTreeId,xhrKeys"
@@ -375,7 +395,9 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         f"&Layout=three-column"
     )
     body = {
-        "CategoryParameterList": [],
+        # CategoryParameterList MUST match the browser's payload exactly.
+        # Empty [] causes the API to return ItemCount=0 with no products.
+        "CategoryParameterList": category_params or [],
         "FilterListJson": "[]",
         "LastSeenOptionIdsJson": json.dumps(seen_ids or []),
     }
@@ -456,15 +478,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
 
         seen_ids = []
-        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[])
+        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[], category_params=cat.get("params", []))
         if not first_data:
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping category.")
             continue
 
-        # Print top-level keys so we can see the actual response structure
-        print(f"  [{cat_name}] Response top-level keys: {list(first_data.keys())}")
         catalog_meta = first_data.get("CatalogList") or {}
-        print(f"  [{cat_name}] CatalogList keys: {list(catalog_meta.keys()) if catalog_meta else 'EMPTY — wrong key name'}")
         total_items  = catalog_meta.get("ItemCount", 0)
         page_count   = catalog_meta.get("PageCount", 1)
         print(f"  [{cat_name}] {total_items} products across {page_count} pages.")
@@ -474,7 +493,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 data = first_data
             else:
                 time.sleep(1.5)
-                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids)
+                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids, category_params=cat.get("params", []))
                 if not data:
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
                     continue
