@@ -385,6 +385,7 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         res = execute_with_retry(session.post, url, json=body, timeout=30, headers=headers)
         if res.status_code != 200:
             print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
+            print(f"  ⚠️ LCW response body: {res.text[:400]}")
             return None
         return res.json()
     except Exception as e:
@@ -393,6 +394,18 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
 
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
+
+    # ── Proxy connectivity check ───────────────────────────────────────────────
+    # Verifies that (a) Webshare credentials work, and (b) the outbound IP
+    # is residential. Runs once per scrape_lcw call. Non-fatal if it fails.
+    print(f"  [LCW] Proxy configured: {WEBSHARE_PROXY is not None}")
+    try:
+        ip_r = session.get("https://api.ipify.org?format=json", timeout=10)
+        print(f"  [LCW] Outbound IP via proxy: {ip_r.text[:80]}")
+    except Exception as e:
+        print(f"  [LCW] IP check failed: {e}")
+    # ──────────────────────────────────────────────────────────────────────────
+
     products_seen, price_changes = 0, 0
 
     check_insert = safe_db_execute(
