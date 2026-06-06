@@ -5,7 +5,8 @@
 import os
 import sys
 import time
-import requests
+import json
+from curl_cffi import requests
 from supabase import create_client
 from datetime import datetime, timezone
 
@@ -22,11 +23,21 @@ FREE_BRAND_LIMIT = 2
 
 # Brand emoji act as visual identifiers since buttons can't hold images
 BRANDS = {
+    "lc_waikiki": "🛍️ LC Waikiki",
     "town_team":  "👕 Town Team",
     "ravin":      "⚡ Ravin",
     "mens_club":  "👔 Men's Club",
     "tree":       "🌿 Tree",
     "dott_jeans": "🔵 Dott Jeans",
+}
+
+BRAND_DISPLAY = {
+    "town_team":  "Town Team",
+    "ravin":      "Ravin",
+    "mens_club":  "Men's Club",
+    "tree":       "Tree",
+    "dott_jeans": "Dott Jeans",
+    "lc_waikiki": "LC Waikiki"
 }
 
 CATEGORIES = {
@@ -48,12 +59,18 @@ CATEGORY_SIZES = {
     "accessories": ["One Size", "S/M", "L/XL"],
 }
 
-# ── Telegram helpers ──────────────────────────────────
+# ── Telegram Network Session Engine ───────────────────
 
-def tg(method, data=None):
+def get_hardened_session():
+    """Initializes browser footprint session to safeguard outbound web actions."""
+    return requests.Session(impersonate="chrome124")
+
+def execute_tg_call(method, data=None):
+    """Executes resilient outbound interactions using hardened browser wrappers."""
     try:
-        r = requests.post(f"{API}/{method}", json=data or {}, timeout=35)
-        return r.json()
+        with get_hardened_session() as session:
+            r = session.post(f"{API}/{method}", json=data or {}, timeout=35)
+            return r.json()
     except Exception as e:
         print(f"  Telegram API error ({method}): {e}")
         return {}
@@ -62,7 +79,7 @@ def send(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
-    return tg("sendMessage", payload)
+    return execute_tg_call("sendMessage", payload)
 
 def edit(chat_id, message_id, text, keyboard=None):
     payload = {
@@ -75,10 +92,10 @@ def edit(chat_id, message_id, text, keyboard=None):
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     else:
         payload["reply_markup"] = {}
-    return tg("editMessageText", payload)
+    return execute_tg_call("editMessageText", payload)
 
 def answer_cb(callback_id, text=""):
-    tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+    execute_tg_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
 # ── Supabase helpers ──────────────────────────────────
 
@@ -126,7 +143,6 @@ def get_live_deals(limit=3):
             supabase.table("price_events")
             .select("*, products(name, brand)")
             .eq("direction", "down")
-            .gte("discount_pct", 25)
             .order("recorded_at", desc=True)
             .limit(limit * 4)
             .execute()
@@ -140,7 +156,8 @@ def get_live_deals(limit=3):
             if len(deals) >= limit:
                 break
         return deals
-    except:
+    except Exception as e:
+        print(f"  ⚠️ Error fetching welcome snapshots: {e}")
         return []
 
 def format_deals_text(deals):
@@ -151,10 +168,13 @@ def format_deals_text(deals):
         p     = d.get("products") or {}
         name  = (p.get("name") or "Product")[:38]
         brand_raw = d.get("brand", "")
-        brand = BRANDS.get(brand_raw, brand_raw).split(" ", 1)[-1].upper()
-        disc  = int(d.get("discount_pct") or 0)
-        price = int(d.get("price_after") or 0)
-        lines.append(f"  🔥 {name} — <b>{disc}% off</b> @ {price} EGP [{brand}]")
+        brand = BRAND_DISPLAY.get(brand_raw, brand_raw).upper()
+        
+        price_before = float(d.get("price_before") or 0)
+        price_after  = float(d.get("price_after") or 0)
+        disc = round(((price_before - price_after) / price_before) * 100) if price_before > 0 else 0
+        
+        lines.append(f"  🔥 {name} — <b>{disc}% off</b> @ {int(price_after)} EGP [{brand}]")
     return "\n".join(lines)
 
 # ── Keyboards ─────────────────────────────────────────
@@ -188,7 +208,7 @@ def size_keyboard(category):
     sizes = CATEGORY_SIZES.get(category, ["S", "M", "L", "XL"])
     rows, row = [], []
     for size in sizes:
-        safe_size = size.replace("/", "-")  # Callback validation split safety map
+        safe_size = size.replace("/", "-")
         row.append({"text": size, "callback_data": f"sz|{category}|{safe_size}"})
         if len(row) == 4:
             rows.append(row)
@@ -223,7 +243,7 @@ def show_brand_selection(chat_id, user, message_id):
     text = (
         "<b>Step 1 of 3 — Choose brands</b>\n\n"
         f"Free plan: pick up to <b>{limit} brands</b>.\n"
-        "Upgrade anytime to monitor all 5 brands."
+        "Upgrade anytime to monitor all brands."
     )
     edit(chat_id, message_id, text, brands_keyboard(selected, tier))
     update_user(chat_id, {"conversation_state": "setup_brands"})
@@ -232,7 +252,7 @@ def show_category_selection(chat_id, user, message_id):
     temp       = user.get("temp_data") or {}
     sel_brands = temp.get("selected_brands", [])
     selected   = temp.get("selected_categories", [])
-    names      = ", ".join(BRANDS.get(b, b) for b in sel_brands)
+    names      = ", ".join(BRAND_DISPLAY.get(b, b) for b in sel_brands)
     text = (
         "<b>Step 2 of 3 — Choose categories</b>\n\n"
         f"Monitoring: <b>{names}</b>\n\n"
@@ -246,7 +266,6 @@ def show_size_for_category(chat_id, user, message_id):
     temp        = user.get("temp_data") or {}
     pending     = temp.get("sizes_pending", [])
     all_cats    = temp.get("selected_categories", [])
-    collected   = temp.get("sizes_collected", {})
 
     if not pending:
         complete_setup(chat_id, user, message_id)
@@ -266,13 +285,11 @@ def show_size_for_category(chat_id, user, message_id):
     update_user(chat_id, {"conversation_state": "setup_sizes"})
 
 def complete_setup(chat_id, user, message_id=None):
-    """Finalizes setup and populates both JSONB arrays and normalized tables cleanly."""
     temp       = user.get("temp_data") or {}
     brands     = temp.get("selected_brands", [])
     categories = temp.get("selected_categories", [])
     sizes_dict = temp.get("sizes_collected", {})
 
-    # Maintain dual-write to core users profile for total system compatibility
     update_user(chat_id, {
         "conversation_state":  "active",
         "brands_monitored":    brands,
@@ -282,16 +299,13 @@ def complete_setup(chat_id, user, message_id=None):
     })
 
     try:
-        # RELATIONAL NORMALIZATION LEVEL 1: Write entries to user_brands table
         for brand in brands:
             supabase.table("user_brands").upsert(
                 {"user_id": chat_id, "brand": brand},
                 on_conflict="user_id,brand"
             ).execute()
 
-        # RELATIONAL NORMALIZATION LEVEL 2: Write entries to user_sizes table
         for category, size in sizes_dict.items():
-            # Restore standard presentation string values (e.g., "S-M" back to "S/M") safely
             clean_size = size.replace("-", "/")
             supabase.table("user_sizes").upsert(
                 {"user_id": chat_id, "category": category, "size": clean_size},
@@ -301,8 +315,7 @@ def complete_setup(chat_id, user, message_id=None):
     except Exception as e:
         print(f"  ❌ Relational normalization database write failed: {e}")
 
-    # Build clear UI summary details to print back to the Telegram screen
-    brand_names = [BRANDS.get(b, b) for b in brands]
+    brand_names = [BRAND_DISPLAY.get(b, b) for b in brands]
     size_lines = "\n".join(f"  • {CATEGORIES.get(c, c)}: {s.replace('-', '/')}" for c, s in sizes_dict.items()) if sizes_dict else "  • All sizes"
 
     text = (
@@ -317,7 +330,6 @@ def complete_setup(chat_id, user, message_id=None):
 # ── Update router ──────────────────────────────────────
 
 def process_update(update):
-    # ── Text messaging commands ──
     if "message" in update and "text" in update["message"]:
         msg      = update["message"]
         chat_id  = msg["chat"]["id"]
@@ -330,7 +342,6 @@ def process_update(update):
             show_welcome(chat_id, user)
         return
 
-    # ── Button tap ──
     if "callback_query" in update:
         cq         = update["callback_query"]
         chat_id    = cq["from"]["id"]
@@ -341,11 +352,9 @@ def process_update(update):
 
         user = get_user(chat_id) or create_user(chat_id, username)
 
-        # ── Start setup ──
         if data == "start_setup":
             show_brand_selection(chat_id, user, message_id)
 
-        # ── Brand toggle ──
         elif data.startswith("brand|"):
             brand = data.split("|")[1]
             temp  = user.get("temp_data") or {}
@@ -363,11 +372,10 @@ def process_update(update):
             text = (
                 "<b>Step 1 of 3 — Choose brands</b>\n\n"
                 f"Free plan: pick up to <b>{limit} brands</b>.\n"
-                "Upgrade anytime to monitor all 5 brands."
+                "Upgrade anytime to monitor all brands."
             )
             edit(chat_id, message_id, text, brands_keyboard(sel_now, tier))
 
-        # ── Brands confirmed ──
         elif data == "brands_done":
             user = get_user(chat_id)
             sel  = (user.get("temp_data") or {}).get("selected_brands", [])
@@ -376,7 +384,6 @@ def process_update(update):
             else:
                 show_category_selection(chat_id, user, message_id)
 
-        # ── Category toggle ──
         elif data.startswith("cat|"):
             cat  = data.split("|")[1]
             temp = user.get("temp_data") or {}
@@ -390,7 +397,7 @@ def process_update(update):
             user       = get_user(chat_id)
             sel_now    = (user.get("temp_data") or {}).get("selected_categories", [])
             sel_brands = (user.get("temp_data") or {}).get("selected_brands", [])
-            names      = ", ".join(BRANDS.get(b, b) for b in sel_brands)
+            names      = ", ".join(BRAND_DISPLAY.get(b, b) for b in sel_brands)
             text = (
                 "<b>Step 2 of 3 — Choose categories</b>\n\n"
                 f"Monitoring: <b>{names}</b>\n\n"
@@ -398,13 +405,11 @@ def process_update(update):
             )
             edit(chat_id, message_id, text, categories_keyboard(sel_now))
 
-        # ── Categories confirmed ──
         elif data == "cats_done":
             user = get_user(chat_id)
             temp = user.get("temp_data") or {}
             sel  = temp.get("selected_categories", [])
             
-            # If no category explicitly picked, default configuration maps to ALL options automatically
             if not sel:
                 sel = list(CATEGORIES.keys())
                 temp["selected_categories"] = sel
@@ -415,7 +420,6 @@ def process_update(update):
             user = get_user(chat_id)
             show_size_for_category(chat_id, user, message_id)
 
-        # ── Size selection processing ──
         elif data.startswith("sz|"):
             _, cat, size = data.split("|")
             temp      = user.get("temp_data") or {}
@@ -441,12 +445,13 @@ if __name__ == "__main__":
     offset = get_offset()
     while True:
         try:
-            updates = tg("getUpdates", {"offset": offset + 1, "timeout": 30})
-            if "result" in updates:
-                for up in updates["result"]:
-                    offset = up["update_id"]
-                    save_offset(offset)
-                    process_update(up)
+            with get_hardened_session() as poll_session:
+                updates = poll_session.post(f"{API}/getUpdates", json={"offset": offset + 1, "timeout": 30}, timeout=45).json()
+                if "result" in updates:
+                    for up in updates["result"]:
+                        offset = up["update_id"]
+                        save_offset(offset)
+                        process_update(up)
         except Exception as e:
             print(f"Loop cooling failure: {e}")
             time.sleep(3)
