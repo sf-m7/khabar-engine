@@ -2,15 +2,14 @@
 # KHABAR — Scraper v10 (Enterprise Resilience Core)
 # Adds: Exponential Backoff, Brand Fault Isolation,
 #       Regional Cookie Priming, and Raw AJAX Routing.
+# Fixed: Akamai bypass using curl_cffi TLS spoofing & proxy routing.
 # ═══════════════════════════════════════════════════════
 
 import json
 import os
 import sys
 import time
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from curl_cffi import requests
 from supabase import create_client
 from datetime import datetime, timezone, timedelta, date
 
@@ -33,8 +32,9 @@ WEBSHARE_PROXY = {
     "https": f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
 } if WEBSHARE_USER and WEBSHARE_PASS else None
 
+# FIXED: Set engine to 'lcw_proxy' to match the evaluation router block below
 BRANDS = [
-    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_ajax"},
+    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_proxy"},
     {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
     {"name": "ravin",      "domain": "shop.iravin.com", "engine": "shopify"},
     {"name": "mens_club",  "domain": "mensclubcollection.com", "engine": "shopify"},
@@ -63,12 +63,30 @@ CATEGORY_MAP = {
 # ── Resilience & Network Handlers ──────────────────────
 
 def get_resilient_session():
-    session = requests.Session()
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+    # FIXED: Initialize curl_cffi session with a Chrome browser identity to fool Akamai
+    session = requests.Session(impersonate="chrome124")
+    if WEBSHARE_PROXY:
+        session.proxies.update(WEBSHARE_PROXY)
     return session
+
+def execute_with_retry(session_method, url, max_retries=3, backoff=1, **kwargs):
+    """
+    Helper to provide retry resilience natively for curl_cffi requests,
+    mimicking the old urllib3 Retry behavior.
+    """
+    delay = backoff
+    for attempt in range(max_retries):
+        try:
+            res = session_method(url, **kwargs)
+            if res.status_code in [429, 500, 502, 503, 504]:
+                raise requests.RequestsError(f"HTTP Status {res.status_code}")
+            return res
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"  ❌ Network request permanently failed on {url}: {e}")
+                raise e
+            time.sleep(delay)
+            delay *= 2
 
 def safe_db_execute(query, retries=3):
     delay = 2
@@ -130,15 +148,19 @@ def detect_options(variants):
     return "option2", "option1"
 
 def check_domain(session, domain):
-    try: return session.get(f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
-    except: return False
+    try: 
+        return execute_with_retry(session.get, f"https://{domain}", timeout=10, headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
+    except: 
+        return False
 
 # ── Alerts & Snapshots ────────────────────────────────
 
 def send_telegram(session, chat_id, text):
     if not TELEGRAM_BOT_TOKEN: return
-    try: session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except: pass
+    try: 
+        execute_with_retry(session.post, f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except: 
+        pass
 
 def find_and_alert_users(supabase, session, brand, category, variant_size, current_price, product_name, product_url, variant_baseline):
     if not TELEGRAM_BOT_TOKEN or not variant_baseline or current_price >= variant_baseline: return
@@ -203,7 +225,8 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
-        try: response = session.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        try: 
+            response = execute_with_retry(session.get, url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
         except Exception as e:
             print(f"  ⚠️ HTTP fault on page {page}: {e}")
             break
@@ -288,46 +311,8 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
 
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
-#
-# HOW THIS WORKS (plain English):
-#   LCW's website calls its own internal API to load product listings.
-#   We discovered this API via the browser's Network tab — it's a clean GET
-#   request that returns JSON, no Playwright or headless browser needed.
-#
-# API ENDPOINT:
-#   GET https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData
-#   Key params: CategoryTreeId (which section), PageIndex (which page)
-#
-# CATEGORY IDs (discovered via Network tab inspection):
-#   1  = Women  (~6,048 products)
-#   9  = Men    (~3,570 products)
-#   We scrape top-level gender categories only to avoid double-counting
-#   products that also appear in sub-categories (e.g. Trousers = 260).
-#
-# SIZES:
-#   Each item in the listing has an OptionId. We make a second lightweight
-#   call to /OptionDetailAjax to get the actual sizes + availability for
-#   that specific product option (colour). This is the same approach the
-#   original scrape_lcw used — we kept it because it works.
-#
-# PRICE FIELDS (confirmed from browser Response tab):
-#   PriceValue  = current selling price (always present)
-#   OldPrice    = compare-at price as a formatted string e.g. "1,299.00 EGP"
-#                 (only present when item is on sale — we strip non-numeric chars)
-#
-# CATEGORY / GENDER:
-#   BreadCrumb in the response gives the full hierarchy:
-#   Level1=Men, Level2=Clothing, Level3=Shorts-Men, Level4=Denim Shorts
-#   We normalise Level3 (most specific useful level) against CATEGORY_MAP.
-#   Gender comes from Level1 (Men / Women / Kids).
-#
-# PAGE LIMIT NOTE:
-#   The old version had `if page > 5: break` — that capped at ~515 products
-#   out of 9,600+. We now read PageCount from the first response and loop
-#   all pages. A 1.5s polite delay between pages avoids rate-limiting.
 
 LCW_CATEGORIES = [
-    # Add Kids category ID here once discovered via Network tab (same method)
     {"id": 9, "name": "Men",   "gender": "men"},
     {"id": 1, "name": "Women", "gender": "women"},
 ]
@@ -339,41 +324,26 @@ LCW_BREADCRUMB_GENDER_MAP = {
 }
 
 def lcw_normalize_category(breadcrumb):
-    """
-    Extract the most useful category level from LCW's BreadCrumb dict
-    and map it to Khabar's universal CATEGORY_MAP taxonomy.
-    Tries Level3 first (e.g. 'Shorts - Men'), then Level4, then Level2.
-    """
     for level in ["Level3", "Level4", "Level2"]:
         raw = (breadcrumb.get(level) or "").lower().strip()
         if not raw:
             continue
-        # Try every keyword in every category
         for category, keywords in CATEGORY_MAP.items():
             if any(kw in raw for kw in keywords):
                 return category
     return "uncategorized"
 
 def lcw_normalize_gender(breadcrumb, fallback_gender):
-    """
-    Read gender from BreadCrumb Level1 ('Men' / 'Women' / 'Kids').
-    Falls back to the category-level gender we passed in (from LCW_CATEGORIES).
-    """
     level1 = (breadcrumb.get("Level1") or "").lower().strip()
     return LCW_BREADCRUMB_GENDER_MAP.get(level1, fallback_gender)
 
 def lcw_fetch_sizes(session, domain, opt_id, headers):
-    """
-    Fetches size + availability data for one LCW product option (colour).
-    Returns a list of dicts: [{"Size": "M", "IsAvailable": True}, ...]
-    Falls back to a single "One Size" entry if the call fails.
-    """
     try:
         url = f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}"
-        res = session.get(url, timeout=10, headers=headers, proxies=WEBSHARE_PROXY)
+        # FIXED: Removed 'proxies=WEBSHARE_PROXY' since session level now handles it globally
+        res = execute_with_retry(session.get, url, timeout=10, headers=headers)
         if res.status_code == 200:
             data = res.json()
-            # The response is either a list directly or wrapped in a key
             if isinstance(data, list):
                 return data
             return data.get("Sizes") or data.get("sizes") or [{"Size": "One Size", "IsAvailable": True}]
@@ -382,24 +352,6 @@ def lcw_fetch_sizes(session, domain, opt_id, headers):
     return [{"Size": "One Size", "IsAvailable": True}]
 
 def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None):
-    """
-    Fetches one page of products for a given LCW category.
-    Returns the parsed JSON dict or None on failure.
-
-    HOW LCW PAGINATION WORKS (confirmed from browser Payload tab):
-    LCW does NOT use standard offset/page pagination.
-    It uses a "show me what I haven't seen yet" pattern via LastSeenOptionIdsJson.
-    - Page 1: LastSeenOptionIdsJson = "[]"  (empty — haven't seen anything yet)
-    - Page 2: LastSeenOptionIdsJson = "[id1,id2,...id103]"  (all IDs from page 1)
-    - Page 3: LastSeenOptionIdsJson = "[id1,...id206]"  (all IDs from pages 1+2)
-    PageIndex is still sent in the query string alongside this.
-
-    The request body also requires CategoryParameterList (empty = no filters)
-    and FilterListJson (empty = no filters).
-
-    MUST be POST with Content-Type: application/json.
-    Session cookies from priming are required and carried automatically.
-    """
     url = (
         f"https://{domain}/en/ajax/ProductList/ProductListPageData"
         f"?xhrKeys=CategoryTreeId,xhrKeys"
@@ -407,15 +359,15 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         f"&PageIndex={page_index}"
         f"&Layout=three-column"
     )
-    # Build the request body exactly as the browser sends it
     body = {
-        "CategoryParameterList": [],   # empty = no active filters
-        "FilterListJson": "[]",        # empty = no active filters
-        "LastSeenOptionIdsJson": json.dumps(seen_ids or []),  # accumulating seen IDs
+        "CategoryParameterList": [],
+        "FilterListJson": "[]",
+        "LastSeenOptionIdsJson": json.dumps(seen_ids or []),
     }
     post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        res = session.post(url, json=body, timeout=30, headers=post_headers)
+        # FIXED: Routed through the resilience logic handler safely using curl_cffi session
+        res = execute_with_retry(session.post, url, json=body, timeout=30, headers=post_headers)
         if res.status_code != 200:
             print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
@@ -425,12 +377,6 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         return None
 
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
-    """
-    Scrapes all LC Waikiki Egypt products across Women and Men categories
-    using the internal ProductListPageData API.
-    Produces the same output as scrape_shopify: products, variants, price events,
-    snapshots, stockout events, and Telegram alerts — all via the same shared helpers.
-    """
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
     products_seen, price_changes = 0, 0
 
@@ -455,17 +401,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "Referer": f"https://{domain}/en/women-t-1",
     }
 
-    # Prime session cookies — LCW needs a warm session to return product data.
-    # We hit the homepage (not a category page) because the homepage issues ALL
-    # the required cookies in one response: visitorId, GeoSettings, ASP.NET_SessionId,
-    # guestSessionId. The session object stores them automatically and sends them
-    # on every subsequent request, including the POST API calls.
     try:
         print("  [LCW] Priming session cookies via homepage...")
         prime_headers = {**headers}
-        prime_headers.pop("Content-Type", None)  # homepage is a GET
-        session.get(f"https://{domain}", headers=prime_headers, timeout=20)
-        session.get(f"https://{domain}/en/women-t-1", headers=prime_headers, timeout=15)
+        prime_headers.pop("Content-Type", None)
+        execute_with_retry(session.get, f"https://{domain}", headers=prime_headers, timeout=20)
+        execute_with_retry(session.get, f"https://{domain}/en/women-t-1", headers=prime_headers, timeout=15)
         print("  [LCW] Session primed.")
     except Exception as e:
         print(f"  [LCW] Cookie priming failed (non-fatal): {e}")
@@ -474,9 +415,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
 
-        # seen_ids accumulates across pages — passed as LastSeenOptionIdsJson each call
         seen_ids = []
-
         first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[])
         if not first_data:
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping category.")
@@ -491,7 +430,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if page_idx == 1:
                 data = first_data
             else:
-                time.sleep(1.5)  # Polite delay — avoids triggering LCW rate limits
+                time.sleep(1.5)
                 data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids)
                 if not data:
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
@@ -502,14 +441,11 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
                 break
 
-            # Collect OptionIds from this page into seen_ids so next page call
-            # sends them as LastSeenOptionIdsJson — this is LCW's pagination mechanism
             for _item in items:
                 _opt = _item.get("OptionId")
                 if _opt and _opt not in seen_ids:
                     seen_ids.append(_opt)
 
-            # ── Build product batch ──────────────────────────────────────────
             batch_products = []
             for item in items:
                 model_id = item.get("ModelId")
@@ -544,7 +480,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not batch_products:
                 continue
 
-            # Upsert products in batches of 100 (Supabase recommended max)
             product_upsert_rows = []
             for i in range(0, len(batch_products), 100):
                 res_p = safe_db_execute(
@@ -557,7 +492,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
             products_seen += len(batch_products)
 
-            # ── Build variant batch (with per-product size API call) ──────────
             batch_variants, product_variant_tracking = [], {}
 
             for item in items:
@@ -569,12 +503,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 product_variant_tracking[db_pid] = []
                 opt_id = item.get("OptionId")
 
-                # Current price: PriceValue is always numeric (confirmed from browser)
                 price      = float(item.get("PriceValue") or 0)
                 if price == 0:
                     continue
 
-                # Compare-at price: OldPrice is a formatted string e.g. "1,299.00 EGP"
                 old_price_str = item.get("OldPrice") or ""
                 compare_at = (
                     float("".join(c for c in old_price_str if c.isdigit() or c == "."))
@@ -582,7 +514,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     else None
                 )
 
-                # Fetch sizes for this product option
                 sizes_data = lcw_fetch_sizes(session, domain, opt_id, headers)
 
                 for s_entry in sizes_data:
@@ -601,7 +532,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                         "is_in_stock":         is_avail,
                         "first_observed_price": v_baseline,
                         "last_updated_at":     datetime.now(timezone.utc).isoformat(),
-                        # _meta_ fields are used for logic below, stripped before DB write
                         "_meta_price":         price,
                         "_meta_compare":       compare_at,
                         "_meta_baseline":      v_baseline,
@@ -637,7 +567,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     for rec in records:
                         prev_v = prev_stock_state.get(rec["external_sku"])
 
-                        # Stockout / restock detection
                         if prev_v:
                             detect_and_write_stockout(
                                 supabase, rec["variant_db_id"], db_pid, brand_name,
@@ -646,7 +575,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                 rec["_meta_price"], rec["_meta_baseline"]
                             )
 
-                        # Price change detection and alerting
                         curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
                         last_ev = safe_db_execute(
                             supabase.table("price_events").select("price_after")
@@ -659,7 +587,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                             if direction:
                                 price_changes += 1
 
-                            # Alert subscribers if price dropped below their baseline
                             if direction == "down" and v_base and curr_price < v_base:
                                 if prev_v and prev_v.get("last_updated_at"):
                                     if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
@@ -710,7 +637,6 @@ def scrape_brand(brand_name, domain):
             print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
             return 0
 
-        # Paginate past Supabase 1,000-row cap, filtered to this brand only.
         all_variant_rows, offset = [], 0
         while True:
             chunk = safe_db_execute(
