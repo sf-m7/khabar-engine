@@ -383,11 +383,18 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         # curl_cffi sets Content-Type: application/json automatically when json= is used.
         # Pass headers directly — no Content-Type override needed.
         res = execute_with_retry(session.post, url, json=body, timeout=30, headers=headers)
-        if res.status_code != 200:
-            print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
+        # LCW returns HTTP 404 as a normal success code for this endpoint — confirmed
+        # from response body which contains valid product JSON despite the 404 status.
+        # Only treat as real failures codes that don't return a parseable JSON body.
+        if res.status_code not in [200, 404]:
+            print(f"  ⚠️ LCW API unexpected HTTP {res.status_code} (cat={category_id}, page={page_index})")
             print(f"  ⚠️ LCW response body: {res.text[:400]}")
             return None
-        return res.json()
+        try:
+            return res.json()
+        except Exception:
+            print(f"  ⚠️ LCW HTTP {res.status_code} but body is not JSON: {res.text[:200]}")
+            return None
     except Exception as e:
         print(f"  ⚠️ LCW network fault (cat={category_id}, page={page_index}): {e}")
         return None
