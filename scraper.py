@@ -379,9 +379,10 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         "FilterListJson": "[]",
         "LastSeenOptionIdsJson": json.dumps(seen_ids or []),
     }
-    post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        res = execute_with_retry(session.post, url, json=body, timeout=30, headers=post_headers)
+        # curl_cffi sets Content-Type: application/json automatically when json= is used.
+        # Pass headers directly — no Content-Type override needed.
+        res = execute_with_retry(session.post, url, json=body, timeout=30, headers=headers)
         if res.status_code != 200:
             print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
@@ -404,23 +405,28 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         else True
     )
 
+    # Headers copied from browser cURL capture — matched exactly to what LCW accepts.
+    # curl_cffi impersonation injects sec-ch-ua / sec-fetch-* automatically.
+    # X-Requested-With removed — real Chrome never sends this header.
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://{domain}/en/women-t-1",
+        "accept":          "application/json, text/plain, */*",
+        "accept-language": "en-US,en;q=0.9",
+        "origin":          f"https://{domain}",
+        "referer":         f"https://{domain}/en/men-clothing-t-9",
+        "sec-fetch-dest":  "empty",
+        "sec-fetch-mode":  "cors",
+        "sec-fetch-site":  "same-origin",
+        "priority":        "u=1, i",
     }
 
     try:
         print("  [LCW] Priming session cookies via homepage...")
-        prime_headers = {**headers}
-        prime_headers.pop("Content-Type", None)
+        prime_headers = {
+            "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+        }
         execute_with_retry(session.get, f"https://{domain}", headers=prime_headers, timeout=20)
-        execute_with_retry(session.get, f"https://{domain}/en/women-t-1", headers=prime_headers, timeout=15)
+        execute_with_retry(session.get, f"https://{domain}/en/men-clothing-t-9", headers=prime_headers, timeout=15)
         print("  [LCW] Session primed.")
     except Exception as e:
         print(f"  [LCW] Cookie priming failed (non-fatal): {e}")
