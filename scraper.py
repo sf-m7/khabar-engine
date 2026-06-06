@@ -574,6 +574,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
                 product_variant_tracking[db_pid] = []
                 opt_id = item.get("OptionId")
+                # Color is in the listing response for most items
+                color  = item.get("Color") or item.get("ColorName") or None
 
                 price      = float(item.get("PriceValue") or 0)
                 if price == 0:
@@ -599,7 +601,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     batch_variants.append({
                         "product_id":          db_pid,
                         "external_sku":        sku,
-                        "color":               None,
+                        "color":               color,
                         "size":                size_label,
                         "is_in_stock":         is_avail,
                         "first_observed_price": v_baseline,
@@ -608,7 +610,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                         "_meta_compare":       compare_at,
                         "_meta_baseline":      v_baseline,
                         "_meta_size":          size_label,
-                        "_meta_color":         None,
+                        "_meta_color":         color,
                         "_meta_available":     is_avail,
                     })
 
