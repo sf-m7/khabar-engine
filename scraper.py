@@ -3,6 +3,7 @@
 # Adds: Exponential Backoff, Brand Fault Isolation,
 #       Regional Cookie Priming, and Raw AJAX Routing.
 # Fixed: Akamai bypass using curl_cffi TLS spoofing & proxy routing.
+# Fixed: Supabase product_variants inner join logic.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -32,7 +33,6 @@ WEBSHARE_PROXY = {
     "https": f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
 } if WEBSHARE_USER and WEBSHARE_PASS else None
 
-# FIXED: Set engine to 'lcw_proxy' to match the evaluation router block below
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_proxy"},
     {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
@@ -63,7 +63,7 @@ CATEGORY_MAP = {
 # ── Resilience & Network Handlers ──────────────────────
 
 def get_resilient_session():
-    # FIXED: Initialize curl_cffi session with a Chrome browser identity to fool Akamai
+    # Initialize curl_cffi session with a Chrome browser identity to fool Akamai
     session = requests.Session(impersonate="chrome124")
     if WEBSHARE_PROXY:
         session.proxies.update(WEBSHARE_PROXY)
@@ -340,7 +340,6 @@ def lcw_normalize_gender(breadcrumb, fallback_gender):
 def lcw_fetch_sizes(session, domain, opt_id, headers):
     try:
         url = f"https://{domain}/en/ajax/product/OptionDetailAjax?optionId={opt_id}"
-        # FIXED: Removed 'proxies=WEBSHARE_PROXY' since session level now handles it globally
         res = execute_with_retry(session.get, url, timeout=10, headers=headers)
         if res.status_code == 200:
             data = res.json()
@@ -366,7 +365,6 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
     }
     post_headers = {**headers, "Content-Type": "application/json"}
     try:
-        # FIXED: Routed through the resilience logic handler safely using curl_cffi session
         res = execute_with_retry(session.post, url, json=body, timeout=30, headers=post_headers)
         if res.status_code != 200:
             print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
@@ -637,12 +635,13 @@ def scrape_brand(brand_name, domain):
             print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
             return 0
 
+        # Fixed: Inner join on products table to correctly filter variants by brand
         all_variant_rows, offset = [], 0
         while True:
             chunk = safe_db_execute(
                 supabase.table("product_variants")
-                .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at")
-                .eq("brand", brand_name)
+                .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at, products!inner(brand)")
+                .eq("products.brand", brand_name)
                 .range(offset, offset + 999)
             )
             rows = chunk.data if (chunk and chunk.data) else []
@@ -650,6 +649,7 @@ def scrape_brand(brand_name, domain):
             if len(rows) < 1000:
                 break
             offset += 1000
+            
         prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
 
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
