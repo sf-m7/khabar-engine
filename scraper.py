@@ -461,7 +461,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping category.")
             continue
 
+        # Print top-level keys so we can see the actual response structure
+        print(f"  [{cat_name}] Response top-level keys: {list(first_data.keys())}")
         catalog_meta = first_data.get("CatalogList") or {}
+        print(f"  [{cat_name}] CatalogList keys: {list(catalog_meta.keys()) if catalog_meta else 'EMPTY — wrong key name'}")
         total_items  = catalog_meta.get("ItemCount", 0)
         page_count   = catalog_meta.get("PageCount", 1)
         print(f"  [{cat_name}] {total_items} products across {page_count} pages.")
