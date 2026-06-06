@@ -34,12 +34,14 @@ WEBSHARE_PROXY = {
 } if WEBSHARE_USER and WEBSHARE_PASS else None
 
 BRANDS = [
+    # LCW first — so we know immediately if the proxy is working
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_proxy"},
+    # Shopify brands — these were working before LCW work began, keep them untouched
     {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
     {"name": "ravin",      "domain": "shop.iravin.com", "engine": "shopify"},
     {"name": "mens_club",  "domain": "mensclubcollection.com", "engine": "shopify"},
     {"name": "tree",       "domain": "tree-stores.com", "engine": "shopify"},
-    {"name": "dott_jeans", "domain": "dottjeans.com", "engine": "shopify"}
+    {"name": "dott_jeans", "domain": "dottjeans.com", "engine": "shopify"},
 ]
 
 BRAND_DISPLAY = {
@@ -63,11 +65,25 @@ CATEGORY_MAP = {
 # ── Resilience & Network Handlers ──────────────────────
 
 def get_resilient_session():
-    # Initialize curl_cffi session with a Chrome browser identity to fool Akamai
-    session = requests.Session(impersonate="chrome124")
-    if WEBSHARE_PROXY:
-        session.proxies.update(WEBSHARE_PROXY)
-    return session
+    # Unchanged from before LCW work — Shopify brands use this exclusively.
+    # curl_cffi with Chrome impersonation for TLS fingerprinting.
+    return requests.Session(impersonate="chrome124")
+
+def get_lcw_session():
+    """
+    Proxied session exclusively for LC Waikiki.
+    Webshare residential proxy is passed at session init using curl_cffi's
+    correct syntax — not via session.proxies.update() which is unreliable.
+    The proxy makes GitHub Actions appear as a real residential user,
+    bypassing Akamai's "Host not in allowlist" datacenter IP block.
+    """
+    if not WEBSHARE_PROXY:
+        return requests.Session(impersonate="chrome124")
+    # curl_cffi accepts proxy at session level via the proxies kwarg
+    # Use the https entry since LCW is HTTPS
+    proxy_url = WEBSHARE_PROXY.get("https") or WEBSHARE_PROXY.get("http")
+    s = requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    return s
 
 def execute_with_retry(session_method, url, max_retries=3, backoff=1, **kwargs):
     """
@@ -622,7 +638,11 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 def scrape_brand(brand_name, domain):
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        session = get_resilient_session()
+        brand_config = next(b for b in BRANDS if b["name"] == brand_name)
+        # LCW gets a proxied session; all other brands get a clean session.
+        # Keeping them separate prevents the proxy from interfering with
+        # Shopify brand TLS connections (caused the Town Team page 11 error).
+        session = get_lcw_session() if brand_config["engine"] == "lcw_proxy" else get_resilient_session()
     except Exception as e:
         print(f"❌ Initialization failed for {brand_name}: {e}")
         return 0
@@ -652,8 +672,6 @@ def scrape_brand(brand_name, domain):
             
         prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
 
-        brand_config = next(b for b in BRANDS if b["name"] == brand_name)
-        
         if brand_config["engine"] == "shopify":
             seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state)
         elif brand_config["engine"] == "lcw_proxy":
