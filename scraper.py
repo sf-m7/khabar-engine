@@ -542,17 +542,27 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not batch_products:
                 continue
 
+            # Deduplicate by external_id — LCW returns multiple colour variants
+            # of the same ModelId on one page. PostgreSQL rejects upserting the
+            # same external_id twice in a single batch (ON CONFLICT error 21000).
+            seen_ext_ids = set()
+            deduped_products = []
+            for p in batch_products:
+                if p["external_id"] not in seen_ext_ids:
+                    seen_ext_ids.add(p["external_id"])
+                    deduped_products.append(p)
+
             product_upsert_rows = []
-            for i in range(0, len(batch_products), 100):
+            for i in range(0, len(deduped_products), 100):
                 res_p = safe_db_execute(
                     supabase.table("products")
-                    .upsert(batch_products[i:i+100], on_conflict="brand,external_id")
+                    .upsert(deduped_products[i:i+100], on_conflict="brand,external_id")
                 )
                 if res_p and res_p.data:
                     product_upsert_rows.extend(res_p.data)
 
             product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
-            products_seen += len(batch_products)
+            products_seen += len(deduped_products)
 
             batch_variants, product_variant_tracking = [], {}
 
