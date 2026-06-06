@@ -503,6 +503,19 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
                 break
 
+            # TEMPORARY: print first item's full keys once to check if
+            # Variants/Sizes are already embedded in the listing response.
+            # Remove this block after one diagnostic run.
+            if page_idx == 1 and cat_name == "Men" and items:
+                first = items[0]
+                print(f"  [DEBUG] Item keys: {list(first.keys())}")
+                for key in ["Variants","Options","Sizes","AvailableSizes",
+                            "SizeOptions","StockItems","AvailableStock",
+                            "OptionDetails","ProductOptions","Color","ColorName"]:
+                    val = first.get(key)
+                    if val is not None:
+                        print(f"  [DEBUG] {key} = {str(val)[:300]}")
+
             for _item in items:
                 _opt = _item.get("OptionId")
                 if _opt and _opt not in seen_ids:
@@ -588,31 +601,39 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     else None
                 )
 
-                sizes_data = lcw_fetch_sizes(session, domain, opt_id, headers)
+                # APPROACH: one variant row per colour option (OptionId).
+                # We skip the OptionDetailAjax sizes call because:
+                # 1. It's Akamai-protected — adds ~100 HTTP calls per page
+                # 2. Returns "One Size" fallback anyway when it fails
+                # 3. Makes each page take 2+ minutes instead of ~5 seconds
+                #
+                # Each OptionId uniquely identifies one colour of a product.
+                # AvailableStock > 0 tells us if that colour is in stock.
+                # Size-level data can be added later via a dedicated endpoint.
+                #
+                # SKU format: lcw_{opt_id} — one row per colour option.
+                is_avail   = int(item.get("AvailableStock") or 0) > 0
+                sku        = f"lcw_{opt_id}"
+                color_name = item.get("Color") or item.get("ColorName") or None
 
-                for s_entry in sizes_data:
-                    size_label = (s_entry.get("Size") or "One Size").strip()
-                    is_avail   = bool(s_entry.get("IsAvailable", True))
-                    sku        = f"lcw_{opt_id}_{size_label.replace(' ', '_')}"
+                prev       = prev_stock_state.get(sku)
+                v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
 
-                    prev       = prev_stock_state.get(sku)
-                    v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
-
-                    batch_variants.append({
-                        "product_id":          db_pid,
-                        "external_sku":        sku,
-                        "color":               color,
-                        "size":                size_label,
-                        "is_in_stock":         is_avail,
-                        "first_observed_price": v_baseline,
-                        "last_updated_at":     datetime.now(timezone.utc).isoformat(),
-                        "_meta_price":         price,
-                        "_meta_compare":       compare_at,
-                        "_meta_baseline":      v_baseline,
-                        "_meta_size":          size_label,
-                        "_meta_color":         color,
-                        "_meta_available":     is_avail,
-                    })
+                batch_variants.append({
+                    "product_id":          db_pid,
+                    "external_sku":        sku,
+                    "color":               color_name,
+                    "size":                None,   # populated later when sizes endpoint found
+                    "is_in_stock":         is_avail,
+                    "first_observed_price": v_baseline,
+                    "last_updated_at":     datetime.now(timezone.utc).isoformat(),
+                    "_meta_price":         price,
+                    "_meta_compare":       compare_at,
+                    "_meta_baseline":      v_baseline,
+                    "_meta_size":          None,
+                    "_meta_color":         color_name,
+                    "_meta_available":     is_avail,
+                })
 
             if batch_variants:
                 db_payload = [{k: v for k, v in row.items() if not k.startswith("_meta_")} for row in batch_variants]
