@@ -53,13 +53,96 @@ BRAND_DISPLAY = {
     "lc_waikiki": "LC Waikiki"
 }
 
+# ── Category Taxonomy ────────────────────────────────────────────────────────
+# Two-level system:
+#   category_normalized = specific sub-category (e.g. "t-shirts", "jeans")
+#   Broad groupings (tops/bottoms/etc.) are derived at query time for reports.
+#   Order matters — more specific patterns checked first.
+#   Applies to ALL brands: Shopify and LCW normalized to the same taxonomy.
+#
+# Broad group mapping for reports:
+#   tops:       t-shirts, shirts, polos, sweatshirts, hoodies, blouses, tunics, bodysuits
+#   bottoms:    jeans, trousers, shorts, skirts, leggings, joggers, chinos, sweatpants
+#   outerwear:  jackets, coats, blazers, cardigans, sweaters, vests
+#   dresses:    dresses, jumpsuits, playsuits, kaftans, abayas
+#   footwear:   sneakers, sandals, boots, loafers, heels, slippers
+#   accessories: bags, belts, scarves, hats, jewelry, watches, sunglasses, socks, underwear
+#   swimwear:   swimwear, bikinis, trunks
+#   loungewear: pyjamas, homewear, nightwear
+
 CATEGORY_MAP = {
-    "tops":        ["shirt", "t-shirt", "tee", "blouse", "top", "polo", "sweatshirt", "tank", "henley", "تيشيرت", "بلوزة"],
-    "bottoms":     ["jeans", "trouser", "pant", "short", "skirt", "legging", "chino", "denim", "jogger", "بنطلون", "جينز"],
-    "dresses":     ["dress", "jumpsuit", "playsuit", "kaftan", "abaya", "maxi", "midi", "فستان", "عباية"],
-    "outerwear":   ["jacket", "coat", "blazer", "hoodie", "cardigan", "sweater", "pullover", "جاكيت", "بلوفر"],
-    "footwear":    ["shoe", "sneaker", "sandal", "boot", "flat", "loafer", "slipper", "حذاء", "سنيكر"],
-    "accessories": ["bag", "belt", "scarf", "hat", "cap", "jewelry", "watch", "sunglasses", "شنطة", "حزام"],
+    # ── Tops (specific) ───────────────────────────────────────────────────────
+    "t-shirts":     ["t-shirt", " tee ", " tee,", "تيشيرت", "jersey tee", "jersey t"],
+    "shirts":       ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
+    "polos":        ["polo"],
+    "sweatshirts":  ["sweatshirt", "سويت شيرت", "sweats"],
+    "hoodies":      ["hoodie", "hoody", "هودي"],
+    "cardigans":    ["cardigan", "كارديجان"],
+    "sweaters":     ["sweater", "pullover", "knitwear", "knit", "بلوفر"],
+    "bodysuits":    ["bodysuit", "body suit", "بودي"],
+    "tank-tops":    ["tank", "sleeveless top", "cami", "spaghetti"],
+
+    # ── Bottoms (specific) ────────────────────────────────────────────────────
+    "jeans":        ["jean", "denim trouser", "denim pant", "جينز"],
+    "trousers":     ["trouser", "pant", "chino", "بنطلون", "slacks"],
+    "shorts":       ["short", "شورت"],
+    "skirts":       ["skirt", "تنورة", "jupe"],
+    "leggings":     ["legging", "تايتس", "tight"],
+    "joggers":      ["jogger", "sweatpant", "tracksuit bottom", "jogging"],
+    "sweatpants":   ["sweat pant"],
+
+    # ── Outerwear (specific) ──────────────────────────────────────────────────
+    "jackets":      ["jacket", "puffer", "parka", "windbreaker", "جاكيت"],
+    "coats":        ["coat", "overcoat", "معطف"],
+    "blazers":      ["blazer", "بليزر"],
+    "vests":        ["vest", "gilet", "صدرية"],
+
+    # ── Dresses & Jumpsuits ───────────────────────────────────────────────────
+    "dresses":      ["dress", "فستان", "maxi dress", "midi dress", "mini dress"],
+    "jumpsuits":    ["jumpsuit", "playsuit", "overall", "romper", "جمبسوت"],
+    "kaftans":      ["kaftan", "قفطان", "abaya", "عباية", "jalabiya", "جلابية"],
+
+    # ── Footwear (specific) ───────────────────────────────────────────────────
+    "sneakers":     ["sneaker", "trainer", "athletic shoe", "سنيكر", "كوتشي"],
+    "sandals":      ["sandal", "flip flop", "flip-flop", "صندل"],
+    "boots":        ["boot", "بوت"],
+    "loafers":      ["loafer", "moccasin", "slip-on", "flat shoe"],
+    "heels":        ["heel", "pump", "wedge", "stiletto"],
+    "slippers":     ["slipper", "house shoe", "شبشب"],
+
+    # ── Accessories (specific) ────────────────────────────────────────────────
+    "bags":         ["bag", "handbag", "backpack", "tote", "clutch", "شنطة", "حقيبة"],
+    "belts":        ["belt", "حزام"],
+    "scarves":      ["scarf", "شال", "stole"],
+    "hats":         ["hat", "cap", "beanie", "قبعة", "طاقية"],
+    "jewelry":      ["jewelry", "jewellery", "necklace", "bracelet", "ring", "earring", "مجوهرات"],
+    "watches":      ["watch", "ساعة"],
+    "sunglasses":   ["sunglass", "eyewear", "نظارة"],
+    "socks":        ["sock", "جوارب", "stocking", "tights"],
+    "underwear":    ["underwear", "bra", "brief", "boxer", "lingerie", "ملابس داخلية"],
+
+    # ── Swimwear ──────────────────────────────────────────────────────────────
+    "swimwear":     ["swimwear", "swimsuit", "bikini", "swim trunk", "مايوه"],
+
+    # ── Loungewear ────────────────────────────────────────────────────────────
+    "loungewear":   ["pyjama", "pajama", "nightwear", "sleepwear", "homewear", "بيجامة"],
+
+    # ── Sportswear ────────────────────────────────────────────────────────────
+    "sportswear":   ["sport", "gym", "athletic", "workout", "training", "active"],
+}
+
+# Broad category groups — used for report-level aggregation.
+# category_normalized stores the specific value; queries use this map to roll up.
+CATEGORY_GROUPS = {
+    "tops":        ["t-shirts", "shirts", "polos", "sweatshirts", "hoodies", "bodysuits", "tank-tops"],
+    "outerwear":   ["jackets", "coats", "blazers", "cardigans", "sweaters", "vests"],
+    "bottoms":     ["jeans", "trousers", "shorts", "skirts", "leggings", "joggers", "sweatpants"],
+    "dresses":     ["dresses", "jumpsuits", "kaftans"],
+    "footwear":    ["sneakers", "sandals", "boots", "loafers", "heels", "slippers"],
+    "accessories": ["bags", "belts", "scarves", "hats", "jewelry", "watches", "sunglasses", "socks", "underwear"],
+    "swimwear":    ["swimwear"],
+    "loungewear":  ["loungewear"],
+    "sportswear":  ["sportswear"],
 }
 
 # ── Resilience & Network Handlers ──────────────────────
@@ -424,28 +507,12 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
 
-    # ── Proxy connectivity check ───────────────────────────────────────────────
-    # Verifies that (a) Webshare credentials work, and (b) the outbound IP
-    # is residential. Runs once per scrape_lcw call. Non-fatal if it fails.
-    print(f"  [LCW] Proxy configured: {WEBSHARE_PROXY is not None}")
-    try:
-        ip_r = session.get("https://api.ipify.org?format=json", timeout=10)
-        print(f"  [LCW] Outbound IP via proxy: {ip_r.text[:80]}")
-    except Exception as e:
-        print(f"  [LCW] IP check failed: {e}")
-    # ──────────────────────────────────────────────────────────────────────────
-
+    print(f"  [LCW] Proxy active: {WEBSHARE_PROXY is not None}")
     products_seen, price_changes = 0, 0
 
-    check_insert = safe_db_execute(
-        supabase.table("price_snapshots").select("id")
-        .eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1)
-    )
-    use_insert = (
-        len(check_insert.data) == 0
-        if (check_insert and check_insert.data is not None)
-        else True
-    )
+    # Always use upsert for snapshots — the unique index handles conflicts.
+    # The old INSERT/UPDATE toggle caused duplicate key errors on re-runs.
+    use_insert = True  # passed to upsert_snapshot but upsert handles conflicts
 
     # Headers copied from browser cURL capture — matched exactly to what LCW accepts.
     # curl_cffi impersonation injects sec-ch-ua / sec-fetch-* automatically.
@@ -460,18 +527,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "sec-fetch-site":  "same-origin",
         "priority":        "u=1, i",
     }
-
-    try:
-        print("  [LCW] Priming session cookies via homepage...")
-        prime_headers = {
-            "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "accept-language": "en-US,en;q=0.9",
-        }
-        execute_with_retry(session.get, f"https://{domain}", headers=prime_headers, timeout=20)
-        execute_with_retry(session.get, f"https://{domain}/en/men-clothing-t-9", headers=prime_headers, timeout=15)
-        print("  [LCW] Session primed.")
-    except Exception as e:
-        print(f"  [LCW] Cookie priming failed (non-fatal): {e}")
 
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
@@ -502,19 +557,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not items:
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
                 break
-
-            # TEMPORARY: print first item's full keys once to check if
-            # Variants/Sizes are already embedded in the listing response.
-            # Remove this block after one diagnostic run.
-            if page_idx == 1 and cat_name == "Men" and items:
-                import json as _json
-                first = items[0]
-                print(f"  [DEBUG] Color={first.get('Color')} BreadCrump={first.get('BreadCrump')} BreadCrumb={first.get('BreadCrumb')}")
-                print(f"  [DEBUG] Price={first.get('Price')} DiscountedPrice={first.get('DiscountedPrice')} DiscountedPriceValue={first.get('DiscountedPriceValue')}")
-                osl = first.get("OptionSummaryList")
-                print(f"  [DEBUG] OptionSummaryList = {_json.dumps(osl)[:800] if osl else 'NULL'}")
-                mvm = first.get("ModelViewModel")
-                print(f"  [DEBUG] ModelViewModel = {str(mvm)[:400] if mvm else 'NULL'}")
 
             for _item in items:
                 _opt = _item.get("OptionId")
@@ -597,15 +639,25 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 # PriceValue = display price (may equal DiscountedPriceValue)
                 # MinOldPrice = original price before discount
                 # Discounted = bool flag for whether item is on sale
-                is_discounted = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
-                price_val     = float(item.get("DiscountedPriceValue") or item.get("PriceValue") or 0)
-                full_price    = float(item.get("MinOldPrice") or item.get("PriceValue") or 0)
+                # PriceValue = "499.00 EGP" (string), DiscountedPriceValue = 0 when not on sale
+                def _p(v):
+                    if not v: return 0.0
+                    if isinstance(v, (int, float)): return float(v)
+                    s = "".join(c for c in str(v) if c.isdigit() or c == ".")
+                    return float(s) if s else 0.0
 
-                if price_val == 0:
+                is_discounted  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
+                discounted_val = _p(item.get("DiscountedPriceValue"))
+                full_val       = _p(item.get("PriceValue") or item.get("Price"))
+                old_val        = _p(item.get("MinOldPrice"))
+
+                if is_discounted and discounted_val > 0:
+                    price, compare_at = discounted_val, (old_val or full_val) if (old_val or full_val) > discounted_val else None
+                else:
+                    price, compare_at = full_val, None
+
+                if price == 0:
                     continue
-
-                price      = price_val
-                compare_at = full_price if (is_discounted and full_price > price_val) else None
 
                 # APPROACH: one variant row per colour option (OptionId).
                 # We skip the OptionDetailAjax sizes call because:
