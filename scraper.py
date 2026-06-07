@@ -413,8 +413,19 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
 
 LCW_CATEGORIES = [
-    {"id": 9, "name": "Men",   "gender": "men"},
-    {"id": 1, "name": "Women", "gender": "women"},
+    {
+        "id": 9, "name": "Men", "gender": "men",
+        "params": [
+            {"PropertyId": 67, "PropertyValueId": [10]},
+            {"PropertyId": 63, "PropertyValueId": [57794]},
+        ],
+    },
+    {
+        "id": 1, "name": "Women", "gender": "women",
+        "params": [
+            {"PropertyId": 67, "PropertyValueId": [8]},
+        ],
+    },
 ]
 
 LCW_BREADCRUMB_GENDER_MAP = {
@@ -468,10 +479,16 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         # curl_cffi sets Content-Type: application/json automatically when json= is used.
         # Pass headers directly — no Content-Type override needed.
         res = execute_with_retry(session.post, url, json=body, timeout=30, headers=headers)
-        if res.status_code != 200:
-            print(f"  ⚠️ LCW API returned HTTP {res.status_code} (cat={category_id}, page={page_index})")
+        # LCW returns HTTP 404 as its normal success code for this endpoint.
+        # Only treat non-200/404 codes as real failures.
+        if res.status_code not in [200, 404]:
+            print(f"  ⚠️ LCW API unexpected HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
-        return res.json()
+        try:
+            return res.json()
+        except Exception:
+            print(f"  ⚠️ LCW HTTP {res.status_code} but body is not JSON")
+            return None
     except Exception as e:
         print(f"  ⚠️ LCW network fault (cat={category_id}, page={page_index}): {e}")
         return None
@@ -482,6 +499,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
     # upsert_snapshot uses ON CONFLICT DO UPDATE — no insert/update toggle needed
     use_insert = True
+    prev_prices = load_last_prices(supabase, brand_name)
 
     # Headers copied from browser cURL capture — matched exactly to what LCW accepts.
     # curl_cffi impersonation injects sec-ch-ua / sec-fetch-* automatically.
@@ -665,11 +683,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                             )
 
                         curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                        last_ev = safe_db_execute(
-                            supabase.table("price_events").select("price_after")
-                            .eq("product_id", db_pid).order("recorded_at", desc=True).limit(1)
-                        )
-                        last_p = float(last_ev.data[0]["price_after"]) if (last_ev and last_ev.data) else None
+                        last_p = prev_prices.get(db_pid)  # in-memory — zero DB queries
 
                         if last_p is None or abs(last_p - curr_price) > 0.01:
                             direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
@@ -704,6 +718,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                     "recorded_at":   datetime.now(timezone.utc).isoformat(),
                                 })
                             )
+                            prev_prices[db_pid] = curr_price
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
 
