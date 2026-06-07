@@ -1,12 +1,11 @@
 name: Khabar Price Scraper
 on:
   schedule:
-    # Runs 4 times daily: midnight, 6am, noon, 6pm UTC
-    # Egypt is UTC+3, so local times are: 3am, 9am, 3pm, 9pm
-    # Midnight UTC run captures end-of-day prices for intelligence reports.
-    # 4-hour interval gives 720 snapshots/product over 6 months — sufficient
-    # for all Level 2 intelligence products in the Khabar playbook.
-    - cron: "0 0,6,12,18 * * *"
+    # 2x daily — the only schedule that fits within 1GB/month Webshare plan.
+    # Midnight UTC = end-of-day price capture (essential for intelligence reports).
+    # Noon UTC = midday price capture.
+    # At ~14.4MB per run: 2 × 30 days × 14.4MB = 864MB/month (fits in 1GB).
+    - cron: "0 0,12 * * *"
   workflow_dispatch:
 jobs:
   scrape:
