@@ -534,6 +534,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 )
                 breadcrumb = item.get("BreadCrump") or {}
                 category   = lcw_normalize_category(breadcrumb)
+                # BreadCrump may be empty — fall back to product name which
+                # always contains the category ("Men's T-Shirt", "Men's Jeans")
+                if category == "uncategorized" and name:
+                    category = lcw_normalize_category({"Level3": name})
                 gender     = lcw_normalize_gender(breadcrumb, cat_gender)
                 model_url  = item.get("ModelUrl") or ""
                 url        = f"https://{domain}{model_url}" if model_url.startswith("/") else model_url
