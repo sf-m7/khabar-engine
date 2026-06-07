@@ -507,14 +507,14 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             # Variants/Sizes are already embedded in the listing response.
             # Remove this block after one diagnostic run.
             if page_idx == 1 and cat_name == "Men" and items:
+                import json as _json
                 first = items[0]
-                print(f"  [DEBUG] Item keys: {list(first.keys())}")
-                for key in ["Variants","Options","Sizes","AvailableSizes",
-                            "SizeOptions","StockItems","AvailableStock",
-                            "OptionDetails","ProductOptions","Color","ColorName"]:
-                    val = first.get(key)
-                    if val is not None:
-                        print(f"  [DEBUG] {key} = {str(val)[:300]}")
+                print(f"  [DEBUG] Color={first.get('Color')} BreadCrump={first.get('BreadCrump')} BreadCrumb={first.get('BreadCrumb')}")
+                print(f"  [DEBUG] Price={first.get('Price')} DiscountedPrice={first.get('DiscountedPrice')} DiscountedPriceValue={first.get('DiscountedPriceValue')}")
+                osl = first.get("OptionSummaryList")
+                print(f"  [DEBUG] OptionSummaryList = {_json.dumps(osl)[:800] if osl else 'NULL'}")
+                mvm = first.get("ModelViewModel")
+                print(f"  [DEBUG] ModelViewModel = {str(mvm)[:400] if mvm else 'NULL'}")
 
             for _item in items:
                 _opt = _item.get("OptionId")
@@ -532,7 +532,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     or item.get("Name")
                     or f"LCW-{model_id}"
                 )
-                breadcrumb = item.get("BreadCrumb") or {}
+                breadcrumb = item.get("BreadCrump") or {}
                 category   = lcw_normalize_category(breadcrumb)
                 gender     = lcw_normalize_gender(breadcrumb, cat_gender)
                 model_url  = item.get("ModelUrl") or ""
@@ -542,7 +542,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     "brand":             brand_name,
                     "external_id":       str(model_id),
                     "name":              name,
-                    "category_raw":      (breadcrumb.get("Level3") or ""),
+                    "category_raw":      (breadcrumb.get("Level3") or breadcrumb.get("Level2") or ""),
                     "category_normalized": category,
                     "gender":            gender,
                     "sizes_available":   [],
@@ -588,18 +588,20 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 product_variant_tracking[db_pid] = []
                 opt_id = item.get("OptionId")
                 # Color is in the listing response for most items
-                color  = item.get("Color") or item.get("ColorName") or None
+                # Price fields from confirmed item structure:
+                # DiscountedPriceValue = numeric current price (always present)
+                # PriceValue = display price (may equal DiscountedPriceValue)
+                # MinOldPrice = original price before discount
+                # Discounted = bool flag for whether item is on sale
+                is_discounted = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
+                price_val     = float(item.get("DiscountedPriceValue") or item.get("PriceValue") or 0)
+                full_price    = float(item.get("MinOldPrice") or item.get("PriceValue") or 0)
 
-                price      = float(item.get("PriceValue") or 0)
-                if price == 0:
+                if price_val == 0:
                     continue
 
-                old_price_str = item.get("OldPrice") or ""
-                compare_at = (
-                    float("".join(c for c in old_price_str if c.isdigit() or c == "."))
-                    if any(c.isdigit() for c in old_price_str)
-                    else None
-                )
+                price      = price_val
+                compare_at = full_price if (is_discounted and full_price > price_val) else None
 
                 # APPROACH: one variant row per colour option (OptionId).
                 # We skip the OptionDetailAjax sizes call because:
@@ -689,7 +691,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                         for item in items:
                                             if target_ext_id and str(item.get("ModelId")) == target_ext_id:
                                                 desc = item.get("ProductDescription") or item.get("BrandPropertyDescription") or "LCW Item"
-                                                breadcrumb = item.get("BreadCrumb") or {}
+                                                breadcrumb = item.get("BreadCrump") or {}
                                                 category   = lcw_normalize_category(breadcrumb)
                                                 model_url  = item.get("ModelUrl") or ""
                                                 product_url = f"https://{domain}{model_url}"
