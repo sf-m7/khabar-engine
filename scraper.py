@@ -293,21 +293,56 @@ def load_last_prices(supabase, brand_name):
         if result and result.data: return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
     return {}
 
-def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert):
-    if not variant_records: return
-    prices = [v["_meta_price"] for v in variant_records]
+def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert=True):
+    """
+    Writes one price snapshot per product (or per variant) per day.
+    Uses upsert with ON CONFLICT DO UPDATE so it's safe to call multiple
+    times per day — second call simply updates the price value in place.
+    The unique index idx_snapshot_product_day enforces one row per day.
+    """
+    if not variant_records:
+        return
+    prices = [v["_meta_price"] for v in variant_records if v.get("_meta_price")]
+    if not prices:
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     if len(set(prices)) == 1:
+        # All variants at same price — one product-level snapshot row
         vd = variant_records[0]
-        row = {"product_id": db_product_id, "variant_id": None, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
-        if use_insert: safe_db_execute(supabase.table("price_snapshots").insert(row))
-        else: safe_db_execute(supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("product_id", db_product_id).eq("snapshot_date", str(today)))
+        row = {
+            "product_id":     db_product_id,
+            "variant_id":     None,
+            "brand":          brand_name,
+            "price":          vd["_meta_price"],
+            "compare_at_price": vd["_meta_compare"],
+            "snapshot_date":  str(today),
+            "recorded_at":    now_iso,
+        }
+        safe_db_execute(
+            supabase.table("price_snapshots")
+            .upsert(row, on_conflict="product_id,snapshot_date")
+        )
     else:
+        # Multiple prices across variants — one row per variant
         for vd in variant_records:
             vid = vd.get("variant_db_id")
-            if not vid: continue
-            row = {"product_id": None, "variant_id": vid, "brand": brand_name, "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "snapshot_date": str(today), "recorded_at": datetime.now(timezone.utc).isoformat()}
-            if use_insert: safe_db_execute(supabase.table("price_snapshots").insert(row))
-            else: safe_db_execute(supabase.table("price_snapshots").update({"price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"], "recorded_at": datetime.now(timezone.utc).isoformat()}).eq("variant_id", vid).eq("snapshot_date", str(today)))
+            if not vid:
+                continue
+            row = {
+                "product_id":     None,
+                "variant_id":     vid,
+                "brand":          brand_name,
+                "price":          vd["_meta_price"],
+                "compare_at_price": vd["_meta_compare"],
+                "snapshot_date":  str(today),
+                "recorded_at":    now_iso,
+            }
+            safe_db_execute(
+                supabase.table("price_snapshots")
+                .upsert(row, on_conflict="variant_id,snapshot_date")
+            )
 
 def detect_and_write_stockout(supabase, variant_db_id, product_id, brand, size, color, prev_stock, curr_stock, curr_price, baseline):
     if prev_stock == curr_stock: return
