@@ -35,14 +35,13 @@ WEBSHARE_PROXY = {
 } if WEBSHARE_USER and WEBSHARE_PASS else None
 
 BRANDS = [
-    # Shopify brands first — guaranteed to run even if LCW fails
+    # LCW first — measure proxy bandwidth immediately, then Shopify brands follow
+    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_proxy"},
     {"name": "town_team",  "domain": "www.townteam.com", "engine": "shopify"},
     {"name": "ravin",      "domain": "shop.iravin.com", "engine": "shopify"},
     {"name": "mens_club",  "domain": "mensclubcollection.com", "engine": "shopify"},
     {"name": "tree",       "domain": "tree-stores.com", "engine": "shopify"},
     {"name": "dott_jeans", "domain": "dottjeans.com", "engine": "shopify"},
-    # LCW last — uses Webshare proxy; bandwidth measured after first clean run
-    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg", "engine": "lcw_proxy"},
 ]
 
 BRAND_DISPLAY = {
