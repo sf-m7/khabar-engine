@@ -1,11 +1,17 @@
 name: Khabar Price Scraper
 on:
   schedule:
-    - cron: "0 * * * *"   # Every 60 minutes (was every 30 — GitHub Actions skips runs under load)
+    # Runs 4 times daily: midnight, 6am, noon, 6pm UTC
+    # Egypt is UTC+3, so local times are: 3am, 9am, 3pm, 9pm
+    # Midnight UTC run captures end-of-day prices for intelligence reports.
+    # 4-hour interval gives 720 snapshots/product over 6 months — sufficient
+    # for all Level 2 intelligence products in the Khabar playbook.
+    - cron: "0 0,6,12,18 * * *"
   workflow_dispatch:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - name: Pull the code
         uses: actions/checkout@v4
@@ -13,16 +19,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
+          cache: "pip"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Random startup delay
-        run: |
-          DELAY=$((RANDOM % 900 + 60))
-          echo "Sleeping ${DELAY}s before scraping..."
-          sleep $DELAY
       - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
