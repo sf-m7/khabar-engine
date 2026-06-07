@@ -382,7 +382,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
             for db_pid, records in product_variant_tracking.items():
                 if not records: continue
-                upsert_snapshot(supabase, brand_name, db_pid, records, today, use_insert)
+                upsert_snapshot(supabase, brand_name, db_pid, records, today)
                 sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
 
                 for rec in records:
@@ -450,7 +450,7 @@ def lcw_fetch_sizes(session, domain, opt_id, headers):
         pass
     return [{"Size": "One Size", "IsAvailable": True}]
 
-def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None):
+def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=None, category_params=None):
     url = (
         f"https://{domain}/en/ajax/ProductList/ProductListPageData"
         f"?xhrKeys=CategoryTreeId,xhrKeys"
@@ -459,7 +459,8 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers, seen_ids=N
         f"&Layout=three-column"
     )
     body = {
-        "CategoryParameterList": [],
+        # CategoryParameterList MUST match the browser payload — empty [] returns 0 results.
+        "CategoryParameterList": category_params or [],
         "FilterListJson": "[]",
         "LastSeenOptionIdsJson": json.dumps(seen_ids or []),
     }
@@ -479,15 +480,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
     products_seen, price_changes = 0, 0
 
-    check_insert = safe_db_execute(
-        supabase.table("price_snapshots").select("id")
-        .eq("brand", brand_name).eq("snapshot_date", str(today)).limit(1)
-    )
-    use_insert = (
-        len(check_insert.data) == 0
-        if (check_insert and check_insert.data is not None)
-        else True
-    )
+    # upsert_snapshot uses ON CONFLICT DO UPDATE — no insert/update toggle needed
+    use_insert = True
 
     # Headers copied from browser cURL capture — matched exactly to what LCW accepts.
     # curl_cffi impersonation injects sec-ch-ua / sec-fetch-* automatically.
@@ -511,7 +505,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
 
         seen_ids = []
-        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[])
+        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers, seen_ids=[], category_params=cat.get("params", []))
         if not first_data:
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping category.")
             continue
@@ -526,7 +520,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 data = first_data
             else:
                 time.sleep(1.5)
-                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids)
+                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers, seen_ids=seen_ids, category_params=cat.get("params", []))
                 if not data:
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
                     continue
@@ -656,7 +650,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     if not records:
                         continue
 
-                    upsert_snapshot(supabase, brand_name, db_pid, records, today, use_insert)
+                    upsert_snapshot(supabase, brand_name, db_pid, records, today)
                     sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
 
                     for rec in records:
