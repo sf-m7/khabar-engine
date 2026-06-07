@@ -402,10 +402,12 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                                     target_ext_id = next((k for k, v in product_id_map.items() if v == db_pid), None)
                                     for p in products:
                                         if target_ext_id and str(p["id"]) == target_ext_id:
-                                            find_and_alert_users(supabase, session, brand_name, rec["_meta_size"], curr_price, p["title"], f"https://{domain}/products/{p['handle']}", v_base)
+                                            find_and_alert_users(supabase, session, brand_name, normalize_category(f"{p['title']} {p.get('product_type','')}"), rec["_meta_size"], curr_price, p["title"], f"https://{domain}/products/{p['handle']}", v_base)
 
                         safe_db_execute(supabase.table("price_events").insert({"product_id": db_pid, "brand": brand_name, "price_before": last_p, "price_after": curr_price, "direction": direction, "sizes_in_stock": sizes_in_stock, "recorded_at": datetime.now(timezone.utc).isoformat()}))
                         prev_prices[db_pid] = curr_price  # keep in-memory dict current
+        print(f"  Page {page} — {len(batch_products) if batch_products else 0} products processed.")
+        time.sleep(1)  # polite delay — avoid bot detection on Shopify stores
         page += 1
     return products_seen, price_changes
 
@@ -587,17 +589,28 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not batch_products:
                 continue
 
+            # Deduplicate by external_id — LCW returns multiple colour variants
+            # of the same ModelId on one page. Upserting the same external_id
+            # twice in one batch causes PostgreSQL error 21000 (ON CONFLICT row
+            # affected twice). Keep only the first occurrence per ModelId.
+            seen_ext_ids = set()
+            deduped_products = []
+            for bp in batch_products:
+                if bp["external_id"] not in seen_ext_ids:
+                    seen_ext_ids.add(bp["external_id"])
+                    deduped_products.append(bp)
+
             product_upsert_rows = []
-            for i in range(0, len(batch_products), 100):
+            for i in range(0, len(deduped_products), 100):
                 res_p = safe_db_execute(
                     supabase.table("products")
-                    .upsert(batch_products[i:i+100], on_conflict="brand,external_id")
+                    .upsert(deduped_products[i:i+100], on_conflict="brand,external_id")
                 )
                 if res_p and res_p.data:
                     product_upsert_rows.extend(res_p.data)
 
             product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
-            products_seen += len(batch_products)
+            products_seen += len(deduped_products)
 
             batch_variants, product_variant_tracking = [], {}
 
