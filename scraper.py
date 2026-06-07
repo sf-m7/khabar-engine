@@ -276,37 +276,44 @@ def load_last_prices(supabase, brand_name):
         if result and result.data: return {row.get("product_id"): float(row["price"]) for row in result.data if row.get("product_id")}
     return {}
 
-def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today, use_insert=True):
+def upsert_snapshot(supabase, brand_name, db_product_id, variant_records, today,
+                    use_insert=True, existing_snapshot_ids=None):
     """
-    Writes one price snapshot per product per day using ON CONFLICT DO UPDATE.
-    Safe to call multiple times per day — second call updates price in place.
-    The use_insert param is kept for signature compatibility but ignored.
+    Writes one price snapshot per product per day.
+    Uses median price across variants. 
+    existing_snapshot_ids: set of product_ids already snapshotted today —
+    passed in from a single pre-loaded query to avoid per-product SELECTs.
     """
     if not variant_records:
         return
     prices = [v["_meta_price"] for v in variant_records if v.get("_meta_price")]
     if not prices:
         return
+    prices_sorted = sorted(prices)
+    median_price = prices_sorted[len(prices_sorted) // 2]
+    vd = variant_records[0]
     now_iso = datetime.now(timezone.utc).isoformat()
-    if len(set(prices)) == 1:
-        vd = variant_records[0]
-        safe_db_execute(supabase.table("price_snapshots").upsert(
-            {"product_id": db_product_id, "variant_id": None, "brand": brand_name,
-             "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"],
-             "snapshot_date": str(today), "recorded_at": now_iso},
-            on_conflict="product_id,snapshot_date"
-        ))
+
+    if existing_snapshot_ids is not None and db_product_id in existing_snapshot_ids:
+        # Already have a snapshot today — update price in place
+        safe_db_execute(
+            supabase.table("price_snapshots")
+            .update({"price": median_price, "recorded_at": now_iso})
+            .eq("product_id", db_product_id)
+            .eq("snapshot_date", str(today))
+        )
     else:
-        for vd in variant_records:
-            vid = vd.get("variant_db_id")
-            if not vid:
-                continue
-            safe_db_execute(supabase.table("price_snapshots").upsert(
-                {"product_id": None, "variant_id": vid, "brand": brand_name,
-                 "price": vd["_meta_price"], "compare_at_price": vd["_meta_compare"],
-                 "snapshot_date": str(today), "recorded_at": now_iso},
-                on_conflict="variant_id,snapshot_date"
-            ))
+        safe_db_execute(supabase.table("price_snapshots").insert({
+            "product_id":      db_product_id,
+            "variant_id":      None,
+            "brand":           brand_name,
+            "price":           median_price,
+            "compare_at_price": vd["_meta_compare"],
+            "snapshot_date":   str(today),
+            "recorded_at":     now_iso,
+        }))
+        if existing_snapshot_ids is not None:
+            existing_snapshot_ids.add(db_product_id)
 
 def detect_and_write_stockout(supabase, variant_db_id, product_id, brand, size, color, prev_stock, curr_stock, curr_price, baseline):
     if prev_stock == curr_stock: return
@@ -322,6 +329,17 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
     # For Town Team (~30k variants) this eliminates ~30,000 DB round trips,
     # cutting runtime from 2+ hours to under 30 minutes.
     prev_prices = load_last_prices(supabase, brand_name)
+
+    # Pre-load today's existing snapshot product_ids — avoids per-product SELECT
+    _snap_res = safe_db_execute(
+        supabase.table("price_snapshots")
+        .select("product_id")
+        .eq("brand", brand_name)
+        .eq("snapshot_date", str(today))
+    )
+    existing_snapshot_ids = set(
+        r["product_id"] for r in (_snap_res.data or []) if r.get("product_id")
+    )
 
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
@@ -382,7 +400,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
             for db_pid, records in product_variant_tracking.items():
                 if not records: continue
-                upsert_snapshot(supabase, brand_name, db_pid, records, today)
+                upsert_snapshot(supabase, brand_name, db_pid, records, today, existing_snapshot_ids=existing_snapshot_ids)
                 sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
 
                 for rec in records:
@@ -413,6 +431,48 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
 
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
+
+def parse_lcw_sizes(html):
+    """
+    Parse size availability from LCW product page HTML.
+    Sizes are rendered as <button> elements with data-label attribute.
+    In-stock:     class="option-size-box"
+    Out of stock: class="option-size-box option-size-box__stripped"
+    Returns: [{"size": "M", "is_in_stock": True}, ...]
+    """
+    import re
+    sizes = []
+    buttons = re.findall(
+        r'<button[^>]+data-label="([^"]+)"[^>]+class="([^"]+)"[^>]*>',
+        html
+    )
+    for label, classes in buttons:
+        if 'option-size-box' in classes:
+            sizes.append({
+                "size": label.strip(),
+                "is_in_stock": 'option-size-box__stripped' not in classes
+            })
+    return sizes
+
+def fetch_lcw_product_sizes(session, url, headers):
+    """
+    Fetches a single LCW product page and returns parsed sizes.
+    Cost: ~172KB compressed per call (confirmed from browser).
+    Only called for products that need size data.
+    """
+    try:
+        res = execute_with_retry(session.get, url, timeout=20, headers={
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            "accept-encoding": "gzip, deflate, br",
+        })
+        if res.status_code == 200:
+            return parse_lcw_sizes(res.text)
+    except Exception as e:
+        print(f"  ⚠️ Size fetch failed for {url}: {e}")
+    return []
+
+
 
 LCW_CATEGORIES = [
     {
@@ -502,6 +562,17 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     # upsert_snapshot uses ON CONFLICT DO UPDATE — no insert/update toggle needed
     use_insert = True
     prev_prices = load_last_prices(supabase, brand_name)
+
+    # Pre-load today's existing snapshot product_ids
+    _snap_res_lcw = safe_db_execute(
+        supabase.table("price_snapshots")
+        .select("product_id")
+        .eq("brand", brand_name)
+        .eq("snapshot_date", str(today))
+    )
+    existing_snapshot_ids = set(
+        r["product_id"] for r in (_snap_res_lcw.data or []) if r.get("product_id")
+    )
 
     # Headers copied from browser cURL capture — matched exactly to what LCW accepts.
     # curl_cffi impersonation injects sec-ch-ua / sec-fetch-* automatically.
@@ -681,7 +752,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     if not records:
                         continue
 
-                    upsert_snapshot(supabase, brand_name, db_pid, records, today)
+                    upsert_snapshot(supabase, brand_name, db_pid, records, today, existing_snapshot_ids=existing_snapshot_ids)
                     sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
 
                     for rec in records:
@@ -734,6 +805,76 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                             prev_prices[db_pid] = curr_price
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
+
+    # ── Size population pass ────────────────────────────────────────────────────
+    # Each LCW variant row currently represents one colour option (OptionId).
+    # We fetch its product page and update the existing row with size data.
+    # If a product has multiple sizes, we update the first variant row and
+    # insert additional rows for remaining sizes — each keyed by
+    # external_sku = "lcw_{optionId}_{size}" (size appended, unique per size).
+    # The original "lcw_{optionId}" row is updated to the first size found.
+    # Capped at 200 pages per run (~34MB proxy bandwidth).
+    print(f"  [LCW] Fetching sizes for variants missing data (cap: 200/run)...")
+    try:
+        missing = safe_db_execute(
+            supabase.table("product_variants")
+            .select("id, product_id, external_sku, color, first_observed_price, is_in_stock, products!inner(url, brand)")
+            .eq("products.brand", "lc_waikiki")
+            .is_("size", "null")
+            .limit(200)
+        )
+        if missing and missing.data:
+            print(f"  [LCW] {len(missing.data)} variants need sizes.")
+            fetched, populated = 0, 0
+            for row in missing.data:
+                url = (row.get("products") or {}).get("url")
+                if not url:
+                    continue
+                sizes = fetch_lcw_product_sizes(session, url, {
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "accept-language": "en-US,en;q=0.9",
+                })
+                fetched += 1
+                if sizes:
+                    base_sku     = row["external_sku"]
+                    product_id   = row.get("product_id")
+                    color        = row.get("color")
+                    fop          = row.get("first_observed_price") or prev_prices.get(product_id)
+                    now_iso      = datetime.now(timezone.utc).isoformat()
+
+                    for i, sz in enumerate(sizes):
+                        if i == 0:
+                            # Update the existing variant row with first size
+                            safe_db_execute(
+                                supabase.table("product_variants")
+                                .update({
+                                    "size":           sz["size"],
+                                    "is_in_stock":    sz["is_in_stock"],
+                                    "last_updated_at": now_iso,
+                                })
+                                .eq("id", row["id"])
+                            )
+                        else:
+                            # Insert additional rows for remaining sizes
+                            sku = f"{base_sku}_{sz['size'].replace(' ', '_')}"
+                            safe_db_execute(
+                                supabase.table("product_variants").upsert({
+                                    "product_id":           product_id,
+                                    "external_sku":         sku,
+                                    "color":                color,
+                                    "size":                 sz["size"],
+                                    "is_in_stock":          sz["is_in_stock"],
+                                    "first_observed_price": fop,
+                                    "last_updated_at":      now_iso,
+                                }, on_conflict="external_sku")
+                            )
+                    populated += 1
+                time.sleep(0.5)  # polite delay between product page fetches
+            print(f"  [LCW] Sizes fetched: {fetched} pages, {populated} products populated.")
+        else:
+            print("  [LCW] All variants have size data. ✅")
+    except Exception as e:
+        print(f"  [LCW] Size population error (non-fatal): {e}")
 
     return products_seen, price_changes
 
