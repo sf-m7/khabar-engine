@@ -1,11 +1,24 @@
 name: Khabar Price Scraper
 on:
   schedule:
-    # 2x daily — the only schedule that fits within 1GB/month Webshare plan.
-    # Midnight UTC = end-of-day price capture (essential for intelligence reports).
-    # Noon UTC = midday price capture.
-    # At ~14.4MB per run: 2 × 30 days × 14.4MB = 864MB/month (fits in 1GB).
-    - cron: "0 0,12 * * *"
+    # 4x daily (every 6 hours) — fits within 1GB/month Webshare proxy budget.
+    #
+    # BANDWIDTH MATH (only LCW uses proxy — Shopify brands go direct):
+    #   LCW listing API: ~0MB (compressed persistent TCP connection)
+    #   LCW size HTML pages: 40 pages × 164KB = 6.6MB per run
+    #   Total per run: ~7MB (with headroom for retries)
+    #   Monthly: 7MB × 4 runs × 30 days = 840MB ← fits 1GB with 160MB headroom
+    #
+    # WHY 4x:
+    #   - Catches intraday price changes for flash sale detection (L1·02)
+    #   - Size population completes in ~61 days instead of ~194 at 2x
+    #   - Each run writes one daily snapshot per product (idempotent)
+    #
+    # ANTI-DETECTION:
+    #   - Python startup jitter (0-30s random delay) staggers exact hit times
+    #   - Per-page delays with random intervals built into scraper.py
+    #   - curl_cffi Chrome TLS fingerprint impersonation
+    - cron: "0 0,6,12,18 * * *"
   workflow_dispatch:
 jobs:
   scrape:
