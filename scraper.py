@@ -4,7 +4,8 @@
 #  v13.1  SIZE_CAP=10 (1x daily schedule, 1GB/month Webshare plan)
 #  v13.2  LCW color resolved: ColorImageUrl filename (Turkish name)
 #         with MainColorHexCode fallback
-#  v13.3  Stock propagation RPC call after LCW listing pass
+#  v13.3  Session priming before LCW API calls (fixes Akamai 403)
+#         propagate_lcw_stock() RPC removed (caused Supabase timeout)
 #  v13.4  Snapshot loading: explicit limit(20000) in both Shopify
 #         and LCW scrapers — fixes duplicate key crash on 2nd+ daily run
 # ═══════════════════════════════════════════════════════
@@ -609,6 +610,39 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "priority":        "u=1, i",
     }
 
+    # ── Session priming ───────────────────────────────────────────────────────
+    # Akamai Bot Manager requires a prior browser-like page visit before it
+    # accepts API requests. Without this, the very first API call returns 403
+    # because Akamai has no record of a valid session for this proxy IP.
+    #
+    # We fetch one LCW category page (HTML only — ~500-900 KB) which causes
+    # Akamai to set its _abck session cookie on the session object. All
+    # subsequent API calls in this same session automatically carry that cookie.
+    #
+    # Bandwidth: ~800 KB/run × 30 days = ~24 MB/month — acceptable within 1 GB.
+    # This is far less than the old check_domain call, which loaded the full
+    # Next.js app bundle. We only need the HTML response, not any assets.
+    try:
+        prime_url = f"https://{domain}/en/men-clothing-t-9"
+        prime_headers = {
+            "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            "accept-encoding": "gzip, deflate, br",
+            "cache-control":   "no-cache",
+            "pragma":          "no-cache",
+        }
+        prime_res = execute_with_retry(
+            session.get, prime_url, max_retries=2, backoff=3,
+            timeout=20, headers=prime_headers
+        )
+        print(f"  [LCW] Session primed — HTTP {prime_res.status_code} "
+              f"({len(prime_res.content) / 1024:.0f} KB)")
+        # Pause 2-4 seconds: behaves like a human who glanced at the page
+        # before clicking into a product listing.
+        time.sleep(random.uniform(2, 4))
+    except Exception as e:
+        print(f"  [LCW] Priming failed (will attempt API anyway): {e}")
+
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         cat_params = cat.get("params", [])
@@ -813,25 +847,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                             prev_prices[db_pid] = curr_price
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # v13.3 — STOCK PROPAGATION: sync parent variant stock → size-expanded children.
-    # Uses the propagate_lcw_stock() DB function (one call, no N+1 overhead).
-    # The listing API updates parent variants (lcw_{optId}) with fresh AvailableStock
-    # on every run, but size-expanded children (lcw_{optId}_{SIZE}) are only created
-    # once by the size pass and never touched again. This single RPC call propagates
-    # any stock status changes from parent → children where they've drifted.
-    # ══════════════════════════════════════════════════════════════════════════
-    try:
-        propagation = safe_db_execute(supabase.rpc("propagate_lcw_stock"))
-        if propagation and propagation.data is not None:
-            count = propagation.data
-            if count:
-                print(f"  [LCW] Stock propagation: {count} child variants updated.")
-            else:
-                print(f"  [LCW] Stock propagation: all children already in sync. ✅")
-    except Exception as e:
-        print(f"  [LCW] Stock propagation error (non-fatal): {e}")
 
     # ── Size population pass ──────────────────────────────────────────────────
     # Fetch product pages for LCW variants that still have size=null.
