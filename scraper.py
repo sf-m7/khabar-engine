@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════
 # KHABAR — Scraper v13
 # Built on v12. Changes:
-#  v13.1  SIZE_CAP raised to 40 (matches 4x daily schedule)
+#  v13.1  SIZE_CAP=10 (1x daily schedule, 1GB/month Webshare plan)
 #  v13.2  LCW color resolved: ColorImageUrl filename (Turkish name)
 #         with MainColorHexCode fallback
 #  v13.3  Stock propagation RPC call after LCW listing pass
@@ -835,9 +835,11 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
     # ── Size population pass ──────────────────────────────────────────────────
     # Fetch product pages for LCW variants that still have size=null.
-    # v13.1: SIZE_CAP raised to 40. At 4x daily: fully populated in ~61 days.
-    SIZE_CAP      = 40   # product pages per run
-    # BANDWIDTH: 40 pages × 164KB × 4 runs/day × 30 days = 787MB ✅ fits 1GB
+    # SIZE_CAP at 10 keeps per-run cost at ~28.8MB on the 1GB/month Webshare plan.
+    # Null-size population at 1x daily: ~970 days to finish — intentionally slow.
+    # Acceptable for now; the core intelligence (price + stock) runs fine without.
+    # Upgrade path: move to 2GB Webshare plan → SIZE_CAP=25 → ~65 days to finish.
+    SIZE_CAP      = 10   # product pages per run — conservative for 1GB/month plan
     SIZE_TIMEOUT  = 300  # bail out of size pass after 5 minutes regardless
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
     try:
@@ -955,9 +957,25 @@ def scrape_brand(brand_name, domain):
         return 0
 
 if __name__ == "__main__":
-    print("🚀 Khabar Network-Hardened Scraper starting...")
-    # Random startup jitter — staggers 4x daily runs so we don't always hit
-    # endpoints at exactly the same wall-clock seconds (a bot pattern signal).
+    # ── Brand filter ──────────────────────────────────────────────────────────
+    # SCRAPE_TARGET controls which brands this run processes.
+    # Set via the workflow yml env block — no code change needed to switch.
+    #
+    #   SCRAPE_TARGET=shopify  → only Shopify brands (no proxy, zero Webshare cost)
+    #   SCRAPE_TARGET=lcw      → only LC Waikiki (proxy, ~29 MB/run)
+    #   SCRAPE_TARGET=all      → everything (default, for manual one-off runs)
+    #
+    # WHY: Shopify brands use no proxy so they can run 4x daily for free.
+    # LCW uses the proxy so it runs 1x daily to fit within 1 GB/month budget.
+    # Two yml files, one scraper, no duplicated logic.
+    SCRAPE_TARGET = os.environ.get("SCRAPE_TARGET", "all").lower()
+    if SCRAPE_TARGET == "shopify":
+        active_brands = [b for b in BRANDS if b["engine"] == "shopify"]
+    elif SCRAPE_TARGET == "lcw":
+        active_brands = [b for b in BRANDS if b["engine"] == "lcw_proxy"]
+    else:
+        active_brands = BRANDS
+    print(f"🚀 Khabar Scraper starting... target={SCRAPE_TARGET} ({len(active_brands)} brands)")
     startup_jitter = random.uniform(0, 30)
     print(f"  Startup jitter: {startup_jitter:.1f}s")
     time.sleep(startup_jitter)
@@ -1058,7 +1076,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"⚠️ Pre-run housecleaning dropped: {e}")
 
-    total = sum(scrape_brand(b["name"], b["domain"]) for b in BRANDS)
+    total = sum(scrape_brand(b["name"], b["domain"]) for b in active_brands)
 
     # ── Post-run intelligence detection ──────────────────────────────────────
     try:
