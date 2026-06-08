@@ -2,8 +2,11 @@
 # KHABAR — Scraper v13
 # Built on v12. Changes:
 #  v13.1  SIZE_CAP raised to 40 (matches 4x daily schedule)
-#  v13.2  LCW color diagnostic logging (discover actual API field name)
+#  v13.2  LCW color resolved: ColorImageUrl filename (Turkish name)
+#         with MainColorHexCode fallback
 #  v13.3  Stock propagation RPC call after LCW listing pass
+#  v13.4  Snapshot loading: explicit limit(20000) in both Shopify
+#         and LCW scrapers — fixes duplicate key crash on 2nd+ daily run
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -307,10 +310,14 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
     # Single query for yesterday's prices — replaces per-variant DB SELECTs
     prev_prices = load_last_prices(supabase, brand_name)
 
-    # Pre-load today's snapshotted product IDs — prevents duplicate inserts
+    # Pre-load today's snapshotted product IDs — prevents duplicate inserts.
+    # IMPORTANT: explicit limit(20000) overrides PostgREST's default 1000-row cap.
+    # Without this, brands with >1000 products (Town Team: 3,084 / Ravin: 2,080)
+    # fail with duplicate key errors on the 2nd+ run of the day.
     _snap = safe_db_execute(
         supabase.table("price_snapshots").select("product_id")
         .eq("brand", brand_name).eq("snapshot_date", str(today))
+        .limit(20000)
     )
     existing_snapshot_ids = set(
         r["product_id"] for r in (_snap.data or []) if r.get("product_id")
@@ -579,9 +586,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
+    # IMPORTANT: explicit limit(20000) overrides PostgREST's default 1000-row cap.
+    # LCW has 7,197 products — without this, runs 2+ of the day hit duplicate key errors.
     _snap = safe_db_execute(
         supabase.table("price_snapshots").select("product_id")
         .eq("brand", brand_name).eq("snapshot_date", str(today))
+        .limit(20000)
     )
     existing_snapshot_ids = set(
         r["product_id"] for r in (_snap.data or []) if r.get("product_id")
@@ -598,13 +608,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "sec-fetch-site":  "same-origin",
         "priority":        "u=1, i",
     }
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # v13.2 — COLOR DIAGNOSTIC: print on FIRST category, FIRST page only.
-    # This lets us discover the actual API field name for color.
-    # Once identified, we'll hardcode it and remove this block.
-    # ══════════════════════════════════════════════════════════════════════════
-    color_diagnosed = False
 
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
@@ -636,19 +639,6 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not items:
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
                 break
-
-            # ── v13.2 COLOR DIAGNOSTIC (fires once per run) ───────────────
-            if not color_diagnosed and items:
-                sample = items[0]
-                color_fields = {k: v for k, v in sample.items()
-                                if any(c in k.lower() for c in ["color", "colour", "renk"])}
-                print(f"  [LCW COLOR DIAG] Fields with 'color/colour/renk' in name: {color_fields}")
-                print(f"  [LCW COLOR DIAG] All item keys: {sorted(sample.keys())}")
-                # Also log AvailableStock to verify stock detection
-                print(f"  [LCW STOCK DIAG] AvailableStock={sample.get('AvailableStock')}, "
-                      f"StockStatus={sample.get('StockStatus')}, "
-                      f"IsOutOfStock={sample.get('IsOutOfStock')}")
-                color_diagnosed = True
 
             for _item in items:
                 _opt = _item.get("OptionId")
@@ -730,18 +720,21 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                 is_avail   = int(item.get("AvailableStock") or 0) > 0
                 sku        = f"lcw_{opt_id}"
 
-                # ── v13.2 COLOR: try every plausible field name ───────────
-                color_name = (
-                    item.get("Color")
-                    or item.get("ColorName")
-                    or item.get("OptionColorName")
-                    or item.get("OptionColor")
-                    or item.get("DefaultColorName")
-                    or item.get("OptionColorDescription")
-                    or item.get("ColorDescription")
-                    or item.get("DefaultOptionColorName")
-                    or None
-                )
+                # ── COLOR EXTRACTION (resolved via diagnostic run) ────────
+                # The `Color` API field is always None in LCW's listing response.
+                # ColorImageUrl contains the Turkish color name in its filename:
+                #   e.g. ".../icon/lacivert.png" → "lacivert" (= navy)
+                # MainColorHexCode is the fallback (e.g. "1A1A55").
+                # Turkish color names are stored as-is — consistent across all
+                # LCW products, which is what the intelligence queries need.
+                color_img_url = item.get("ColorImageUrl") or ""
+                color_name = None
+                if color_img_url:
+                    m = re.search(r'/([^/]+)\.(png|jpg|jpeg|webp)$', color_img_url, re.IGNORECASE)
+                    if m:
+                        color_name = m.group(1).lower()
+                if not color_name:
+                    color_name = item.get("MainColorHexCode") or None
 
                 prev       = prev_stock_state.get(sku)
                 v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
