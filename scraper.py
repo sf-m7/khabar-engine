@@ -1,17 +1,9 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v12
-# Built on v10 (last known working). Changes:
-#   1. price_events never deleted (intelligence asset)
-#   2. price_snapshots kept 90 days (Supabase free tier)
-#   3. Per-variant price SELECT eliminated (in-memory lookup)
-#   4. Snapshot writes batched per page (100× faster)
-#   5. LCW priming removed (bandwidth fix)
-#   6. LCW 404 treated as success (confirmed API behaviour)
-#   7. LCW CategoryParameterList params restored
-#   8. LCW deduplication by ModelId per batch
-#   9. LCW sizes via HTML page parsing (replaces broken OptionDetailAjax)
-#  10. Expanded category taxonomy (36 specific categories)
-#  11. find_and_alert_users category arg fixed
+# KHABAR — Scraper v13
+# Built on v12. Changes:
+#  v13.1  SIZE_CAP raised to 40 (matches 4x daily schedule)
+#  v13.2  LCW color diagnostic logging (discover actual API field name)
+#  v13.3  Stock propagation RPC call after LCW listing pass
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -607,6 +599,13 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         "priority":        "u=1, i",
     }
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # v13.2 — COLOR DIAGNOSTIC: print on FIRST category, FIRST page only.
+    # This lets us discover the actual API field name for color.
+    # Once identified, we'll hardcode it and remove this block.
+    # ══════════════════════════════════════════════════════════════════════════
+    color_diagnosed = False
+
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         cat_params = cat.get("params", [])
@@ -637,6 +636,19 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             if not items:
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
                 break
+
+            # ── v13.2 COLOR DIAGNOSTIC (fires once per run) ───────────────
+            if not color_diagnosed and items:
+                sample = items[0]
+                color_fields = {k: v for k, v in sample.items()
+                                if any(c in k.lower() for c in ["color", "colour", "renk"])}
+                print(f"  [LCW COLOR DIAG] Fields with 'color/colour/renk' in name: {color_fields}")
+                print(f"  [LCW COLOR DIAG] All item keys: {sorted(sample.keys())}")
+                # Also log AvailableStock to verify stock detection
+                print(f"  [LCW STOCK DIAG] AvailableStock={sample.get('AvailableStock')}, "
+                      f"StockStatus={sample.get('StockStatus')}, "
+                      f"IsOutOfStock={sample.get('IsOutOfStock')}")
+                color_diagnosed = True
 
             for _item in items:
                 _opt = _item.get("OptionId")
@@ -717,9 +729,20 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
                 is_avail   = int(item.get("AvailableStock") or 0) > 0
                 sku        = f"lcw_{opt_id}"
-                color_name = (item.get("Color") or item.get("ColorName")
-                               or item.get("OptionColorName") or item.get("OptionColor")
-                               or item.get("DefaultColorName") or None)
+
+                # ── v13.2 COLOR: try every plausible field name ───────────
+                color_name = (
+                    item.get("Color")
+                    or item.get("ColorName")
+                    or item.get("OptionColorName")
+                    or item.get("OptionColor")
+                    or item.get("DefaultColorName")
+                    or item.get("OptionColorDescription")
+                    or item.get("ColorDescription")
+                    or item.get("DefaultOptionColorName")
+                    or None
+                )
+
                 prev       = prev_stock_state.get(sku)
                 v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
 
@@ -798,11 +821,30 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # v13.3 — STOCK PROPAGATION: sync parent variant stock → size-expanded children.
+    # Uses the propagate_lcw_stock() DB function (one call, no N+1 overhead).
+    # The listing API updates parent variants (lcw_{optId}) with fresh AvailableStock
+    # on every run, but size-expanded children (lcw_{optId}_{SIZE}) are only created
+    # once by the size pass and never touched again. This single RPC call propagates
+    # any stock status changes from parent → children where they've drifted.
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        propagation = safe_db_execute(supabase.rpc("propagate_lcw_stock"))
+        if propagation and propagation.data is not None:
+            count = propagation.data
+            if count:
+                print(f"  [LCW] Stock propagation: {count} child variants updated.")
+            else:
+                print(f"  [LCW] Stock propagation: all children already in sync. ✅")
+    except Exception as e:
+        print(f"  [LCW] Stock propagation error (non-fatal): {e}")
+
     # ── Size population pass ──────────────────────────────────────────────────
     # Fetch product pages for LCW variants that still have size=null.
-    # Capped at 200/run (~34MB). At 2x daily, fully populated in ~24 days.
-    SIZE_CAP      = 25   # product pages per run — safe at 6x daily within 1GB/month
-    # Math: 25 pages × 164KB × 6 runs × 30 days = 738MB ✅ fits 1GB with 286MB headroom
+    # v13.1: SIZE_CAP raised to 40. At 4x daily: fully populated in ~61 days.
+    SIZE_CAP      = 40   # product pages per run
+    # BANDWIDTH: 40 pages × 164KB × 4 runs/day × 30 days = 787MB ✅ fits 1GB
     SIZE_TIMEOUT  = 300  # bail out of size pass after 5 minutes regardless
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
     try:
@@ -921,7 +963,7 @@ def scrape_brand(brand_name, domain):
 
 if __name__ == "__main__":
     print("🚀 Khabar Network-Hardened Scraper starting...")
-    # Random startup jitter — staggers 6x daily runs so we don't always hit
+    # Random startup jitter — staggers 4x daily runs so we don't always hit
     # endpoints at exactly the same wall-clock seconds (a bot pattern signal).
     startup_jitter = random.uniform(0, 30)
     print(f"  Startup jitter: {startup_jitter:.1f}s")
@@ -949,15 +991,6 @@ if __name__ == "__main__":
 
         # 2. Detect delisted products/variants — feeds L1·13 product-delisted
         #    and L1·15 variant-count-decay signals.
-        #
-        #    For each item not seen for 14+ days that's still marked active:
-        #      a) Set is_active=false on the row
-        #      b) Stamp delisted_at with the current timestamp
-        #      c) Write a stockout_events row of type='delisted' capturing the
-        #         final price and discount depth at the moment of delisting
-        #
-        #    These event rows are the actual data factories and PE clients pay
-        #    for in the L2 intelligence products.
         now_iso     = datetime.now(timezone.utc).isoformat()
         cutoff_seen = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
 
@@ -978,8 +1011,6 @@ if __name__ == "__main__":
             print(f"  Marked {len(pids)} stale products as delisted.")
 
         # ── Variant-level delisting (the per-SKU intelligence layer) ──
-        # We pull all variants whose product hasn't been seen for 14+ days
-        # AND that haven't already been stamped as delisted.
         stale_variants = safe_db_execute(
             _sb.table("product_variants")
             .select("id, product_id, size, color, is_in_stock, first_observed_price, products!inner(brand, last_seen_at)")
@@ -987,12 +1018,9 @@ if __name__ == "__main__":
             .lt("products.last_seen_at", cutoff_seen)
         )
         if stale_variants and stale_variants.data:
-            # Find each variant's final price from price_snapshots
-            # (the most recent snapshot before delisting)
             event_rows = []
             for v in stale_variants.data:
                 pid = v.get("product_id")
-                # Get the last known price for this product
                 last_snap = safe_db_execute(
                     _sb.table("price_snapshots")
                     .select("price, compare_at_price")
@@ -1020,12 +1048,10 @@ if __name__ == "__main__":
                     "recorded_at":           now_iso,
                 })
 
-            # Batch insert delisted events
             if event_rows:
                 for i in range(0, len(event_rows), 100):
                     safe_db_execute(_sb.table("stockout_events").insert(event_rows[i:i+100]))
 
-            # Stamp delisted_at on the variant rows so we don't re-process them
             vids = [v["id"] for v in stale_variants.data]
             for i in range(0, len(vids), 200):
                 safe_db_execute(
@@ -1046,9 +1072,6 @@ if __name__ == "__main__":
         _sb2 = create_client(SUPABASE_URL, SUPABASE_KEY)
 
         # L1·02 Flash Sale Detection
-        # A flash sale = price dropped then reverted within 24 hours.
-        # Scan recent price events: find products with a 'down' event
-        # followed by an 'up' event within 24 hours, unflagged.
         flash_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
         downs = safe_db_execute(
             _sb2.table("price_events")
@@ -1060,7 +1083,6 @@ if __name__ == "__main__":
         if downs and downs.data:
             flash_count = 0
             for d in downs.data:
-                # Look for a subsequent 'up' event on same product within 24hrs
                 upper_bound = (datetime.fromisoformat(d["recorded_at"]) + timedelta(hours=24)).isoformat()
                 revert = safe_db_execute(
                     _sb2.table("price_events")
@@ -1082,8 +1104,6 @@ if __name__ == "__main__":
                 print(f"  ⚡ Detected {flash_count} flash sale events (L1·02).")
 
         # L1·07 Mode B Statistical Deal Detection
-        # After 30+ days of data: flag prices below rolling 30-day IQR threshold.
-        # Only runs if we have 30+ days of snapshots for any brand.
         oldest_snap = safe_db_execute(
             _sb2.table("price_snapshots")
             .select("snapshot_date")
@@ -1094,9 +1114,6 @@ if __name__ == "__main__":
             first_date = oldest_snap.data[0]["snapshot_date"]
             days_of_data = (date.today() - date.fromisoformat(str(first_date))).days
             if days_of_data >= 30:
-                # Flag recent price events below IQR threshold
-                # This is a simplified check: compare price_after against
-                # the product's 30-day median from snapshots
                 stat_cutoff = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
                 recent_events = safe_db_execute(
                     _sb2.table("price_events")
@@ -1108,7 +1125,6 @@ if __name__ == "__main__":
                 if recent_events and recent_events.data:
                     stat_count = 0
                     for ev in recent_events.data:
-                        # Get 30-day price history for this product
                         thirty_ago = str(date.today() - timedelta(days=30))
                         history = safe_db_execute(
                             _sb2.table("price_snapshots")
