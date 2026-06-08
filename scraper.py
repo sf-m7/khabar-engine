@@ -16,6 +16,7 @@
 
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -364,6 +365,26 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         product_id_map = {row["external_id"]: row["id"] for row in product_upsert_rows}
         products_seen += len(batch_products)
 
+        # Set first_observed_price on new products (only fires once per product lifecycle)
+        new_pids = [pid for pid in product_id_map.values()]
+        if new_pids:
+            for p in products:
+                db_pid = product_id_map.get(str(p["id"]))
+                if not db_pid: continue
+                first_variant_price = None
+                for v in p.get("variants", []):
+                    pr = float(v.get("price") or 0)
+                    if pr > 0:
+                        first_variant_price = pr
+                        break
+                if first_variant_price:
+                    safe_db_execute(
+                        supabase.table("products")
+                        .update({"first_observed_price": first_variant_price})
+                        .eq("id", db_pid)
+                        .is_("first_observed_price", "null")
+                    )
+
         batch_variants, product_variant_tracking = [], {}
         for p in products:
             db_pid = product_id_map.get(str(p["id"]))
@@ -435,11 +456,15 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                                                 rec["_meta_size"], curr_price, p["title"],
                                                 f"https://{domain}/products/{p['handle']}", v_base
                                             )
+                        # Calculate honest discount vs first_observed_price
+                        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
                         safe_db_execute(supabase.table("price_events").insert({
-                            "product_id":  db_pid, "brand": brand_name,
-                            "price_before": last_p, "price_after": curr_price,
-                            "direction":   direction, "sizes_in_stock": sizes_in_stock,
-                            "recorded_at": datetime.now(timezone.utc).isoformat(),
+                            "product_id":    db_pid, "brand": brand_name,
+                            "price_before":  last_p, "price_after": curr_price,
+                            "compare_at_price": rec["_meta_compare"],
+                            "discount_pct":  honest_disc,
+                            "direction":     direction, "sizes_in_stock": sizes_in_stock,
+                            "recorded_at":   datetime.now(timezone.utc).isoformat(),
                         }))
                         prev_prices[db_pid] = curr_price
 
@@ -508,14 +533,14 @@ def parse_lcw_sizes(html):
 def fetch_lcw_product_sizes(session, url):
     """GET a single product page and parse its sizes. ~172KB compressed per call."""
     try:
-        res = execute_with_retry(session.get, url, timeout=20, headers={
+        res = execute_with_retry(session.get, url, max_retries=1, backoff=0,
+                                 timeout=8, headers={
             "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
             "accept-encoding": "gzip, deflate, br",
         })
         if res.status_code == 200:
-            sizes = parse_lcw_sizes(res.text)
-            return sizes
+            return parse_lcw_sizes(res.text)
         print(f"  ⚠️ Size page HTTP {res.status_code}: {url}")
     except Exception as e:
         print(f"  ⚠️ Size fetch error: {e}")
@@ -601,7 +626,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
         for page_idx in range(1, page_count + 1):
             data = first_data if page_idx == 1 else None
             if page_idx > 1:
-                time.sleep(1.5)
+                time.sleep(random.uniform(1.2, 2.0))
                 data = lcw_fetch_page(session, domain, cat_id, page_idx, headers,
                                        seen_ids=seen_ids, category_params=cat_params)
                 if not data:
@@ -653,6 +678,22 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             product_id_map  = {row["external_id"]: row["id"] for row in product_upsert_rows}
             products_seen  += len(batch_products)
 
+            # Set first_observed_price on new LCW products
+            for item in items:
+                db_pid = product_id_map.get(str(item.get("ModelId")))
+                if not db_pid: continue
+                is_disc  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
+                disc_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
+                full_val = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
+                fop = disc_val if (is_disc and disc_val > 0) else full_val
+                if fop > 0:
+                    safe_db_execute(
+                        supabase.table("products")
+                        .update({"first_observed_price": fop})
+                        .eq("id", db_pid)
+                        .is_("first_observed_price", "null")
+                    )
+
             # ── Variants upsert ───────────────────────────────────────────────
             batch_variants, product_variant_tracking = [], {}
             for item in items:
@@ -676,7 +717,9 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
                 is_avail   = int(item.get("AvailableStock") or 0) > 0
                 sku        = f"lcw_{opt_id}"
-                color_name = item.get("Color") or item.get("ColorName") or None
+                color_name = (item.get("Color") or item.get("ColorName")
+                               or item.get("OptionColorName") or item.get("OptionColor")
+                               or item.get("DefaultColorName") or None)
                 prev       = prev_stock_state.get(sku)
                 v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
 
@@ -741,12 +784,15 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                                     rec["_meta_size"], curr_price, desc,
                                                     f"https://{domain}{model_url}", v_base
                                                 )
+                            honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
                             safe_db_execute(supabase.table("price_events").insert({
-                                "product_id": db_pid, "brand": brand_name,
-                                "price_before": last_p, "price_after": curr_price,
-                                "direction": direction,
-                                "sizes_in_stock": sizes_in_stock_map.get(db_pid, []),
-                                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                                "product_id":      db_pid, "brand": brand_name,
+                                "price_before":    last_p, "price_after": curr_price,
+                                "compare_at_price": rec.get("_meta_compare"),
+                                "discount_pct":    honest_disc,
+                                "direction":       direction,
+                                "sizes_in_stock":  sizes_in_stock_map.get(db_pid, []),
+                                "recorded_at":     datetime.now(timezone.utc).isoformat(),
                             }))
                             prev_prices[db_pid] = curr_price
 
@@ -755,19 +801,26 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     # ── Size population pass ──────────────────────────────────────────────────
     # Fetch product pages for LCW variants that still have size=null.
     # Capped at 200/run (~34MB). At 2x daily, fully populated in ~24 days.
-    print("  [LCW] Fetching sizes for variants missing data (cap: 200/run)...")
+    SIZE_CAP      = 25   # product pages per run — safe at 6x daily within 1GB/month
+    # Math: 25 pages × 164KB × 6 runs × 30 days = 738MB ✅ fits 1GB with 286MB headroom
+    SIZE_TIMEOUT  = 300  # bail out of size pass after 5 minutes regardless
+    print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
     try:
         missing = safe_db_execute(
             supabase.table("product_variants")
-            .select("id, product_id, external_sku, color, first_observed_price, products!inner(url, brand)")
+            .select("id, product_id, external_sku, color, is_in_stock, first_observed_price, products!inner(url, brand)")
             .eq("products.brand", "lc_waikiki")
             .is_("size", "null")
-            .limit(200)
+            .limit(SIZE_CAP)
         )
         if missing and missing.data:
             print(f"  [LCW] {len(missing.data)} variants need sizes.")
             fetched = populated = 0
+            size_pass_start = time.time()
             for row in missing.data:
+                if time.time() - size_pass_start > SIZE_TIMEOUT:
+                    print(f"  [LCW] Size pass time limit reached — stopping early.")
+                    break
                 url = (row.get("products") or {}).get("url")
                 if not url: continue
                 sizes = fetch_lcw_product_sizes(session, url)
@@ -777,28 +830,34 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     color      = row.get("color")
                     fop        = row.get("first_observed_price") or prev_prices.get(product_id)
                     now_iso    = datetime.now(timezone.utc).isoformat()
+                    # is_in_stock from HTML is unreliable through the proxy —
+                    # LCW shows all sizes as stripped without session cookies.
+                    # Use the parent variant's is_in_stock (from listing API's
+                    # AvailableStock field) as the authoritative source.
+                    parent_stock = row.get("is_in_stock", True)
                     for i, sz in enumerate(sizes):
                         if i == 0:
                             # Update existing variant row with first size
+                            # Keep parent's is_in_stock — don't overwrite with HTML data
                             safe_db_execute(
                                 supabase.table("product_variants")
-                                .update({"size": sz["size"], "is_in_stock": sz["is_in_stock"], "last_updated_at": now_iso})
+                                .update({"size": sz["size"], "last_updated_at": now_iso})
                                 .eq("id", row["id"])
                             )
                         else:
-                            # Insert additional size rows
+                            # Insert additional size rows — inherit parent's stock status
                             sku = f"{row['external_sku']}_{sz['size'].replace(' ', '_')}"
                             safe_db_execute(
                                 supabase.table("product_variants").upsert({
                                     "product_id": product_id, "external_sku": sku,
                                     "color": color, "size": sz["size"],
-                                    "is_in_stock": sz["is_in_stock"],
+                                    "is_in_stock": parent_stock,
                                     "first_observed_price": fop,
                                     "last_updated_at": now_iso,
                                 }, on_conflict="external_sku")
                             )
                     populated += 1
-                time.sleep(0.5)
+                time.sleep(random.uniform(0.4, 1.0))
             print(f"  [LCW] Sizes: {fetched} pages fetched, {populated} products populated.")
         else:
             print("  [LCW] All variants have size data. ✅")
@@ -821,9 +880,12 @@ def scrape_brand(brand_name, domain):
     today = date.today()
     print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
     try:
-        if not check_domain(session, domain):
-            print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
-            return 0
+        # Skip check_domain for LCW — loading the homepage through the proxy
+        # costs ~31MB (full Next.js app). API failures are handled gracefully.
+        if brand_config["engine"] != "lcw_proxy":
+            if not check_domain(session, domain):
+                print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
+                return 0
 
         all_variant_rows, offset = [], 0
         while True:
@@ -859,15 +921,219 @@ def scrape_brand(brand_name, domain):
 
 if __name__ == "__main__":
     print("🚀 Khabar Network-Hardened Scraper starting...")
+    # Random startup jitter — staggers 6x daily runs so we don't always hit
+    # endpoints at exactly the same wall-clock seconds (a bot pattern signal).
+    startup_jitter = random.uniform(0, 30)
+    print(f"  Startup jitter: {startup_jitter:.1f}s")
+    time.sleep(startup_jitter)
+
+    # ── Database housecleaning ───────────────────────────────────────────────
+    # WHAT WE KEEP FOREVER (intelligence assets):
+    #   - products       — even delisted ones (brand health signals)
+    #   - product_variants — historical SKUs feed velocity & launch analysis
+    #   - price_events   — every price change is precious history
+    #   - stockout_events — demand velocity over years
+    #
+    # WHAT WE PRUNE:
+    #   - price_snapshots > 90 days — captured by price_events when changed
+    #   - Mark products NOT seen for 14 days as is_active=false
+    #     (triggers L1·13 delisting signal; rows retained for intelligence)
     try:
         _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # price_events: NEVER deleted — permanent intelligence asset.
-        # price_snapshots: keep 90 days — covers one full season,
-        #   enables Mode B IQR detection, fits Supabase 500MB free tier.
+
+        # 1. Prune old daily snapshots (kept 90 days for Mode B IQR window)
         cutoff_snap = str(date.today() - timedelta(days=90))
-        safe_db_execute(_sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap))
+        safe_db_execute(
+            _sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap)
+        )
+
+        # 2. Detect delisted products/variants — feeds L1·13 product-delisted
+        #    and L1·15 variant-count-decay signals.
+        #
+        #    For each item not seen for 14+ days that's still marked active:
+        #      a) Set is_active=false on the row
+        #      b) Stamp delisted_at with the current timestamp
+        #      c) Write a stockout_events row of type='delisted' capturing the
+        #         final price and discount depth at the moment of delisting
+        #
+        #    These event rows are the actual data factories and PE clients pay
+        #    for in the L2 intelligence products.
+        now_iso     = datetime.now(timezone.utc).isoformat()
+        cutoff_seen = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+
+        # ── Product-level delisting ──
+        stale_products = safe_db_execute(
+            _sb.table("products")
+            .select("id, brand")
+            .eq("is_active", True)
+            .lt("last_seen_at", cutoff_seen)
+        )
+        if stale_products and stale_products.data:
+            pids = [r["id"] for r in stale_products.data]
+            safe_db_execute(
+                _sb.table("products")
+                .update({"is_active": False, "delisted_at": now_iso})
+                .in_("id", pids)
+            )
+            print(f"  Marked {len(pids)} stale products as delisted.")
+
+        # ── Variant-level delisting (the per-SKU intelligence layer) ──
+        # We pull all variants whose product hasn't been seen for 14+ days
+        # AND that haven't already been stamped as delisted.
+        stale_variants = safe_db_execute(
+            _sb.table("product_variants")
+            .select("id, product_id, size, color, is_in_stock, first_observed_price, products!inner(brand, last_seen_at)")
+            .is_("delisted_at", "null")
+            .lt("products.last_seen_at", cutoff_seen)
+        )
+        if stale_variants and stale_variants.data:
+            # Find each variant's final price from price_snapshots
+            # (the most recent snapshot before delisting)
+            event_rows = []
+            for v in stale_variants.data:
+                pid = v.get("product_id")
+                # Get the last known price for this product
+                last_snap = safe_db_execute(
+                    _sb.table("price_snapshots")
+                    .select("price, compare_at_price")
+                    .eq("product_id", pid)
+                    .order("snapshot_date", desc=True)
+                    .limit(1)
+                )
+                final_price = float(last_snap.data[0]["price"]) if (last_snap and last_snap.data) else None
+                baseline    = v.get("first_observed_price")
+                discount    = None
+                was_on_disc = False
+                if final_price and baseline and float(baseline) > 0:
+                    discount = round(((float(baseline) - final_price) / float(baseline)) * 100, 2)
+                    was_on_disc = discount > 0
+                event_rows.append({
+                    "variant_id":            v["id"],
+                    "product_id":            pid,
+                    "brand":                 (v.get("products") or {}).get("brand"),
+                    "size":                  v.get("size"),
+                    "color":                 v.get("color"),
+                    "event_type":            "delisted",
+                    "price_at_event":        final_price,
+                    "discount_pct_at_event": discount,
+                    "was_on_discount":       was_on_disc,
+                    "recorded_at":           now_iso,
+                })
+
+            # Batch insert delisted events
+            if event_rows:
+                for i in range(0, len(event_rows), 100):
+                    safe_db_execute(_sb.table("stockout_events").insert(event_rows[i:i+100]))
+
+            # Stamp delisted_at on the variant rows so we don't re-process them
+            vids = [v["id"] for v in stale_variants.data]
+            for i in range(0, len(vids), 200):
+                safe_db_execute(
+                    _sb.table("product_variants")
+                    .update({"delisted_at": now_iso, "is_in_stock": False})
+                    .in_("id", vids[i:i+200])
+                )
+
+            print(f"  Recorded {len(event_rows)} variant delisting events.")
+
     except Exception as e:
         print(f"⚠️ Pre-run housecleaning dropped: {e}")
 
     total = sum(scrape_brand(b["name"], b["domain"]) for b in BRANDS)
+
+    # ── Post-run intelligence detection ──────────────────────────────────────
+    try:
+        _sb2 = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # L1·02 Flash Sale Detection
+        # A flash sale = price dropped then reverted within 24 hours.
+        # Scan recent price events: find products with a 'down' event
+        # followed by an 'up' event within 24 hours, unflagged.
+        flash_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        downs = safe_db_execute(
+            _sb2.table("price_events")
+            .select("id, product_id, price_after, recorded_at")
+            .eq("direction", "down")
+            .eq("is_flash_sale", False)
+            .gt("recorded_at", flash_cutoff)
+        )
+        if downs and downs.data:
+            flash_count = 0
+            for d in downs.data:
+                # Look for a subsequent 'up' event on same product within 24hrs
+                upper_bound = (datetime.fromisoformat(d["recorded_at"]) + timedelta(hours=24)).isoformat()
+                revert = safe_db_execute(
+                    _sb2.table("price_events")
+                    .select("id")
+                    .eq("product_id", d["product_id"])
+                    .eq("direction", "up")
+                    .gt("recorded_at", d["recorded_at"])
+                    .lt("recorded_at", upper_bound)
+                    .limit(1)
+                )
+                if revert and revert.data:
+                    safe_db_execute(
+                        _sb2.table("price_events")
+                        .update({"is_flash_sale": True})
+                        .eq("id", d["id"])
+                    )
+                    flash_count += 1
+            if flash_count:
+                print(f"  ⚡ Detected {flash_count} flash sale events (L1·02).")
+
+        # L1·07 Mode B Statistical Deal Detection
+        # After 30+ days of data: flag prices below rolling 30-day IQR threshold.
+        # Only runs if we have 30+ days of snapshots for any brand.
+        oldest_snap = safe_db_execute(
+            _sb2.table("price_snapshots")
+            .select("snapshot_date")
+            .order("snapshot_date", desc=False)
+            .limit(1)
+        )
+        if oldest_snap and oldest_snap.data:
+            first_date = oldest_snap.data[0]["snapshot_date"]
+            days_of_data = (date.today() - date.fromisoformat(str(first_date))).days
+            if days_of_data >= 30:
+                # Flag recent price events below IQR threshold
+                # This is a simplified check: compare price_after against
+                # the product's 30-day median from snapshots
+                stat_cutoff = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+                recent_events = safe_db_execute(
+                    _sb2.table("price_events")
+                    .select("id, product_id, price_after")
+                    .eq("is_statistical_deal", False)
+                    .eq("direction", "down")
+                    .gt("recorded_at", stat_cutoff)
+                )
+                if recent_events and recent_events.data:
+                    stat_count = 0
+                    for ev in recent_events.data:
+                        # Get 30-day price history for this product
+                        thirty_ago = str(date.today() - timedelta(days=30))
+                        history = safe_db_execute(
+                            _sb2.table("price_snapshots")
+                            .select("price")
+                            .eq("product_id", ev["product_id"])
+                            .gte("snapshot_date", thirty_ago)
+                            .order("snapshot_date", desc=False)
+                        )
+                        if history and history.data and len(history.data) >= 10:
+                            prices = sorted(float(r["price"]) for r in history.data)
+                            q1 = prices[len(prices) // 4]
+                            q3 = prices[3 * len(prices) // 4]
+                            iqr = q3 - q1
+                            threshold = q1 - 1.5 * iqr
+                            if float(ev["price_after"]) < threshold:
+                                safe_db_execute(
+                                    _sb2.table("price_events")
+                                    .update({"is_statistical_deal": True})
+                                    .eq("id", ev["id"])
+                                )
+                                stat_count += 1
+                    if stat_count:
+                        print(f"  📊 Detected {stat_count} statistical deal events (L1·07).")
+
+    except Exception as e:
+        print(f"  ⚠️ Post-run intelligence detection error: {e}")
+
     print(f"\n🏁 All done. Total price changes this run: {total}")
