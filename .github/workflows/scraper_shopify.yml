@@ -2,21 +2,17 @@ name: Khabar Shopify Scraper
 
 on:
   schedule:
-    # 4x daily — every 6 hours.
-    # Shopify brands use NO proxy (direct connection) so this costs
-    # zero Webshare bandwidth regardless of frequency.
-    # 4x daily gives us:
-    #   - Intraday flash sale detection (L1·02) for all 5 Shopify brands
-    #   - Stockout velocity within a 6-hour window (L1·08)
-    #   - Cross-brand simultaneous discount detection (L1·16) at useful resolution
-    # Brands: Town Team, Ravin, Men's Club, Tree, Dott Jeans
-    - cron: "0 0,6,12,18 * * *"
+    # 4x daily at 1, 7, 13, 19 UTC — deliberately offset 1 hour from midnight
+    # so this never runs concurrently with the LCW scraper (which runs at 0:00).
+    # Concurrent runs caused DB conflicts and housecleaning crashes.
+    # Shopify brands use NO proxy — zero Webshare bandwidth cost.
+    - cron: "0 1,7,13,19 * * *"
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Pull the code
         uses: actions/checkout@v4
