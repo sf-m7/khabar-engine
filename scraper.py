@@ -1007,100 +1007,81 @@ if __name__ == "__main__":
     time.sleep(startup_jitter)
 
     # ── Database housecleaning ───────────────────────────────────────────────
-    # WHAT WE KEEP FOREVER (intelligence assets):
-    #   - products       — even delisted ones (brand health signals)
-    #   - product_variants — historical SKUs feed velocity & launch analysis
-    #   - price_events   — every price change is precious history
-    #   - stockout_events — demand velocity over years
-    #
-    # WHAT WE PRUNE:
-    #   - price_snapshots > 90 days — captured by price_events when changed
-    #   - Mark products NOT seen for 14 days as is_active=false
-    #     (triggers L1·13 delisting signal; rows retained for intelligence)
-    try:
-        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Only runs in the LCW workflow (SCRAPE_TARGET=lcw) or manual all-brands runs.
+    # NEVER runs in the Shopify workflow — that runs 4x daily and would:
+    #   (a) cause concurrent DB conflicts when both workflows fire at midnight
+    #   (b) trigger the variant delisting loop on every run (N+1 crash risk)
+    # Once per day via the LCW midnight run is sufficient for all housecleaning.
+    if SCRAPE_TARGET in ("lcw", "all"):
+        try:
+            _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # 1. Prune old daily snapshots (kept 90 days for Mode B IQR window)
-        cutoff_snap = str(date.today() - timedelta(days=90))
-        safe_db_execute(
-            _sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap)
-        )
-
-        # 2. Detect delisted products/variants — feeds L1·13 product-delisted
-        #    and L1·15 variant-count-decay signals.
-        now_iso     = datetime.now(timezone.utc).isoformat()
-        cutoff_seen = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
-
-        # ── Product-level delisting ──
-        stale_products = safe_db_execute(
-            _sb.table("products")
-            .select("id, brand")
-            .eq("is_active", True)
-            .lt("last_seen_at", cutoff_seen)
-        )
-        if stale_products and stale_products.data:
-            pids = [r["id"] for r in stale_products.data]
+            # 1. Prune old daily snapshots (kept 90 days for Mode B IQR window)
+            cutoff_snap = str(date.today() - timedelta(days=90))
             safe_db_execute(
-                _sb.table("products")
-                .update({"is_active": False, "delisted_at": now_iso})
-                .in_("id", pids)
+                _sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap)
             )
-            print(f"  Marked {len(pids)} stale products as delisted.")
 
-        # ── Variant-level delisting (the per-SKU intelligence layer) ──
-        stale_variants = safe_db_execute(
-            _sb.table("product_variants")
-            .select("id, product_id, size, color, is_in_stock, first_observed_price, products!inner(brand, last_seen_at)")
-            .is_("delisted_at", "null")
-            .lt("products.last_seen_at", cutoff_seen)
-        )
-        if stale_variants and stale_variants.data:
-            event_rows = []
-            for v in stale_variants.data:
-                pid = v.get("product_id")
-                last_snap = safe_db_execute(
-                    _sb.table("price_snapshots")
-                    .select("price, compare_at_price")
-                    .eq("product_id", pid)
-                    .order("snapshot_date", desc=True)
-                    .limit(1)
+            now_iso     = datetime.now(timezone.utc).isoformat()
+            cutoff_seen = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+
+            # 2. Product-level delisting — mark unseen products as inactive
+            stale_products = safe_db_execute(
+                _sb.table("products")
+                .select("id, brand")
+                .eq("is_active", True)
+                .lt("last_seen_at", cutoff_seen)
+                .limit(500)
+            )
+            if stale_products and stale_products.data:
+                pids = [r["id"] for r in stale_products.data]
+                safe_db_execute(
+                    _sb.table("products")
+                    .update({"is_active": False, "delisted_at": now_iso})
+                    .in_("id", pids)
                 )
-                final_price = float(last_snap.data[0]["price"]) if (last_snap and last_snap.data) else None
-                baseline    = v.get("first_observed_price")
-                discount    = None
-                was_on_disc = False
-                if final_price and baseline and float(baseline) > 0:
-                    discount = round(((float(baseline) - final_price) / float(baseline)) * 100, 2)
-                    was_on_disc = discount > 0
-                event_rows.append({
+                print(f"  Marked {len(pids)} stale products as delisted.")
+
+            # 3. Variant-level delisting — write stockout_events of type 'delisted'
+            # IMPORTANT: capped at 200 rows per run, NO inner query per variant.
+            # The old version did one DB call per stale variant (N+1), which caused
+            # Supabase timeouts when hundreds of variants were stale. price_at_event
+            # is set to NULL here — it can be backfilled from price_snapshots later.
+            stale_variants = safe_db_execute(
+                _sb.table("product_variants")
+                .select("id, product_id, size, color, products!inner(brand, last_seen_at)")
+                .is_("delisted_at", "null")
+                .lt("products.last_seen_at", cutoff_seen)
+                .limit(200)
+            )
+            if stale_variants and stale_variants.data:
+                event_rows = [{
                     "variant_id":            v["id"],
-                    "product_id":            pid,
+                    "product_id":            v.get("product_id"),
                     "brand":                 (v.get("products") or {}).get("brand"),
                     "size":                  v.get("size"),
                     "color":                 v.get("color"),
                     "event_type":            "delisted",
-                    "price_at_event":        final_price,
-                    "discount_pct_at_event": discount,
-                    "was_on_discount":       was_on_disc,
+                    "price_at_event":        None,
+                    "discount_pct_at_event": None,
+                    "was_on_discount":       False,
                     "recorded_at":           now_iso,
-                })
+                } for v in stale_variants.data]
 
-            if event_rows:
                 for i in range(0, len(event_rows), 100):
                     safe_db_execute(_sb.table("stockout_events").insert(event_rows[i:i+100]))
 
-            vids = [v["id"] for v in stale_variants.data]
-            for i in range(0, len(vids), 200):
-                safe_db_execute(
-                    _sb.table("product_variants")
-                    .update({"delisted_at": now_iso, "is_in_stock": False})
-                    .in_("id", vids[i:i+200])
-                )
+                vids = [v["id"] for v in stale_variants.data]
+                for i in range(0, len(vids), 200):
+                    safe_db_execute(
+                        _sb.table("product_variants")
+                        .update({"delisted_at": now_iso, "is_in_stock": False})
+                        .in_("id", vids[i:i+200])
+                    )
+                print(f"  Recorded {len(event_rows)} variant delisting events.")
 
-            print(f"  Recorded {len(event_rows)} variant delisting events.")
-
-    except Exception as e:
-        print(f"⚠️ Pre-run housecleaning dropped: {e}")
+        except Exception as e:
+            print(f"⚠️ Pre-run housecleaning dropped: {e}")
 
     total = sum(scrape_brand(b["name"], b["domain"]) for b in active_brands)
 
