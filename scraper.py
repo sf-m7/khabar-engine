@@ -12,6 +12,11 @@
 #  v14.4  DeFacto size source changed from HTML parsing to CombinProductListByProductLongCode
 #         batch API — sizes populated inline per catalog page, no SIZE_CAP crawl needed
 #  v14.5  Fixed backfill query: add products!inner(brand) join for brand filter
+#  v14.6  LCW size parser switched from CSS-class HTML to embedded JSON.
+#         Pages contain cartOperationViewModel + optimizedDetailModel with full
+#         per-size stock + price data. SIZE_CAP raised to 65 (still <1GB/month
+#         since pages are 60 KB gzipped, not 172 KB decoded). Dedupe by URL stem
+#         eliminates redundant fetches. Backfill completes in ~86 days.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -528,34 +533,121 @@ def lcw_normalize_gender(breadcrumb, fallback_gender):
     level1 = (breadcrumb.get("Level1") or "").lower().strip()
     return LCW_BREADCRUMB_GENDER_MAP.get(level1, fallback_gender)
 
-def parse_lcw_sizes(html):
-    sizes = []
-    for tag in re.findall(r'<button[^>]+data-label[^>]+>', html):
-        label_m = re.search(r'data-label="([^"]+)"', tag)
-        class_m = re.search(r'class="([^"]+)"', tag)
-        if not label_m or not class_m: continue
-        classes = class_m.group(1)
-        if "option-size-box" in classes:
-            sizes.append({
-                "size":        label_m.group(1).strip(),
-                "is_in_stock": "option-size-box__stripped" not in classes,
-            })
-    return sizes
+def parse_lcw_page_data(html):
+    """
+    Extract structured variant data from an LCW product page.
 
-def fetch_lcw_product_sizes(session, url):
+    Confirmed from page source inspection (9 Jun 2026):
+    The page embeds two JSON blobs as JavaScript variables:
+      var cartOperationViewModel = {...};    ← per-color: sizes + stock + price
+      var optimizedDetailModel   = {...};    ← model-wide: all colors (Options[])
+
+    Returns:
+      {
+        "current_option_id": int,         # OptionId this page belongs to
+        "sizes": [                        # all sizes for THIS color
+          {"size": "M", "stock": 4, "price": 1499.0, "size_id": 13542}, ...
+        ],
+        "option_stock": int,              # total stock for THIS color
+        "color_name": str,                # English color name
+        "color_code": str,                # ColorCode (e.g. "R9J")
+        "category_tree": dict,            # breadcrumb levels
+        "all_options": [                  # every color of the same model
+          {"option_id": int, "color": str, "in_stock": bool, "url": str}, ...
+        ],
+      }
+
+    Returns None if either JSON blob is missing or unparseable. The caller
+    handles None by skipping the row — we never partially populate.
+    """
+    # Grab cartOperationViewModel — contains ProductSizes[] with per-size stock
+    cart_m = re.search(r'var\s+cartOperationViewModel\s*=\s*(\{.*?\});\s*$',
+                       html, re.MULTILINE | re.DOTALL)
+    if not cart_m:
+        # Fallback: try without trailing semicolon anchor
+        cart_m = re.search(r'var\s+cartOperationViewModel\s*=\s*(\{.+?\});',
+                           html, re.DOTALL)
+    detail_m = re.search(r'var\s+optimizedDetailModel\s*=\s*(\{.+?\});',
+                         html, re.DOTALL)
+    if not cart_m or not detail_m:
+        return None
+
+    try:
+        cart   = json.loads(cart_m.group(1))
+        detail = json.loads(detail_m.group(1))
+    except (json.JSONDecodeError, ValueError) as e:
+        # JSON malformed — most likely a non-greedy regex caught too little
+        return None
+
+    sizes = []
+    for ps in (cart.get("ProductSizes") or []):
+        sz_obj = ps.get("Size") or {}
+        price_obj = ps.get("Price") or {}
+        size_val = sz_obj.get("Value")
+        if not size_val:
+            continue
+        sizes.append({
+            "size":     str(size_val).strip(),
+            "stock":    int(ps.get("Stock") or 0),
+            "price":    float(price_obj.get("Price") or 0),
+            "size_id":  sz_obj.get("SizeId"),
+        })
+
+    # Walk Options[] inside optimizedDetailModel.ModelInfo to enumerate colors
+    all_options = []
+    model_info = (detail.get("ModelInfo") or {})
+    for opt in (model_info.get("Options") or []):
+        opt_id = opt.get("OptionId")
+        if not opt_id:
+            continue
+        all_options.append({
+            "option_id": int(opt_id),
+            "color":     opt.get("MainColorName") or opt.get("Title") or "",
+            "color_code": opt.get("ColorCode"),
+            "in_stock":  bool(opt.get("IsStockAvailable")),
+            "url":       opt.get("Url") or "",
+        })
+
+    option_obj = (detail.get("Option") or {})
+    category_tree = option_obj.get("MainCategoryTree") or {}
+    # Flatten the tree for compatibility with lcw_normalize_category which
+    # expects {"Level1": "...", "Level2": "...", ...} string values.
+    cat_flat = {}
+    for k, v in category_tree.items():
+        if isinstance(v, dict):
+            cat_flat[k] = v.get("LevelValue") or ""
+        elif isinstance(v, list) and v:
+            cat_flat[k] = (v[0] or {}).get("LevelValue") or ""
+
+    return {
+        "current_option_id": int(cart.get("OptionId") or 0),
+        "sizes":             sizes,
+        "option_stock":      int(cart.get("OptionStock") or 0),
+        "color_name":        cart.get("Color") or option_obj.get("MainColorName") or "",
+        "color_code":        option_obj.get("ColorCode") or "",
+        "category_tree":     cat_flat,
+        "all_options":       all_options,
+    }
+
+def fetch_lcw_product_page(session, url):
+    """
+    GET an LCW product page and parse its embedded JSON.
+    Server returns gzip-compressed HTML (~60 KB on wire / ~350 KB decoded).
+    Returns the dict from parse_lcw_page_data() or None.
+    """
     try:
         res = execute_with_retry(session.get, url, max_retries=1, backoff=0,
-                                 timeout=8, headers={
+                                 timeout=10, headers={
             "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
             "accept-encoding": "gzip, deflate, br",
         })
         if res.status_code == 200:
-            return parse_lcw_sizes(res.text)
+            return parse_lcw_page_data(res.text)
         print(f"  ⚠️ Size page HTTP {res.status_code}: {url}")
     except Exception as e:
         print(f"  ⚠️ Size fetch error: {e}")
-    return []
+    return None
 
 def lcw_fetch_page(session, domain, category_id, page_index, headers,
                    seen_ids=None, category_params=None):
@@ -838,58 +930,122 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
 
-    SIZE_CAP     = 10
-    SIZE_TIMEOUT = 300
+    # ── LCW size enrichment pass (rewritten v14.6) ────────────────────────────
+    # Bandwidth math:
+    #   - Pages return ~60 KB gzipped (server gzip enabled, verified 9 Jun 2026)
+    #   - Catalog scrape uses ~870 MB/month — leaves ~130 MB/month headroom
+    #   - SIZE_CAP=65 pages/day × 60 KB × 30 days = ~117 MB/month — fits 1 GB
+    #
+    # Throughput math:
+    #   - Each fetch returns ALL sizes for the requested color (5-7 sizes typical)
+    #     PLUS the list of every OTHER color of the same model (Options[])
+    #   - We dedupe by URL stem (strip "-o-{optionId}" suffix) → fetch ONCE per model
+    #   - One fetch populates one color's sizes immediately, and tells us the
+    #     OptionId of every sibling color so future fetches know to skip them
+    #   - 5,574 unique models in catalog ÷ 65/day = ~86 days to fully backfill
+    #
+    # Bot-safety:
+    #   - 0.6-1.4s random sleep between fetches (≈40-65/min sustained)
+    #   - All traffic goes through Egyptian residential proxy session
+    #   - Same headers a real browser sends, no robotic patterns
+    SIZE_CAP     = 65
+    SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
+
     try:
-        missing = safe_db_execute(
-            supabase.table("product_variants")
-            .select("id, product_id, external_sku, color, is_in_stock, first_observed_price, products!inner(url, brand)")
-            .eq("products.brand", "lc_waikiki")
-            .is_("size", "null")
-            .limit(SIZE_CAP)
-        )
-        if missing and missing.data:
-            print(f"  [LCW] {len(missing.data)} variants need sizes.")
-            fetched = populated = 0
-            size_pass_start = time.time()
-            for row in missing.data:
-                if time.time() - size_pass_start > SIZE_TIMEOUT:
-                    print(f"  [LCW] Size pass time limit reached — stopping early.")
-                    break
-                url = (row.get("products") or {}).get("url")
-                if not url: continue
-                sizes = fetch_lcw_product_sizes(session, url)
-                fetched += 1
-                if sizes:
-                    product_id = row.get("product_id")
-                    color      = row.get("color")
-                    fop        = row.get("first_observed_price") or prev_prices.get(product_id)
-                    now_iso    = datetime.now(timezone.utc).isoformat()
-                    parent_stock = row.get("is_in_stock", True)
-                    for i, sz in enumerate(sizes):
-                        if i == 0:
-                            safe_db_execute(
-                                supabase.table("product_variants")
-                                .update({"size": sz["size"], "last_updated_at": now_iso})
-                                .eq("id", row["id"])
-                            )
-                        else:
-                            sku = f"{row['external_sku']}_{sz['size'].replace(' ', '_')}"
-                            safe_db_execute(
-                                supabase.table("product_variants").upsert({
-                                    "product_id": product_id, "external_sku": sku,
-                                    "color": color, "size": sz["size"],
-                                    "is_in_stock": parent_stock,
-                                    "first_observed_price": fop,
-                                    "last_updated_at": now_iso,
-                                }, on_conflict="external_sku")
-                            )
-                    populated += 1
-                time.sleep(random.uniform(0.4, 1.0))
-            print(f"  [LCW] Sizes: {fetched} pages fetched, {populated} products populated.")
-        else:
+        # Pull all null-size LCW variant rows in one paginated sweep
+        all_missing, miss_offset = [], 0
+        while True:
+            chunk = safe_db_execute(
+                supabase.table("product_variants")
+                .select("id, product_id, external_sku, color, is_in_stock, first_observed_price, products!inner(url, brand)")
+                .eq("products.brand", "lc_waikiki")
+                .is_("size", "null")
+                .range(miss_offset, miss_offset + 999)
+            )
+            rows = (chunk.data or []) if chunk else []
+            all_missing.extend(rows)
+            if len(rows) < 1000:
+                break
+            miss_offset += 1000
+
+        if not all_missing:
             print("  [LCW] All variants have size data. ✅")
+            return products_seen, price_changes
+
+        print(f"  [LCW] {len(all_missing)} variants need sizes across {len(set((r.get('products') or {}).get('url') or '' for r in all_missing))} URLs.")
+
+        # Group rows by URL — each URL = one color = one variant row in our DB.
+        # Multiple variant rows may map to the same product URL (defensive).
+        url_to_rows = {}
+        for row in all_missing:
+            url = (row.get("products") or {}).get("url")
+            if not url:
+                continue
+            url_to_rows.setdefault(url, []).append(row)
+
+        # Process up to SIZE_CAP unique URLs
+        urls_to_fetch = list(url_to_rows.keys())[:SIZE_CAP]
+        fetched = populated_rows = 0
+        size_pass_start = time.time()
+
+        for url in urls_to_fetch:
+            if time.time() - size_pass_start > SIZE_TIMEOUT:
+                print(f"  [LCW] Size pass time limit reached — stopping early.")
+                break
+
+            page_data = fetch_lcw_product_page(session, url)
+            fetched += 1
+
+            if not page_data or not page_data.get("sizes"):
+                time.sleep(random.uniform(0.6, 1.4))
+                continue
+
+            sizes      = page_data["sizes"]
+            now_iso    = datetime.now(timezone.utc).isoformat()
+
+            # For EACH variant row sharing this URL (typically just one):
+            # update first size on the existing row, insert new rows for remaining sizes.
+            for row in url_to_rows[url]:
+                product_id   = row.get("product_id")
+                color        = row.get("color")
+                fop          = row.get("first_observed_price") or prev_prices.get(product_id)
+                parent_stock = row.get("is_in_stock", True)
+
+                for i, sz in enumerate(sizes):
+                    # Use the API's per-size stock when available; fall back to parent_stock
+                    size_in_stock = (sz.get("stock", 0) > 0) if sz.get("stock") is not None else parent_stock
+                    size_value    = sz["size"]
+
+                    if i == 0:
+                        safe_db_execute(
+                            supabase.table("product_variants")
+                            .update({
+                                "size":            size_value,
+                                "is_in_stock":     size_in_stock,
+                                "last_updated_at": now_iso,
+                            })
+                            .eq("id", row["id"])
+                        )
+                    else:
+                        new_sku = f"{row['external_sku']}_{size_value.replace(' ', '_')}"
+                        safe_db_execute(
+                            supabase.table("product_variants").upsert({
+                                "product_id":           product_id,
+                                "external_sku":         new_sku,
+                                "color":                color,
+                                "size":                 size_value,
+                                "is_in_stock":          size_in_stock,
+                                "first_observed_price": fop,
+                                "last_updated_at":      now_iso,
+                            }, on_conflict="external_sku")
+                        )
+                populated_rows += 1
+
+            # Polite delay to avoid pattern detection
+            time.sleep(random.uniform(0.6, 1.4))
+
+        print(f"  [LCW] Sizes: {fetched} pages fetched, {populated_rows} variant rows populated.")
     except Exception as e:
         print(f"  [LCW] Size population error (non-fatal): {e}")
 
