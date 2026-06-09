@@ -6,6 +6,8 @@
 #         Size enrichment pass (SIZE_CAP=10, same pattern as LCW)
 #  v14.2  Fixed parse_defacto_sizes: real HTML uses data-size on <button>
 #         with class "is-no-stock" for OOS — not data-value on <li>
+#  v14.3  Snapshot writes changed from insert to upsert (on_conflict=product_id,snapshot_date)
+#         Fixes duplicate key crash on re-runs when PostgREST ignores limit(20000)
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -432,7 +434,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
             snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
             if snap_rows:
-                safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
+                safe_db_execute(supabase.table("price_snapshots").upsert(snap_rows, on_conflict="product_id,snapshot_date"))
 
             for db_pid, records in product_variant_tracking.items():
                 if not records: continue
@@ -769,7 +771,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
                 snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
                 if snap_rows:
-                    safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
+                    safe_db_execute(supabase.table("price_snapshots").upsert(snap_rows, on_conflict="product_id,snapshot_date"))
 
                 sizes_in_stock_map = {}
                 for db_pid, records in product_variant_tracking.items():
@@ -1182,7 +1184,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 # Snapshots
                 snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
                 if snap_rows:
-                    safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
+                    safe_db_execute(supabase.table("price_snapshots").upsert(snap_rows, on_conflict="product_id,snapshot_date"))
 
                 # Stockout detection + price events
                 for db_pid, records in product_variant_tracking.items():
