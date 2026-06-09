@@ -4,6 +4,8 @@
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
 #         Size enrichment pass (SIZE_CAP=10, same pattern as LCW)
+#  v14.2  Fixed parse_defacto_sizes: real HTML uses data-size on <button>
+#         with class "is-no-stock" for OOS — not data-value on <li>
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -879,36 +881,34 @@ def parse_defacto_sizes(html):
     """
     Parse size + stock status from a DeFacto product page HTML.
 
-    The page renders a list of sizes for the currently-selected color.
-    In-stock sizes appear as plain <li> elements.
-    Out-of-stock sizes carry an "OUT OF STOCK" label visible on the page.
+    Confirmed structure from Elements tab (9 Jun 2026):
 
-    We look for <li> elements that contain a size label. The presence of
-    "out-of-stock" in the class or of the literal text "OUT OF STOCK" in
-    the element marks a size as unavailable.
+    In-stock:
+      <button class="size-selector-sizes-size__button"
+              data-type="size" data-size="M" ...>
 
-    Attribute order may vary — we extract label and class independently.
+    Out of stock:
+      <button class="size-selector-sizes-size__button is-no-stock"
+              data-type="size" data-size="XS" ...>
+
+    Rules:
+    - Size label is in the data-size attribute on the <button>.
+    - Out-of-stock is indicated by the class "is-no-stock" on that same button.
+    - We only capture buttons with data-type="size" to avoid other button types.
     """
     sizes = []
 
-    # Pattern: <li class="..." data-value="M"> or similar size list items.
-    # DeFacto renders sizes inside a <ul class="size-list"> or similar wrapper.
-    # We capture every <li> that contains a data-value attribute (the size label)
-    # and check whether it also carries an out-of-stock indicator.
-    for tag in re.findall(r'<li[^>]+data-value[^>]*>.*?</li>', html, re.DOTALL):
-        value_m = re.search(r'data-value="([^"]+)"', tag)
-        if not value_m:
+    for tag in re.findall(r'<button[^>]+data-type="size"[^>]*>', html):
+        size_m = re.search(r'data-size="([^"]+)"', tag)
+        if not size_m:
             continue
-        size_label = value_m.group(1).strip()
-        # A size is out-of-stock if:
-        #   - its class contains "out-of-stock" / "outofstock" / "sold-out", OR
-        #   - the visible text inside the <li> contains "OUT OF STOCK"
+        size_label = size_m.group(1).strip()
         class_m    = re.search(r'class="([^"]+)"', tag)
         classes    = (class_m.group(1) if class_m else "").lower()
-        text_oos   = "out of stock" in tag.lower() or "outofstock" in classes or "out-of-stock" in classes
+        is_oos     = "is-no-stock" in classes
         sizes.append({
             "size":        size_label,
-            "is_in_stock": not text_oos,
+            "is_in_stock": not is_oos,
         })
 
     return sizes
