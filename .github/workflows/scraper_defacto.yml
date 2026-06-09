@@ -1,0 +1,37 @@
+name: Khabar DeFacto Scraper
+
+on:
+  # Manual trigger only during testing phase.
+  # Once confirmed working and proxy decision made,
+  # delete this file and add defacto to either:
+  #   scraper_shopify.yml (if no proxy needed), or
+  #   scraper_lcw.yml     (if Akamai blocks and proxy required)
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run DeFacto scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SCRAPE_TARGET: defacto
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        run: python -u scraper.py
