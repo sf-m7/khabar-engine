@@ -17,6 +17,19 @@
 #         per-size stock + price data. SIZE_CAP raised to 65 (still <1GB/month
 #         since pages are 60 KB gzipped, not 172 KB decoded). Dedupe by URL stem
 #         eliminates redundant fetches. Backfill completes in ~86 days.
+#  v14.7  SYSTEM AUDIT FIXES — detection & alert engine repair:
+#         • load_last_prices() now paginates (.range loop). It was capped at the
+#           PostgREST 1000-row default, so ~95% of the catalog never received a
+#           price baseline → every observation logged as a directionless event and
+#           no real drop was ever detected/alerted. This was the root cause of the
+#           price_events flood and the dead alert pipeline.
+#         • First-sighting no longer writes a direction=NULL event; it seeds the
+#           in-memory baseline silently (the snapshot already stores the price).
+#         • Removed the inverted ">5-day last_updated_at" alert gate that could
+#           never be true for a daily scraper (it blocked every alert). Alerts now
+#           fire on a genuine down-transition below first_observed_price.
+#         • Added MIN_ALERT_DISCOUNT_PCT (10%) quality floor on alerts.
+#         • Restored the rolling 30-day purge of price_events (was dropped in v14).
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -35,6 +48,10 @@ SUPABASE_URL       = os.environ["SUPABASE_URL"]
 SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# Minimum true discount (vs first_observed_price) before a user is alerted.
+# Keeps alerts genuine and naturally caps alert volume.
+MIN_ALERT_DISCOUNT_PCT = 10
 
 WEBSHARE_USER  = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
 WEBSHARE_PASS  = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
@@ -246,6 +263,11 @@ def find_and_alert_users(supabase, session, brand, category, variant_size,
                          current_price, product_name, product_url, variant_baseline):
     if not TELEGRAM_BOT_TOKEN or not variant_baseline or current_price >= variant_baseline:
         return
+    # Quality floor (v14.7): only alert on a genuinely meaningful markdown.
+    # Prevents trivial 1-2% wobble from spamming users and keeps "deal" honest.
+    honest_discount = round(((variant_baseline - current_price) / variant_baseline) * 100)
+    if honest_discount < MIN_ALERT_DISCOUNT_PCT:
+        return
     matches = safe_db_execute(
         supabase.table("user_sizes")
         .select("user_id, users!inner(telegram_id, conversation_state, price_ceiling)")
@@ -262,7 +284,6 @@ def find_and_alert_users(supabase, session, brand, category, variant_size,
             supabase.table("user_brands").select("user_id").eq("user_id", uid).eq("brand", brand)
         )
         if not brand_check or not brand_check.data: continue
-        honest_discount = round(((variant_baseline - current_price) / variant_baseline) * 100)
         alert = (
             f"🔥 <b>Deal Alert — {BRAND_DISPLAY.get(brand, brand)}</b>\n\n"
             f"<b>{product_name}</b>\n"
@@ -276,17 +297,40 @@ def find_and_alert_users(supabase, session, brand, category, variant_size,
 # ── Snapshots ─────────────────────────────────────────────────────────────────
 
 def load_last_prices(supabase, brand_name):
+    """
+    Returns {product_id: price} for the most recent day that has snapshots
+    (today first, else yesterday).
+
+    CRITICAL (v14.7): this MUST paginate. PostgREST silently caps every
+    response at 1000 rows regardless of how many snapshots exist. The old
+    single-query version returned only the first 1000 products per brand, so
+    every product beyond row 1000 came back with no baseline — meaning the
+    scraper treated ~95% of the catalog as "new" on every run, flooding
+    price_events with directionless rows and never detecting a real price
+    change (and therefore never firing an alert) for those products.
+    The .range() loop below loads the full set, exactly like the snapshot
+    pre-load and prev_stock_state loaders already do.
+    """
     today, yesterday = str(date.today()), str(date.today() - timedelta(days=1))
     for target_date in [today, yesterday]:
-        result = safe_db_execute(
-            supabase.table("price_snapshots")
-            .select("product_id, price")
-            .eq("brand", brand_name)
-            .eq("snapshot_date", target_date)
-        )
-        if result and result.data:
-            return {row["product_id"]: float(row["price"])
-                    for row in result.data if row.get("product_id")}
+        prices, offset = {}, 0
+        while True:
+            result = safe_db_execute(
+                supabase.table("price_snapshots")
+                .select("product_id, price")
+                .eq("brand", brand_name)
+                .eq("snapshot_date", target_date)
+                .range(offset, offset + 999)
+            )
+            rows = (result.data or []) if result else []
+            for row in rows:
+                if row.get("product_id"):
+                    prices[row["product_id"]] = float(row["price"])
+            if len(rows) < 1000:
+                break
+            offset += 1000
+        if prices:
+            return prices
     return {}
 
 def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_ids):
@@ -466,20 +510,24 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                         )
                     curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
                     last_p = prev_prices.get(db_pid)
-                    if last_p is None or abs(last_p - curr_price) > 0.01:
-                        direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
-                        if direction: price_changes += 1
+                    if last_p is None:
+                        # First price seen for this product in the rolling window.
+                        # Seed the baseline silently — the snapshot already records
+                        # this price. Writing a directionless event here is what
+                        # flooded price_events; we no longer do it. (v14.7)
+                        prev_prices[db_pid] = curr_price
+                    elif abs(last_p - curr_price) > 0.01:
+                        direction = "down" if curr_price < last_p else "up"
+                        price_changes += 1
                         if direction == "down" and v_base and curr_price < v_base:
-                            if prev_v and prev_v.get("last_updated_at"):
-                                if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
-                                    for p in products:
-                                        if str(p["id"]) == next((k for k, v in product_id_map.items() if v == db_pid), None):
-                                            find_and_alert_users(
-                                                supabase, session, brand_name,
-                                                normalize_category(f"{p['title']} {p.get('product_type','')}"),
-                                                rec["_meta_size"], curr_price, p["title"],
-                                                f"https://{domain}/products/{p['handle']}", v_base
-                                            )
+                            for p in products:
+                                if str(p["id"]) == next((k for k, v in product_id_map.items() if v == db_pid), None):
+                                    find_and_alert_users(
+                                        supabase, session, brand_name,
+                                        normalize_category(f"{p['title']} {p.get('product_type','')}"),
+                                        rec["_meta_size"], curr_price, p["title"],
+                                        f"https://{domain}/products/{p['handle']}", v_base
+                                    )
                         honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
                         safe_db_execute(supabase.table("price_events").insert({
                             "product_id":    db_pid, "brand": brand_name,
@@ -899,23 +947,24 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                             )
                         curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
                         last_p = prev_prices.get(db_pid)
-                        if last_p is None or abs(last_p - curr_price) > 0.01:
-                            direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
-                            if direction: price_changes += 1
+                        if last_p is None:
+                            # First price in the rolling window — seed silently (v14.7).
+                            prev_prices[db_pid] = curr_price
+                        elif abs(last_p - curr_price) > 0.01:
+                            direction = "down" if curr_price < last_p else "up"
+                            price_changes += 1
                             if direction == "down" and v_base and curr_price < v_base:
-                                if prev_v and prev_v.get("last_updated_at"):
-                                    if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
-                                        for item in items:
-                                            if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None):
-                                                desc       = item.get("ProductDescription") or item.get("BrandPropertyDescription") or "LCW Item"
-                                                breadcrumb = item.get("BreadCrump") or {}
-                                                category   = lcw_normalize_category(breadcrumb)
-                                                model_url  = item.get("ModelUrl") or ""
-                                                find_and_alert_users(
-                                                    supabase, session, brand_name, category,
-                                                    rec["_meta_size"], curr_price, desc,
-                                                    f"https://{domain}{model_url}", v_base
-                                                )
+                                for item in items:
+                                    if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None):
+                                        desc       = item.get("ProductDescription") or item.get("BrandPropertyDescription") or "LCW Item"
+                                        breadcrumb = item.get("BreadCrump") or {}
+                                        category   = lcw_normalize_category(breadcrumb)
+                                        model_url  = item.get("ModelUrl") or ""
+                                        find_and_alert_users(
+                                            supabase, session, brand_name, category,
+                                            rec["_meta_size"], curr_price, desc,
+                                            f"https://{domain}{model_url}", v_base
+                                        )
                             honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
                             safe_db_execute(supabase.table("price_events").insert({
                                 "product_id":      db_pid, "brand": brand_name,
@@ -1423,29 +1472,29 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                         curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
                         last_p = prev_prices.get(db_pid)
 
-                        if last_p is None or abs(last_p - curr_price) > 0.01:
-                            direction = "down" if (last_p and curr_price < last_p) else "up" if last_p else None
-                            if direction:
-                                price_changes += 1
+                        if last_p is None:
+                            # First price in the rolling window — seed silently (v14.7).
+                            prev_prices[db_pid] = curr_price
+                        elif abs(last_p - curr_price) > 0.01:
+                            direction = "down" if curr_price < last_p else "up"
+                            price_changes += 1
 
                             if direction == "down" and v_base and curr_price < v_base:
-                                if prev_v and prev_v.get("last_updated_at"):
-                                    if (datetime.now(timezone.utc) - datetime.fromisoformat(prev_v["last_updated_at"])) > timedelta(days=5):
-                                        for p_item in items:
-                                            if p_item.get("LongCode") == next(
-                                                (k for k, v in product_id_map.items() if v == db_pid), None
-                                            ):
-                                                p_name = p_item.get("Name") or p_item.get("GtmName") or "DeFacto Item"
-                                                seo    = p_item.get("SeoName") or ""
-                                                vidx   = p_item.get("ProductVariantIndex") or ""
-                                                p_url  = f"https://{domain}/en-eg/{seo}-{vidx}" if seo and vidx else f"https://{domain}"
-                                                cat_lvl3 = (p_item.get("CategoriesLvl3") or {}).get("CategoryName") or ""
-                                                p_cat  = normalize_category(f"{cat_lvl3} {p_name}")
-                                                find_and_alert_users(
-                                                    supabase, session, brand_name, p_cat,
-                                                    rec["_meta_size"], curr_price,
-                                                    p_name, p_url, v_base
-                                                )
+                                for p_item in items:
+                                    if p_item.get("LongCode") == next(
+                                        (k for k, v in product_id_map.items() if v == db_pid), None
+                                    ):
+                                        p_name = p_item.get("Name") or p_item.get("GtmName") or "DeFacto Item"
+                                        seo    = p_item.get("SeoName") or ""
+                                        vidx   = p_item.get("ProductVariantIndex") or ""
+                                        p_url  = f"https://{domain}/en-eg/{seo}-{vidx}" if seo and vidx else f"https://{domain}"
+                                        cat_lvl3 = (p_item.get("CategoriesLvl3") or {}).get("CategoryName") or ""
+                                        p_cat  = normalize_category(f"{cat_lvl3} {p_name}")
+                                        find_and_alert_users(
+                                            supabase, session, brand_name, p_cat,
+                                            rec["_meta_size"], curr_price,
+                                            p_name, p_url, v_base
+                                        )
 
                             honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
                             safe_db_execute(supabase.table("price_events").insert({
@@ -1628,6 +1677,14 @@ if __name__ == "__main__":
             cutoff_snap = str(date.today() - timedelta(days=90))
             safe_db_execute(
                 _sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap)
+            )
+            # price_events is the rolling 30-day alert engine — prune older rows so
+            # the table stays bounded. (Restored in v14.7; the purge had been
+            # dropped during the v14 refactor, letting the table grow without limit.)
+            # price_snapshots remains the permanent warehouse for long-range history.
+            cutoff_events = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            safe_db_execute(
+                _sb.table("price_events").delete().lt("recorded_at", cutoff_events)
             )
             now_iso     = datetime.now(timezone.utc).isoformat()
             cutoff_seen = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
