@@ -9,6 +9,8 @@
 #  v14.3  Snapshot pre-load changed from single .limit(20000) query to paginated
 #         .range() loop — PostgREST ignores .limit() above 1000, partial index
 #         blocks upsert ON CONFLICT, so insert is safe when pre-load is exhaustive
+#  v14.4  DeFacto size source changed from HTML parsing to CombinProductListByProductLongCode
+#         batch API — sizes populated inline per catalog page, no SIZE_CAP crawl needed
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -894,64 +896,63 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
 # ── DeFacto Scraper ───────────────────────────────────────────────────────────
 
-def parse_defacto_sizes(html):
+def fetch_defacto_sizes_batch(session, domain, long_codes):
     """
-    Parse size + stock status from a DeFacto product page HTML.
+    POST to CombinProductListByProductLongCode with a list of LongCodes.
+    Returns a dict: {LongCode -> [{"size": str, "is_in_stock": bool}, ...]}
 
-    Confirmed structure from Elements tab (9 Jun 2026):
+    Confirmed from browser Network tab (9 Jun 2026):
+    - Method: POST
+    - Content-Type: application/json
+    - Body: ["LONGCODE1", "LONGCODE2", ...]
+    - Response: {Data: [{LongCode, Sizes: [{SizeName, StockQuantity: null}, ...], Stock: N}, ...]}
 
-    In-stock:
-      <button class="size-selector-sizes-size__button"
-              data-type="size" data-size="M" ...>
-
-    Out of stock:
-      <button class="size-selector-sizes-size__button is-no-stock"
-              data-type="size" data-size="XS" ...>
-
-    Rules:
-    - Size label is in the data-size attribute on the <button>.
-    - Out-of-stock is indicated by the class "is-no-stock" on that same button.
-    - We only capture buttons with data-type="size" to avoid other button types.
+    Per-size StockQuantity is always null — DeFacto does not expose it via API.
+    We inherit is_in_stock from the parent variant's Stock > 0 field.
     """
-    sizes = []
-
-    for tag in re.findall(r'<button[^>]+data-type="size"[^>]*>', html):
-        size_m = re.search(r'data-size="([^"]+)"', tag)
-        if not size_m:
-            continue
-        size_label = size_m.group(1).strip()
-        class_m    = re.search(r'class="([^"]+)"', tag)
-        classes    = (class_m.group(1) if class_m else "").lower()
-        is_oos     = "is-no-stock" in classes
-        sizes.append({
-            "size":        size_label,
-            "is_in_stock": not is_oos,
-        })
-
-    return sizes
-
-def fetch_defacto_product_sizes(session, url, domain):
-    """
-    GET a single DeFacto product page and parse its sizes.
-    Returns list of {"size": str, "is_in_stock": bool}.
-    Falls back to [] on any error.
-    """
+    if not long_codes:
+        return {}
+    url = f"https://{domain}/en-eg/Catalog/CombinProductListByProductLongCode"
     try:
         res = execute_with_retry(
-            session.get, url, max_retries=1, backoff=0,
-            timeout=10, headers={
-                "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "accept-language": "en-US,en;q=0.9",
-                "accept-encoding": "gzip, deflate, br",
-                "referer":         f"https://{domain}/en-eg/",
+            session.post, url,
+            json=long_codes,
+            timeout=15,
+            headers={
+                "accept":           "*/*",
+                "accept-language":  "en-US,en;q=0.9",
+                "content-type":     "application/json; charset=UTF-8",
+                "origin":           f"https://{domain}",
+                "referer":          f"https://{domain}/en-eg/",
+                "sec-fetch-dest":   "empty",
+                "sec-fetch-mode":   "cors",
+                "sec-fetch-site":   "same-origin",
+                "x-requested-with": "XMLHttpRequest",
             }
         )
-        if res.status_code == 200:
-            return parse_defacto_sizes(res.text)
-        print(f"  ⚠️ [DeFacto] Size page HTTP {res.status_code}: {url}")
+        if res.status_code != 200:
+            print(f"  ⚠️ [DeFacto] CombinProduct HTTP {res.status_code}")
+            return {}
+        data = res.json()
+        items = data.get("Data") or []
+        result = {}
+        for item in items:
+            lc = item.get("ProductLongCode") or (item.get("DataLayer") or {}).get("LongCode")
+            if not lc:
+                continue
+            # Use the outer Sizes array (has SizeName), stock inherited from Stock field
+            raw_sizes = item.get("Sizes") or (item.get("DataLayer") or {}).get("Sizes") or []
+            stock_total = int(item.get("ProductVariantMiniProductStock") or
+                              (item.get("DataLayer") or {}).get("Stock") or 0)
+            is_avail = stock_total > 0
+            result[lc] = [
+                {"size": sz["SizeName"], "is_in_stock": is_avail}
+                for sz in raw_sizes if sz.get("SizeName")
+            ]
+        return result
     except Exception as e:
-        print(f"  ⚠️ [DeFacto] Size fetch error: {e}")
-    return []
+        print(f"  ⚠️ [DeFacto] CombinProduct batch error: {e}")
+        return {}
 
 def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state):
     """
@@ -1206,6 +1207,42 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                     vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
                     product_variant_tracking[vr["product_id"]].append(vr)
 
+                # ── Inline size population via batch API ──────────────────────
+                # Call CombinProductListByProductLongCode with all LongCodes
+                # from this page. Returns sizes immediately — no deferred pass.
+                page_long_codes = [
+                    vr["external_sku"].replace("defacto_", "", 1)
+                    for vr in batch_variants
+                ]
+                if page_long_codes:
+                    size_map = fetch_defacto_sizes_batch(session, domain, page_long_codes)
+                    now_iso_sz = datetime.now(timezone.utc).isoformat()
+                    for vr in batch_variants:
+                        lc    = vr["external_sku"].replace("defacto_", "", 1)
+                        sizes = size_map.get(lc, [])
+                        if not sizes or not vr.get("variant_db_id"):
+                            continue
+                        # Update first size on existing row
+                        safe_db_execute(
+                            supabase.table("product_variants")
+                            .update({"size": sizes[0]["size"], "is_in_stock": sizes[0]["is_in_stock"], "last_updated_at": now_iso_sz})
+                            .eq("id", vr["variant_db_id"])
+                        )
+                        # Insert additional sizes as new variant rows
+                        for sz in sizes[1:]:
+                            extra_sku = f"defacto_{lc}_{sz['size'].replace(' ', '_')}"
+                            safe_db_execute(
+                                supabase.table("product_variants").upsert({
+                                    "product_id":           vr["product_id"],
+                                    "external_sku":         extra_sku,
+                                    "color":                vr.get("_meta_color"),
+                                    "size":                 sz["size"],
+                                    "is_in_stock":          sz["is_in_stock"],
+                                    "first_observed_price": vr.get("_meta_baseline"),
+                                    "last_updated_at":      now_iso_sz,
+                                }, on_conflict="external_sku")
+                            )
+
                 # Snapshots
                 snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
                 if snap_rows:
@@ -1279,51 +1316,60 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 print(f"  [{cat_name}] No NextDataUrl — end of catalog.")
                 break
 
-    # ── DeFacto size enrichment pass ─────────────────────────────────────────
-    # Fetches product pages for variants still missing size data.
-    # SIZE_CAP=10 keeps bandwidth cost low — same pattern as LCW.
-    # No proxy used — plain GET through GitHub Actions IP.
-    SIZE_CAP     = 10
-    SIZE_TIMEOUT = 300
-    print(f"  [DeFacto] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
+    # ── DeFacto backfill pass: fix any variants still missing sizes ─────────
+    # Catches variants from previous runs before this batch API approach.
+    # Loads all null-size variants for this brand, batches their LongCodes
+    # into one POST, and writes sizes in bulk. Runs once per scrape.
     try:
-        missing = safe_db_execute(
-            supabase.table("product_variants")
-            .select("id, product_id, external_sku, color, is_in_stock, first_observed_price, products!inner(url, brand)")
-            .eq("products.brand", brand_name)
-            .is_("size", "null")
-            .limit(SIZE_CAP)
-        )
-        if missing and missing.data:
-            print(f"  [DeFacto] {len(missing.data)} variants need sizes.")
-            fetched = populated = 0
-            size_pass_start = time.time()
-            for row in missing.data:
-                if time.time() - size_pass_start > SIZE_TIMEOUT:
-                    print(f"  [DeFacto] Size pass time limit reached — stopping early.")
-                    break
-                url = (row.get("products") or {}).get("url")
-                if not url:
-                    continue
-                sizes = fetch_defacto_product_sizes(session, url, domain)
-                fetched += 1
-                if sizes:
-                    product_id   = row.get("product_id")
-                    color        = row.get("color")
-                    fop          = row.get("first_observed_price") or prev_prices.get(product_id)
-                    now_iso      = datetime.now(timezone.utc).isoformat()
-                    parent_stock = row.get("is_in_stock", True)
+        all_missing, miss_offset = [], 0
+        while True:
+            chunk = safe_db_execute(
+                supabase.table("product_variants")
+                .select("id, product_id, external_sku, color, is_in_stock, first_observed_price")
+                .eq("products.brand", brand_name)
+                .is_("size", "null")
+                .range(miss_offset, miss_offset + 999)
+            )
+            rows = (chunk.data or []) if chunk else []
+            all_missing.extend(rows)
+            if len(rows) < 1000:
+                break
+            miss_offset += 1000
+
+        if all_missing:
+            print(f"  [DeFacto] Backfilling sizes for {len(all_missing)} variants...")
+            # Extract LongCode from external_sku: "defacto_E7961AX26SPWT32" -> "E7961AX26SPWT32"
+            sku_to_row = {}
+            long_codes = []
+            for row in all_missing:
+                lc = row["external_sku"].replace("defacto_", "", 1)
+                sku_to_row[lc] = row
+                long_codes.append(lc)
+
+            # Batch in groups of 36 (one catalog page worth) to stay reasonable
+            populated = 0
+            for batch_start in range(0, len(long_codes), 36):
+                batch = long_codes[batch_start:batch_start + 36]
+                size_map = fetch_defacto_sizes_batch(session, domain, batch)
+                now_iso  = datetime.now(timezone.utc).isoformat()
+                for lc, sizes in size_map.items():
+                    if not sizes:
+                        continue
+                    row = sku_to_row.get(lc)
+                    if not row:
+                        continue
+                    product_id = row.get("product_id")
+                    color      = row.get("color")
+                    fop        = row.get("first_observed_price") or prev_prices.get(product_id)
                     for i, sz in enumerate(sizes):
                         if i == 0:
-                            # Update the existing variant row with the first size
                             safe_db_execute(
                                 supabase.table("product_variants")
                                 .update({"size": sz["size"], "is_in_stock": sz["is_in_stock"], "last_updated_at": now_iso})
                                 .eq("id", row["id"])
                             )
                         else:
-                            # Insert additional size rows for this color variant
-                            sku = f"{row['external_sku']}_{sz['size'].replace(' ', '_')}"
+                            sku = f"defacto_{lc}_{sz['size'].replace(' ', '_')}"
                             safe_db_execute(
                                 supabase.table("product_variants").upsert({
                                     "product_id":           product_id,
@@ -1336,12 +1382,12 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                                 }, on_conflict="external_sku")
                             )
                     populated += 1
-                time.sleep(random.uniform(0.5, 1.2))
-            print(f"  [DeFacto] Sizes: {fetched} pages fetched, {populated} products populated.")
+                time.sleep(random.uniform(0.5, 1.0))
+            print(f"  [DeFacto] Backfill complete: {populated} variants populated.")
         else:
             print("  [DeFacto] All variants have size data. ✅")
     except Exception as e:
-        print(f"  [DeFacto] Size population error (non-fatal): {e}")
+        print(f"  [DeFacto] Size backfill error (non-fatal): {e}")
 
     return products_seen, price_changes
 
