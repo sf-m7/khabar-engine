@@ -119,7 +119,18 @@ def get_resilient_session():
 def get_lcw_session():
     if not WEBSHARE_PROXY:
         return requests.Session(impersonate="chrome124")
-    proxy_url = WEBSHARE_PROXY.get("https") or WEBSHARE_PROXY.get("http")
+    # Use one of 8 Egyptian residential sticky sessions.
+    # Webshare format: {base_user}-eg-{1..8}:{password}@p.webshare.io:80
+    # Why Egypt: LCW Egypt's Akamai scores Egyptian ISP IPs (Etisalat, WE,
+    # Vodafone EG) as low-risk because real Egyptian users browse lcwaikiki.eg
+    # from those exact IPs every day. Foreign or datacenter IPs score high-risk
+    # and get 403'd. We pick a random session number so the IP rotates between
+    # daily runs, but stays consistent within a single run (sticky session).
+    base_user = WEBSHARE_USER.split("-")[0]   # strip any stale suffix
+    eg_session = random.randint(1, 900)  # pool has 900+ Egyptian residential IPs
+    eg_user    = f"{base_user}-eg-{eg_session}"
+    proxy_url  = f"http://{eg_user}:{WEBSHARE_PASS}@p.webshare.io:80"
+    print(f"  [LCW] Egyptian proxy session selected: -eg-{eg_session}")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def execute_with_retry(session_method, url, max_retries=3, backoff=1, **kwargs):
