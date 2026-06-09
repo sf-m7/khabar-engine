@@ -11,6 +11,7 @@
 #         blocks upsert ON CONFLICT, so insert is safe when pre-load is exhaustive
 #  v14.4  DeFacto size source changed from HTML parsing to CombinProductListByProductLongCode
 #         batch API — sizes populated inline per catalog page, no SIZE_CAP crawl needed
+#  v14.5  Fixed backfill query: add products!inner(brand) join for brand filter
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -1325,7 +1326,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
         while True:
             chunk = safe_db_execute(
                 supabase.table("product_variants")
-                .select("id, product_id, external_sku, color, is_in_stock, first_observed_price")
+                .select("id, product_id, external_sku, color, is_in_stock, first_observed_price, products!inner(brand)")
                 .eq("products.brand", brand_name)
                 .is_("size", "null")
                 .range(miss_offset, miss_offset + 999)
