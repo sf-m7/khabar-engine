@@ -6,8 +6,9 @@
 #         Size enrichment pass (SIZE_CAP=10, same pattern as LCW)
 #  v14.2  Fixed parse_defacto_sizes: real HTML uses data-size on <button>
 #         with class "is-no-stock" for OOS — not data-value on <li>
-#  v14.3  Snapshot writes changed from insert to upsert (on_conflict=product_id,snapshot_date)
-#         Fixes duplicate key crash on re-runs when PostgREST ignores limit(20000)
+#  v14.3  Snapshot pre-load changed from single .limit(20000) query to paginated
+#         .range() loop — PostgREST ignores .limit() above 1000, partial index
+#         blocks upsert ON CONFLICT, so insert is safe when pre-load is exhaustive
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -327,14 +328,21 @@ def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
 def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state):
     page, products_seen, price_changes = 1, 0, 0
     prev_prices = load_last_prices(supabase, brand_name)
-    _snap = safe_db_execute(
-        supabase.table("price_snapshots").select("product_id")
-        .eq("brand", brand_name).eq("snapshot_date", str(today))
-        .limit(20000)
-    )
-    existing_snapshot_ids = set(
-        r["product_id"] for r in (_snap.data or []) if r.get("product_id")
-    )
+    existing_snapshot_ids = set()
+    _snap_offset = 0
+    while True:
+        _snap = safe_db_execute(
+            supabase.table("price_snapshots").select("product_id")
+            .eq("brand", brand_name).eq("snapshot_date", str(today))
+            .range(_snap_offset, _snap_offset + 999)
+        )
+        _rows = (_snap.data or []) if _snap else []
+        for r in _rows:
+            if r.get("product_id"):
+                existing_snapshot_ids.add(r["product_id"])
+        if len(_rows) < 1000:
+            break
+        _snap_offset += 1000
     print(f"  {len(existing_snapshot_ids)} snapshots already exist for today.")
 
     while True:
@@ -434,7 +442,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
             snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
             if snap_rows:
-                safe_db_execute(supabase.table("price_snapshots").upsert(snap_rows, on_conflict="product_id,snapshot_date"))
+                safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
 
             for db_pid, records in product_variant_tracking.items():
                 if not records: continue
@@ -586,14 +594,21 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
-    _snap = safe_db_execute(
-        supabase.table("price_snapshots").select("product_id")
-        .eq("brand", brand_name).eq("snapshot_date", str(today))
-        .limit(20000)
-    )
-    existing_snapshot_ids = set(
-        r["product_id"] for r in (_snap.data or []) if r.get("product_id")
-    )
+    existing_snapshot_ids = set()
+    _snap_offset = 0
+    while True:
+        _snap = safe_db_execute(
+            supabase.table("price_snapshots").select("product_id")
+            .eq("brand", brand_name).eq("snapshot_date", str(today))
+            .range(_snap_offset, _snap_offset + 999)
+        )
+        _rows = (_snap.data or []) if _snap else []
+        for r in _rows:
+            if r.get("product_id"):
+                existing_snapshot_ids.add(r["product_id"])
+        if len(_rows) < 1000:
+            break
+        _snap_offset += 1000
     print(f"  [LCW] {len(existing_snapshot_ids)} snapshots already exist for today.")
 
     headers = {
@@ -771,7 +786,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
                 snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
                 if snap_rows:
-                    safe_db_execute(supabase.table("price_snapshots").upsert(snap_rows, on_conflict="product_id,snapshot_date"))
+                    safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
 
                 sizes_in_stock_map = {}
                 for db_pid, records in product_variant_tracking.items():
@@ -959,14 +974,24 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
-    _snap = safe_db_execute(
-        supabase.table("price_snapshots").select("product_id")
-        .eq("brand", brand_name).eq("snapshot_date", str(today))
-        .limit(20000)
-    )
-    existing_snapshot_ids = set(
-        r["product_id"] for r in (_snap.data or []) if r.get("product_id")
-    )
+    # Paginated load — PostgREST enforces a 1000-row cap per response regardless
+    # of .limit(). We loop with .range() until we get a partial page, same
+    # pattern used for prev_stock_state loading.
+    existing_snapshot_ids = set()
+    _snap_offset = 0
+    while True:
+        _snap = safe_db_execute(
+            supabase.table("price_snapshots").select("product_id")
+            .eq("brand", brand_name).eq("snapshot_date", str(today))
+            .range(_snap_offset, _snap_offset + 999)
+        )
+        _rows = (_snap.data or []) if _snap else []
+        for r in _rows:
+            if r.get("product_id"):
+                existing_snapshot_ids.add(r["product_id"])
+        if len(_rows) < 1000:
+            break
+        _snap_offset += 1000
     print(f"  [DeFacto] {len(existing_snapshot_ids)} snapshots already exist for today.")
 
     headers = {
@@ -1184,7 +1209,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 # Snapshots
                 snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
                 if snap_rows:
-                    safe_db_execute(supabase.table("price_snapshots").upsert(snap_rows, on_conflict="product_id,snapshot_date"))
+                    safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
 
                 # Stockout detection + price events
                 for db_pid, records in product_variant_tracking.items():
