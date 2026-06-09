@@ -30,6 +30,15 @@
 #           fire on a genuine down-transition below first_observed_price.
 #         • Added MIN_ALERT_DISCOUNT_PCT (10%) quality floor on alerts.
 #         • Restored the rolling 30-day purge of price_events (was dropped in v14).
+#  v14.8  Price-change detection moved from per-variant to PER-PRODUCT. Fixing the
+#         1000-row cap in v14.7 exposed a latent flip-flop: variants of a
+#         multi-price product were each compared against the product's median
+#         snapshot with the baseline mutating mid-loop, manufacturing phantom
+#         up/down events (e.g. 219 mens_club "down" events from 86 products in one
+#         run). Detection now computes one representative price per product via
+#         product_repr_price() — the SAME median build_snapshot_rows stores — and
+#         emits at most one event per product per run. Alerts now fan out across a
+#         product's in-stock sizes. Stockout detection stays per-variant.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -333,17 +342,31 @@ def load_last_prices(supabase, brand_name):
             return prices
     return {}
 
+def product_repr_price(records):
+    """
+    The single representative current price for a product = median of its
+    variant prices. Detection and snapshot writing BOTH use this exact function
+    so that the price stored today equals the baseline read back tomorrow when
+    nothing has changed — preventing the per-variant flip-flop that otherwise
+    manufactures phantom up/down events for multi-price products. (v14.8)
+    """
+    prices = sorted(r["_meta_price"] for r in records if r.get("_meta_price"))
+    return prices[len(prices) // 2] if prices else None
+
+def product_repr_baseline(records):
+    """Representative first_observed_price for a product = median of variant baselines."""
+    bases = sorted(r["_meta_baseline"] for r in records if r.get("_meta_baseline"))
+    return bases[len(bases) // 2] if bases else None
+
 def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_ids):
     rows = []
     now_iso = datetime.now(timezone.utc).isoformat()
     for db_pid, records in product_variant_tracking.items():
         if not records or db_pid in existing_ids:
             continue
-        prices = [r["_meta_price"] for r in records if r.get("_meta_price")]
-        if not prices:
+        median_price = product_repr_price(records)
+        if median_price is None:
             continue
-        prices.sort()
-        median_price = prices[len(prices) // 2]
         vd = records[0]
         rows.append({
             "product_id":       db_pid,
@@ -499,6 +522,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
             for db_pid, records in product_variant_tracking.items():
                 if not records: continue
                 sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+                # Per-variant stockout detection (correct at the variant grain).
                 for rec in records:
                     prev_v = prev_stock_state.get(rec["external_sku"])
                     if prev_v:
@@ -508,36 +532,41 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                             prev_v["is_in_stock"], rec["_meta_available"],
                             rec["_meta_price"], rec["_meta_baseline"]
                         )
-                    curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                    last_p = prev_prices.get(db_pid)
-                    if last_p is None:
-                        # First price seen for this product in the rolling window.
-                        # Seed the baseline silently — the snapshot already records
-                        # this price. Writing a directionless event here is what
-                        # flooded price_events; we no longer do it. (v14.7)
-                        prev_prices[db_pid] = curr_price
-                    elif abs(last_p - curr_price) > 0.01:
-                        direction = "down" if curr_price < last_p else "up"
-                        price_changes += 1
-                        if direction == "down" and v_base and curr_price < v_base:
-                            for p in products:
-                                if str(p["id"]) == next((k for k, v in product_id_map.items() if v == db_pid), None):
-                                    find_and_alert_users(
-                                        supabase, session, brand_name,
-                                        normalize_category(f"{p['title']} {p.get('product_type','')}"),
-                                        rec["_meta_size"], curr_price, p["title"],
-                                        f"https://{domain}/products/{p['handle']}", v_base
-                                    )
-                        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
-                        safe_db_execute(supabase.table("price_events").insert({
-                            "product_id":    db_pid, "brand": brand_name,
-                            "price_before":  last_p, "price_after": curr_price,
-                            "compare_at_price": rec["_meta_compare"],
-                            "discount_pct":  honest_disc,
-                            "direction":     direction, "sizes_in_stock": sizes_in_stock,
-                            "recorded_at":   datetime.now(timezone.utc).isoformat(),
-                        }))
-                        prev_prices[db_pid] = curr_price
+                # Product-level price detection (v14.8): one representative price per
+                # product, compared once. This is what build_snapshot_rows stores, so
+                # an unchanged product compares equal and produces no event — ending
+                # the per-variant flip-flop that manufactured phantom up/down churn.
+                curr_price = product_repr_price(records)
+                v_base     = product_repr_baseline(records)
+                if curr_price is None:
+                    continue
+                last_p = prev_prices.get(db_pid)
+                if last_p is None:
+                    prev_prices[db_pid] = curr_price
+                elif abs(last_p - curr_price) > 0.01:
+                    direction = "down" if curr_price < last_p else "up"
+                    price_changes += 1
+                    if direction == "down" and v_base and curr_price < v_base:
+                        prod = next((p for p in products
+                                     if str(p["id"]) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
+                        if prod:
+                            p_cat = normalize_category(f"{prod['title']} {prod.get('product_type','')}")
+                            p_url = f"https://{domain}/products/{prod['handle']}"
+                            for sz in set(sizes_in_stock):
+                                find_and_alert_users(
+                                    supabase, session, brand_name, p_cat,
+                                    sz, curr_price, prod["title"], p_url, v_base
+                                )
+                    honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+                    safe_db_execute(supabase.table("price_events").insert({
+                        "product_id":    db_pid, "brand": brand_name,
+                        "price_before":  last_p, "price_after": curr_price,
+                        "compare_at_price": records[0].get("_meta_compare"),
+                        "discount_pct":  honest_disc,
+                        "direction":     direction, "sizes_in_stock": sizes_in_stock,
+                        "recorded_at":   datetime.now(timezone.utc).isoformat(),
+                    }))
+                    prev_prices[db_pid] = curr_price
 
         print(f"  Page {page} — {len(batch_products)} products processed.")
         time.sleep(1)
@@ -936,6 +965,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     if not records: continue
                     sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
                     sizes_in_stock_map[db_pid] = sizes_in_stock
+                    # Per-variant (per-colour) stockout detection.
                     for rec in records:
                         prev_v = prev_stock_state.get(rec["external_sku"])
                         if prev_v:
@@ -945,37 +975,41 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                 prev_v["is_in_stock"], rec["_meta_available"],
                                 rec["_meta_price"], rec["_meta_baseline"]
                             )
-                        curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                        last_p = prev_prices.get(db_pid)
-                        if last_p is None:
-                            # First price in the rolling window — seed silently (v14.7).
-                            prev_prices[db_pid] = curr_price
-                        elif abs(last_p - curr_price) > 0.01:
-                            direction = "down" if curr_price < last_p else "up"
-                            price_changes += 1
-                            if direction == "down" and v_base and curr_price < v_base:
-                                for item in items:
-                                    if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None):
-                                        desc       = item.get("ProductDescription") or item.get("BrandPropertyDescription") or "LCW Item"
-                                        breadcrumb = item.get("BreadCrump") or {}
-                                        category   = lcw_normalize_category(breadcrumb)
-                                        model_url  = item.get("ModelUrl") or ""
-                                        find_and_alert_users(
-                                            supabase, session, brand_name, category,
-                                            rec["_meta_size"], curr_price, desc,
-                                            f"https://{domain}{model_url}", v_base
-                                        )
-                            honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
-                            safe_db_execute(supabase.table("price_events").insert({
-                                "product_id":      db_pid, "brand": brand_name,
-                                "price_before":    last_p, "price_after": curr_price,
-                                "compare_at_price": rec.get("_meta_compare"),
-                                "discount_pct":    honest_disc,
-                                "direction":       direction,
-                                "sizes_in_stock":  sizes_in_stock_map.get(db_pid, []),
-                                "recorded_at":     datetime.now(timezone.utc).isoformat(),
-                            }))
-                            prev_prices[db_pid] = curr_price
+                    # Product-level price detection (v14.8) — one event per model.
+                    curr_price = product_repr_price(records)
+                    v_base     = product_repr_baseline(records)
+                    if curr_price is None:
+                        continue
+                    last_p = prev_prices.get(db_pid)
+                    if last_p is None:
+                        prev_prices[db_pid] = curr_price
+                    elif abs(last_p - curr_price) > 0.01:
+                        direction = "down" if curr_price < last_p else "up"
+                        price_changes += 1
+                        if direction == "down" and v_base and curr_price < v_base:
+                            it = next((item for item in items
+                                       if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
+                            if it:
+                                desc       = it.get("ProductDescription") or it.get("BrandPropertyDescription") or "LCW Item"
+                                category   = lcw_normalize_category(it.get("BreadCrump") or {})
+                                model_url  = it.get("ModelUrl") or ""
+                                for sz in set(sizes_in_stock):
+                                    find_and_alert_users(
+                                        supabase, session, brand_name, category,
+                                        sz, curr_price, desc,
+                                        f"https://{domain}{model_url}", v_base
+                                    )
+                        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+                        safe_db_execute(supabase.table("price_events").insert({
+                            "product_id":      db_pid, "brand": brand_name,
+                            "price_before":    last_p, "price_after": curr_price,
+                            "compare_at_price": records[0].get("_meta_compare"),
+                            "discount_pct":    honest_disc,
+                            "direction":       direction,
+                            "sizes_in_stock":  sizes_in_stock_map.get(db_pid, []),
+                            "recorded_at":     datetime.now(timezone.utc).isoformat(),
+                        }))
+                        prev_prices[db_pid] = curr_price
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
 
@@ -1459,6 +1493,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                     if not records:
                         continue
                     sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+                    # Per-variant stockout detection.
                     for rec in records:
                         prev_v = prev_stock_state.get(rec["external_sku"])
                         if prev_v:
@@ -1468,47 +1503,47 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                                 prev_v["is_in_stock"], rec["_meta_available"],
                                 rec["_meta_price"], rec["_meta_baseline"]
                             )
+                    # Product-level price detection (v14.8).
+                    curr_price = product_repr_price(records)
+                    v_base     = product_repr_baseline(records)
+                    if curr_price is None:
+                        continue
+                    last_p = prev_prices.get(db_pid)
+                    if last_p is None:
+                        prev_prices[db_pid] = curr_price
+                    elif abs(last_p - curr_price) > 0.01:
+                        direction = "down" if curr_price < last_p else "up"
+                        price_changes += 1
 
-                        curr_price, v_base = rec["_meta_price"], rec["_meta_baseline"]
-                        last_p = prev_prices.get(db_pid)
+                        if direction == "down" and v_base and curr_price < v_base:
+                            p_item = next((pi for pi in items
+                                           if pi.get("LongCode") == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
+                            if p_item:
+                                p_name = p_item.get("Name") or p_item.get("GtmName") or "DeFacto Item"
+                                seo    = p_item.get("SeoName") or ""
+                                vidx   = p_item.get("ProductVariantIndex") or ""
+                                p_url  = f"https://{domain}/en-eg/{seo}-{vidx}" if seo and vidx else f"https://{domain}"
+                                cat_lvl3 = (p_item.get("CategoriesLvl3") or {}).get("CategoryName") or ""
+                                p_cat  = normalize_category(f"{cat_lvl3} {p_name}")
+                                for sz in set(sizes_in_stock):
+                                    find_and_alert_users(
+                                        supabase, session, brand_name, p_cat,
+                                        sz, curr_price, p_name, p_url, v_base
+                                    )
 
-                        if last_p is None:
-                            # First price in the rolling window — seed silently (v14.7).
-                            prev_prices[db_pid] = curr_price
-                        elif abs(last_p - curr_price) > 0.01:
-                            direction = "down" if curr_price < last_p else "up"
-                            price_changes += 1
-
-                            if direction == "down" and v_base and curr_price < v_base:
-                                for p_item in items:
-                                    if p_item.get("LongCode") == next(
-                                        (k for k, v in product_id_map.items() if v == db_pid), None
-                                    ):
-                                        p_name = p_item.get("Name") or p_item.get("GtmName") or "DeFacto Item"
-                                        seo    = p_item.get("SeoName") or ""
-                                        vidx   = p_item.get("ProductVariantIndex") or ""
-                                        p_url  = f"https://{domain}/en-eg/{seo}-{vidx}" if seo and vidx else f"https://{domain}"
-                                        cat_lvl3 = (p_item.get("CategoriesLvl3") or {}).get("CategoryName") or ""
-                                        p_cat  = normalize_category(f"{cat_lvl3} {p_name}")
-                                        find_and_alert_users(
-                                            supabase, session, brand_name, p_cat,
-                                            rec["_meta_size"], curr_price,
-                                            p_name, p_url, v_base
-                                        )
-
-                            honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
-                            safe_db_execute(supabase.table("price_events").insert({
-                                "product_id":       db_pid,
-                                "brand":            brand_name,
-                                "price_before":     last_p,
-                                "price_after":      curr_price,
-                                "compare_at_price": rec.get("_meta_compare"),
-                                "discount_pct":     honest_disc,
-                                "direction":        direction,
-                                "sizes_in_stock":   sizes_in_stock,
-                                "recorded_at":      datetime.now(timezone.utc).isoformat(),
-                            }))
-                            prev_prices[db_pid] = curr_price
+                        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+                        safe_db_execute(supabase.table("price_events").insert({
+                            "product_id":       db_pid,
+                            "brand":            brand_name,
+                            "price_before":     last_p,
+                            "price_after":      curr_price,
+                            "compare_at_price": records[0].get("_meta_compare"),
+                            "discount_pct":     honest_disc,
+                            "direction":        direction,
+                            "sizes_in_stock":   sizes_in_stock,
+                            "recorded_at":      datetime.now(timezone.utc).isoformat(),
+                        }))
+                        prev_prices[db_pid] = curr_price
 
             print(f"  [{cat_name}] Page {page_index} — {len(items)} items processed.")
 
