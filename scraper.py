@@ -39,6 +39,15 @@
 #         product_repr_price() — the SAME median build_snapshot_rows stores — and
 #         emits at most one event per product per run. Alerts now fan out across a
 #         product's in-stock sizes. Stockout detection stays per-variant.
+#  v14.9  LCW cross-page colour-split fix. LCW paginates by OptionId, so one
+#         model's colours can span multiple catalog pages; per-page detection saw
+#         partial colour sets and emitted symmetric phantom down/up round-trips
+#         (e.g. 1099->599 then 599->1099 minutes apart in one run), which also
+#         created false flash-sale flags. The scraper now accumulates every colour
+#         of a model across the whole crawl and runs snapshot + price detection
+#         ONCE, on the complete set, yielding a stable median. Stockout detection
+#         remains per-page/per-variant. Shopify and DeFacto were unaffected (their
+#         variants never split across pages).
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -813,6 +822,16 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
     except Exception as e:
         print(f"  [LCW] Priming failed (will attempt API anyway): {e}")
 
+    # v14.9: accumulate every colour of a model ACROSS all pages/categories, then
+    # snapshot + detect ONCE after the crawl. LCW paginates by OptionId (colour),
+    # so a single model's colours can land on different pages; per-page detection
+    # then saw partial variant sets and manufactured symmetric phantom down/up
+    # round-trips (e.g. 1099->599 on one page, 599->1099 on another) that also
+    # polluted the flash-sale signal. One detection pass over the full colour set
+    # gives a stable median and kills the artifact.
+    lcw_model_records = {}   # db_pid -> [variant _meta records across the whole run]
+    lcw_model_info    = {}   # db_pid -> {desc, category, url} for alerts
+
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         cat_params = cat.get("params", [])
@@ -956,16 +975,9 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
                     product_variant_tracking[vr["product_id"]].append(vr)
 
-                snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
-                if snap_rows:
-                    safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
-
-                sizes_in_stock_map = {}
+                # Per-variant (per-colour) stockout detection — correct at this grain,
+                # safe to run per page (each OptionId appears on exactly one page).
                 for db_pid, records in product_variant_tracking.items():
-                    if not records: continue
-                    sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
-                    sizes_in_stock_map[db_pid] = sizes_in_stock
-                    # Per-variant (per-colour) stockout detection.
                     for rec in records:
                         prev_v = prev_stock_state.get(rec["external_sku"])
                         if prev_v:
@@ -975,43 +987,66 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                                 prev_v["is_in_stock"], rec["_meta_available"],
                                 rec["_meta_price"], rec["_meta_baseline"]
                             )
-                    # Product-level price detection (v14.8) — one event per model.
-                    curr_price = product_repr_price(records)
-                    v_base     = product_repr_baseline(records)
-                    if curr_price is None:
-                        continue
-                    last_p = prev_prices.get(db_pid)
-                    if last_p is None:
-                        prev_prices[db_pid] = curr_price
-                    elif abs(last_p - curr_price) > 0.01:
-                        direction = "down" if curr_price < last_p else "up"
-                        price_changes += 1
-                        if direction == "down" and v_base and curr_price < v_base:
-                            it = next((item for item in items
-                                       if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
-                            if it:
-                                desc       = it.get("ProductDescription") or it.get("BrandPropertyDescription") or "LCW Item"
-                                category   = lcw_normalize_category(it.get("BreadCrump") or {})
-                                model_url  = it.get("ModelUrl") or ""
-                                for sz in set(sizes_in_stock):
-                                    find_and_alert_users(
-                                        supabase, session, brand_name, category,
-                                        sz, curr_price, desc,
-                                        f"https://{domain}{model_url}", v_base
-                                    )
-                        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
-                        safe_db_execute(supabase.table("price_events").insert({
-                            "product_id":      db_pid, "brand": brand_name,
-                            "price_before":    last_p, "price_after": curr_price,
-                            "compare_at_price": records[0].get("_meta_compare"),
-                            "discount_pct":    honest_disc,
-                            "direction":       direction,
-                            "sizes_in_stock":  sizes_in_stock_map.get(db_pid, []),
-                            "recorded_at":     datetime.now(timezone.utc).isoformat(),
-                        }))
-                        prev_prices[db_pid] = curr_price
+                    # Accumulate this page's colours into the run-level model record
+                    # set; price detection happens once, after the full crawl.
+                    lcw_model_records.setdefault(db_pid, []).extend(records)
+                    if db_pid not in lcw_model_info:
+                        it = next((item for item in items
+                                   if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
+                        if it:
+                            lcw_model_info[db_pid] = {
+                                "desc":     it.get("ProductDescription") or it.get("BrandPropertyDescription") or "LCW Item",
+                                "category": lcw_normalize_category(it.get("BreadCrump") or {}),
+                                "url":      f"https://{domain}{it.get('ModelUrl') or ''}",
+                            }
 
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
+
+    # ── Single detection pass over the FULL colour set per model (v14.9) ──────
+    # Now that every page/category has been crawled, lcw_model_records holds all
+    # colours of each model. We snapshot once and detect once per model using a
+    # stable median, so partial-page views can no longer manufacture phantom
+    # up/down round-trips.
+    snap_rows = build_snapshot_rows(brand_name, lcw_model_records, today, existing_snapshot_ids)
+    if snap_rows:
+        for i in range(0, len(snap_rows), 100):
+            safe_db_execute(supabase.table("price_snapshots").insert(snap_rows[i:i+100]))
+
+    for db_pid, records in lcw_model_records.items():
+        if not records:
+            continue
+        curr_price = product_repr_price(records)
+        v_base     = product_repr_baseline(records)
+        if curr_price is None:
+            continue
+        last_p = prev_prices.get(db_pid)
+        if last_p is None:
+            prev_prices[db_pid] = curr_price
+            continue
+        if abs(last_p - curr_price) <= 0.01:
+            continue
+        direction = "down" if curr_price < last_p else "up"
+        price_changes += 1
+        sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+        if direction == "down" and v_base and curr_price < v_base:
+            info = lcw_model_info.get(db_pid) or {}
+            for sz in set(sizes_in_stock):
+                find_and_alert_users(
+                    supabase, session, brand_name, info.get("category", "uncategorized"),
+                    sz, curr_price, info.get("desc", "LCW Item"),
+                    info.get("url", f"https://{domain}"), v_base
+                )
+        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+        safe_db_execute(supabase.table("price_events").insert({
+            "product_id":       db_pid, "brand": brand_name,
+            "price_before":     last_p, "price_after": curr_price,
+            "compare_at_price": records[0].get("_meta_compare"),
+            "discount_pct":     honest_disc,
+            "direction":        direction,
+            "sizes_in_stock":   sizes_in_stock,
+            "recorded_at":      datetime.now(timezone.utc).isoformat(),
+        }))
+        prev_prices[db_pid] = curr_price
 
     # ── LCW size enrichment pass (rewritten v14.6) ────────────────────────────
     # Bandwidth math:
