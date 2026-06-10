@@ -48,6 +48,13 @@
 #         ONCE, on the complete set, yielding a stable median. Stockout detection
 #         remains per-page/per-variant. Shopify and DeFacto were unaffected (their
 #         variants never split across pages).
+#  v14.10 Snapshot now tracks the latest price each day, not just the first. For
+#         brands scraped multiple times daily (Shopify, DeFacto), a sale starting
+#         after the day's first run left the snapshot frozen at the pre-sale price,
+#         so every later run re-fired the same drop against the stale baseline
+#         (738 products primed to double-count on one observed run). sync_snapshot_price()
+#         updates the day's snapshot to the new price after each real change, so a
+#         drop is recorded once and the warehouse holds the day's latest price.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -389,6 +396,23 @@ def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_id
         existing_ids.add(db_pid)
     return rows
 
+def sync_snapshot_price(supabase, db_pid, today, price):
+    """
+    Keep today's snapshot equal to the latest detected price (v14.10).
+    Snapshots are written once per product per day (first observation). For
+    brands scraped several times a day, a sale that starts AFTER the first run
+    leaves the snapshot frozen at the pre-sale price — so every later run of the
+    day re-compares the new price against the stale baseline and re-fires the
+    same "down" event. Updating the snapshot to the latest price after each real
+    change makes the baseline track reality, so the drop is recorded once.
+    """
+    safe_db_execute(
+        supabase.table("price_snapshots")
+        .update({"price": price})
+        .eq("product_id", db_pid)
+        .eq("snapshot_date", str(today))
+    )
+
 def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
                                size, color, prev_stock, curr_stock, curr_price, baseline):
     if prev_stock == curr_stock: return
@@ -576,6 +600,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                         "recorded_at":   datetime.now(timezone.utc).isoformat(),
                     }))
                     prev_prices[db_pid] = curr_price
+                    sync_snapshot_price(supabase, db_pid, today, curr_price)
 
         print(f"  Page {page} — {len(batch_products)} products processed.")
         time.sleep(1)
@@ -1047,6 +1072,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             "recorded_at":      datetime.now(timezone.utc).isoformat(),
         }))
         prev_prices[db_pid] = curr_price
+        sync_snapshot_price(supabase, db_pid, today, curr_price)
 
     # ── LCW size enrichment pass (rewritten v14.6) ────────────────────────────
     # Bandwidth math:
@@ -1579,6 +1605,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                             "recorded_at":      datetime.now(timezone.utc).isoformat(),
                         }))
                         prev_prices[db_pid] = curr_price
+                        sync_snapshot_price(supabase, db_pid, today, curr_price)
 
             print(f"  [{cat_name}] Page {page_index} — {len(items)} items processed.")
 
