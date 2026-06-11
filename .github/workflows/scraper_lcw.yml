@@ -2,14 +2,13 @@ name: Khabar LCW Scraper
 
 on:
   schedule:
-    # 1x daily — midnight UTC only.
-    # LCW uses the Webshare residential proxy (~29 MB/run).
-    # 1x daily = 870 MB/month, fits within the 1 GB plan with ~150 MB headroom.
-    # Headroom covers roughly 5 manual workflow_dispatch runs per month.
-    #
-    # Upgrade path: if Webshare moves to a 2 GB plan, change cron to
-    # "0 0,12 * * *" (2x daily) and raise SIZE_CAP to 25 in scraper.py.
-    - cron: "0 0 * * *"
+    # 18:00 UTC = 21:00 Cairo (EEST, UTC+3 in summer).
+    # Deliberately 3 hours before Cairo midnight so that even if GitHub's
+    # scheduler runs late (commonly 15–60 min, occasionally more), the run
+    # still lands on the same calendar day and captures the day's prices.
+    # Runs once daily — LCW is the only proxy (Webshare) brand and must stay
+    # within the 1 GB/month bandwidth cap.
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -19,15 +18,18 @@ jobs:
     steps:
       - name: Pull the code
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Run LCW scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
