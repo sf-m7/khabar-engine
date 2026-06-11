@@ -76,6 +76,21 @@
 #           run (e.g. GitHub skipping LCW's slot) previously left the next run with
 #           no baseline, silently re-seeding the whole catalog and detecting zero
 #           changes for that day. It now compares against the last day with data.
+#  v14.13 Three fixes from the post-v14.12 review:
+#         • LCW colours now stored in English. LCW's ColorImageUrl filenames are
+#           Turkish (siyah/beyaz/lacivert/...), and that's what we'd been storing.
+#           Added LCW_COLOR_TR_EN translation dict + normalize_lcw_color() applied
+#           at both catalog write and size-backfill so colour-by-brand queries
+#           don't need per-brand normalisation downstream.
+#         • LCW size backfill now rescues NULL colours. When the catalog couldn't
+#           extract a colour (no ColorImageUrl + no MainColorHexCode), the size
+#           pass left children with size populated but color=NULL. It now reads
+#           cartOperationViewModel.Color from the product page JSON it already
+#           fetches, normalises it, and writes it back to the parent row too.
+#         • check_domain() pre-flight is now skipped for the woocommerce engine.
+#           Mobaco's WordPress homepage rejected the bare "Mozilla/5.0" UA used
+#           by the pre-flight, blocking the entire brand from running. Same
+#           bypass already existed for lcw_proxy and defacto.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -677,6 +692,30 @@ LCW_BREADCRUMB_GENDER_MAP = {
     "kids": "kids", "children": "kids", "أطفال": "kids",
 }
 
+# LCW colour-swatch image filenames are the Turkish colour name (e.g. /siyah.png),
+# which is what we end up storing in product_variants.color. This translation map
+# normalises them to the English names every other brand uses. The set is finite
+# (LCW publishes a fixed palette) so a static dict is cheaper and more reliable
+# than a translation API — no rate limits, no cost, no surprises.
+LCW_COLOR_TR_EN = {
+    "siyah": "black", "beyaz": "white", "gri": "grey", "antrasit": "anthracite",
+    "kirmizi": "red", "bordo": "burgundy", "pembe": "pink", "fusya": "fuchsia",
+    "mercan": "coral", "turuncu": "orange", "sari": "yellow", "ekru": "ecru",
+    "bej": "beige", "kahve": "brown", "haki": "khaki", "yesil": "green",
+    "petrol": "petrol", "turkuaz": "turquoise", "mavi": "blue", "lacivert": "navy",
+    "indigo": "indigo", "mor": "purple", "murdum": "plum", "lila": "lilac",
+    "cokrenkli": "multicolor",
+}
+
+def normalize_lcw_color(raw):
+    """Lowercase + strip + translate Turkish → English when known. Leaves
+    unknown values untouched so we never silently drop a colour we don't
+    recognise — those will surface naturally and can be added to the dict."""
+    if not raw:
+        return None
+    key = str(raw).strip().lower()
+    return LCW_COLOR_TR_EN.get(key, key)
+
 def lcw_normalize_category(breadcrumb):
     for level in ["Level3", "Level4", "Level2"]:
         raw = (breadcrumb.get(level) or "").lower().strip()
@@ -1019,6 +1058,11 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                         color_name = m.group(1).lower()
                 if not color_name:
                     color_name = item.get("MainColorHexCode") or None
+                # Translate the Turkish swatch filename into the English colour name
+                # that every other brand uses, so cross-brand colour queries (e.g.
+                # "what % of men's black bottoms got discounted") work without
+                # per-brand special-casing downstream.
+                color_name = normalize_lcw_color(color_name)
 
                 prev       = prev_stock_state.get(sku)
                 v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
@@ -1193,12 +1237,19 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
 
             sizes      = page_data["sizes"]
             now_iso    = datetime.now(timezone.utc).isoformat()
+            # Rescue the colour from the embedded JSON when the catalog couldn't
+            # extract one (no ColorImageUrl and no MainColorHexCode → NULL parent).
+            # cartOperationViewModel.Color is the per-OptionId colour name; it's
+            # also Turkish, so we run it through the same translator.
+            page_color = normalize_lcw_color(page_data.get("color_name"))
 
             # For EACH variant row sharing this URL (typically just one):
             # update first size on the existing row, insert new rows for remaining sizes.
             for row in url_to_rows[url]:
                 product_id   = row.get("product_id")
-                color        = row.get("color")
+                # If the parent row had no colour, use what the product page told us.
+                # If both are missing, leave it NULL (better than guessing).
+                color        = row.get("color") or page_color
                 fop          = row.get("first_observed_price") or prev_prices.get(product_id)
                 parent_stock = row.get("is_in_stock", True)
 
@@ -1208,13 +1259,18 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
                     size_value    = sz["size"]
 
                     if i == 0:
+                        # Also write the rescued colour back to the parent row so
+                        # the existing record stops being NULL after backfill.
+                        update_payload = {
+                            "size":            size_value,
+                            "is_in_stock":     size_in_stock,
+                            "last_updated_at": now_iso,
+                        }
+                        if not row.get("color") and color:
+                            update_payload["color"] = color
                         safe_db_execute(
                             supabase.table("product_variants")
-                            .update({
-                                "size":            size_value,
-                                "is_in_stock":     size_in_stock,
-                                "last_updated_at": now_iso,
-                            })
+                            .update(update_payload)
                             .eq("id", row["id"])
                         )
                     else:
@@ -2022,7 +2078,13 @@ def scrape_brand(brand_name, domain):
     today = date.today()
     print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
     try:
-        if brand_config["engine"] not in ("lcw_proxy", "defacto"):
+        # Skip the homepage pre-flight for API-based engines. Their root URLs
+        # are often the gateway where bot protection lives (CDN challenges, etc.),
+        # while their JSON APIs sit on a different code path that we exercise
+        # directly. The engine itself will surface a clear error if the API is
+        # genuinely unreachable. Mobaco's WordPress homepage was rejecting the
+        # bare "Mozilla/5.0" UA we used here, blocking the whole brand from running.
+        if brand_config["engine"] not in ("lcw_proxy", "defacto", "woocommerce"):
             if not check_domain(session, domain):
                 print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
                 return 0
