@@ -2,11 +2,12 @@ name: Khabar Shopify Scraper
 
 on:
   schedule:
-    # 4x daily at 1, 7, 13, 19 UTC — deliberately offset 1 hour from midnight
-    # so this never runs concurrently with the LCW scraper (which runs at 0:00).
-    # Concurrent runs caused DB conflicts and housecleaning crashes.
-    # Shopify brands use NO proxy — zero Webshare bandwidth cost.
-    - cron: "0 1,7,13,19 * * *"
+    # No-proxy group: all Shopify brands + DeFacto + Mobaco (WooCommerce).
+    # Four runs daily at 01:00, 07:00, 13:00, 18:00 UTC.
+    # The LAST run is 18:00 UTC = 21:00 Cairo (EEST), pulled back from 19:00 so
+    # that GitHub scheduler delay can't push the end-of-day capture past Cairo
+    # midnight. These brands cost zero proxy bandwidth, so run frequency is free.
+    - cron: "0 1,7,13,18 * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,16 +17,19 @@ jobs:
     steps:
       - name: Pull the code
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run Shopify scraper
+
+      - name: Run Shopify + DeFacto + WooCommerce scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
