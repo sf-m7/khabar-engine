@@ -55,6 +55,27 @@
 #         (738 products primed to double-count on one observed run). sync_snapshot_price()
 #         updates the day's snapshot to the new price after each real change, so a
 #         drop is recorded once and the warehouse holds the day's latest price.
+#  v14.11 Added two Shopify brands: Carina (carina.eg, women's basics/sleepwear)
+#         and 2S Egypt (www.2segypt.com, family homewear/pajamas). Both expose the
+#         standard /products.json endpoint, so they route through the existing
+#         scrape_shopify engine with no new parsing code; the shared CATEGORY_MAP
+#         taxonomy normalizes their catalogs automatically. No proxy needed — they
+#         join the SCRAPE_TARGET=shopify group that runs alongside DeFacto.
+#  v14.12 Brand expansion + a resilience fix:
+#         • Added Andora (andoraeg.com) and Cizaro (cizaro.NET — the .com is an
+#           unrelated POS/ERP vendor) as Shopify brands.
+#         • Added Mobaco (mobaco.com) on a NEW WooCommerce engine that reads the
+#           public Store API (/wp-json/wc/store/v1/products). Product-level price
+#           + sale detection; per-size stock inherited from the product (coarse),
+#           same pattern as DeFacto. currency_minor_unit is read from the response
+#           (never hardcoded) and prices are sanity-bounded so a bad parse cannot
+#           poison a baseline. New SCRAPE_TARGET=mobaco allows an isolated
+#           validation run before it joins the daily no-proxy group.
+#         • load_last_prices() now falls back to the most recent snapshot day in a
+#           14-day window instead of only today/yesterday. A single missed daily
+#           run (e.g. GitHub skipping LCW's slot) previously left the next run with
+#           no baseline, silently re-seeding the whole catalog and detecting zero
+#           changes for that day. It now compares against the last day with data.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -92,6 +113,11 @@ BRANDS = [
     {"name": "mens_club",  "domain": "mensclubcollection.com",   "engine": "shopify"},
     {"name": "tree",       "domain": "tree-stores.com",          "engine": "shopify"},
     {"name": "dott_jeans", "domain": "dottjeans.com",            "engine": "shopify"},
+    {"name": "carina",     "domain": "carina.eg",                "engine": "shopify"},
+    {"name": "2s_egypt",   "domain": "www.2segypt.com",          "engine": "shopify"},
+    {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
+    {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
+    {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
 
@@ -101,6 +127,11 @@ BRAND_DISPLAY = {
     "mens_club":  "Men's Club",
     "tree":       "Tree",
     "dott_jeans": "Dott Jeans",
+    "carina":     "Carina",
+    "2s_egypt":   "2S Egypt",
+    "andora":     "Andora",
+    "cizaro":     "Cizaro",
+    "mobaco":     "Mobaco",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
 }
@@ -323,40 +354,55 @@ def find_and_alert_users(supabase, session, brand, category, variant_size,
 
 def load_last_prices(supabase, brand_name):
     """
-    Returns {product_id: price} for the most recent day that has snapshots
-    (today first, else yesterday).
+    Returns {product_id: price} for this brand's MOST RECENT snapshot day
+    within the last 14 days (today preferred, else the latest prior day).
 
     CRITICAL (v14.7): this MUST paginate. PostgREST silently caps every
-    response at 1000 rows regardless of how many snapshots exist. The old
-    single-query version returned only the first 1000 products per brand, so
-    every product beyond row 1000 came back with no baseline — meaning the
-    scraper treated ~95% of the catalog as "new" on every run, flooding
-    price_events with directionless rows and never detecting a real price
-    change (and therefore never firing an alert) for those products.
-    The .range() loop below loads the full set, exactly like the snapshot
-    pre-load and prev_stock_state loaders already do.
+    response at 1000 rows regardless of how many snapshots exist, so the
+    baseline must be loaded with a .range() loop, not a single query.
+
+    RESILIENCE (v14.12): this previously looked back only ONE day (today, else
+    yesterday). For a once-daily brand (LCW) that meant a single missed run —
+    e.g. when GitHub's scheduler skipped the midnight slot — left "yesterday"
+    empty, so the next run found no baseline, silently re-seeded every product
+    as first-sighted, and detected zero price changes for that entire day.
+    We now pick the most recent snapshot_date that actually HAS data inside a
+    14-day window. One skipped run no longer blinds detection: the next run
+    just compares against the last day we do have, which correctly captures
+    whatever moved during the gap. Beyond 14 days with no data we return empty
+    (silent re-seed) so a long outage can't fire a flood of stale "changes".
     """
-    today, yesterday = str(date.today()), str(date.today() - timedelta(days=1))
-    for target_date in [today, yesterday]:
-        prices, offset = {}, 0
-        while True:
-            result = safe_db_execute(
-                supabase.table("price_snapshots")
-                .select("product_id, price")
-                .eq("brand", brand_name)
-                .eq("snapshot_date", target_date)
-                .range(offset, offset + 999)
-            )
-            rows = (result.data or []) if result else []
-            for row in rows:
-                if row.get("product_id"):
-                    prices[row["product_id"]] = float(row["price"])
-            if len(rows) < 1000:
-                break
-            offset += 1000
-        if prices:
-            return prices
-    return {}
+    today = date.today()
+    floor = str(today - timedelta(days=14))
+    latest = safe_db_execute(
+        supabase.table("price_snapshots")
+        .select("snapshot_date")
+        .eq("brand", brand_name)
+        .lte("snapshot_date", str(today))
+        .gte("snapshot_date", floor)
+        .order("snapshot_date", desc=True)
+        .limit(1)
+    )
+    if not latest or not latest.data:
+        return {}
+    target_date = latest.data[0]["snapshot_date"]
+    prices, offset = {}, 0
+    while True:
+        result = safe_db_execute(
+            supabase.table("price_snapshots")
+            .select("product_id, price")
+            .eq("brand", brand_name)
+            .eq("snapshot_date", target_date)
+            .range(offset, offset + 999)
+        )
+        rows = (result.data or []) if result else []
+        for row in rows:
+            if row.get("product_id"):
+                prices[row["product_id"]] = float(row["price"])
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    return prices
 
 def product_repr_price(records):
     """
@@ -1694,6 +1740,274 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
 
     return products_seen, price_changes
 
+# ── WooCommerce Scraper (Mobaco) ──────────────────────────────────────────────
+# WooCommerce ships a public, key-less "Store API" that powers its own cart/blocks
+# and is enabled by default in WooCommerce core regardless of theme:
+#   GET /wp-json/wc/store/v1/products?per_page=100&page=N   → JSON array
+# Each product carries a `prices` object with amounts expressed in MINOR units as
+# strings, plus the divisor to apply:
+#   prices.price            "12000"   (current)
+#   prices.regular_price    "15000"   (list price)
+#   prices.sale_price       "12000"
+#   prices.currency_minor_unit  2     → real price = int(amount) / 10**minor_unit
+# We read currency_minor_unit from the response (never hardcode it) so a store with
+# a 3-decimal currency can't silently make every price 10x wrong. For variable
+# products the list price is the range minimum and per-variation stock is NOT in
+# the list response, so — exactly like DeFacto — we enumerate size labels from the
+# product's attribute terms and inherit stock from the product-level is_in_stock.
+# No proxy required.
+
+WOO_SIZE_ATTR_HINTS  = ("size", "sizes", "مقاس", "المقاس")
+WOO_COLOR_ATTR_HINTS = ("color", "colour", "لون", "اللون")
+
+def _woo_price(amount, minor_unit):
+    """Convert a WooCommerce minor-unit price string to a real number, safely."""
+    try:
+        if amount is None or amount == "":
+            return 0.0
+        return int(str(amount)) / (10 ** int(minor_unit))
+    except (ValueError, TypeError):
+        try:
+            return float(amount)
+        except (ValueError, TypeError):
+            return 0.0
+
+def _woo_extract_sizes_colors(product):
+    """
+    Pull size labels and a single colour (if unambiguous) from a Store API
+    product's `attributes` array. Returns (sizes_list, color_or_None).
+    sizes_list is [] when the product has no size attribute (treated as one
+    sizeless variant by the caller).
+    """
+    sizes, colors = [], []
+    for attr in (product.get("attributes") or []):
+        name = (attr.get("name") or "").strip().lower()
+        terms = [t.get("name") for t in (attr.get("terms") or []) if t.get("name")]
+        if any(h in name for h in WOO_SIZE_ATTR_HINTS):
+            sizes.extend(terms)
+        elif any(h in name for h in WOO_COLOR_ATTR_HINTS):
+            colors.extend(terms)
+    # Only assign a colour when it is unambiguous (single colour product).
+    color = colors[0] if len(colors) == 1 else None
+    return sizes, color
+
+def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state):
+    """
+    Scrapes a WooCommerce store via the public Store API.
+    Product-level price + sale detection now; per-size stock is coarse
+    (inherited from product is_in_stock), consistent with the DeFacto engine.
+    """
+    print(f"  [WooCommerce] Starting Store API scrape (no proxy)...")
+    products_seen, price_changes = 0, 0
+    PER_PAGE = 100
+
+    prev_prices = load_last_prices(supabase, brand_name)
+    existing_snapshot_ids = set()
+    _snap_offset = 0
+    while True:
+        _snap = safe_db_execute(
+            supabase.table("price_snapshots").select("product_id")
+            .eq("brand", brand_name).eq("snapshot_date", str(today))
+            .range(_snap_offset, _snap_offset + 999)
+        )
+        _rows = (_snap.data or []) if _snap else []
+        for r in _rows:
+            if r.get("product_id"):
+                existing_snapshot_ids.add(r["product_id"])
+        if len(_rows) < 1000:
+            break
+        _snap_offset += 1000
+    print(f"  [WooCommerce] {len(existing_snapshot_ids)} snapshots already exist for today.")
+
+    headers = {
+        "accept":          "application/json, text/plain, */*",
+        "accept-language": "en-US,en;q=0.9",
+        "referer":         f"https://{domain}/",
+    }
+
+    page = 1
+    while True:
+        url = f"https://{domain}/wp-json/wc/store/v1/products?per_page={PER_PAGE}&page={page}"
+        try:
+            res = execute_with_retry(session.get, url, timeout=30, headers=headers)
+        except Exception as e:
+            print(f"  ⚠️ [WooCommerce] Page {page} network error: {e}")
+            break
+        if res.status_code != 200:
+            if page == 1:
+                print(f"  ⚠️ [WooCommerce] HTTP {res.status_code} on first page — Store API "
+                      f"may be disabled or path differs. Body: {res.text[:160]}")
+            break
+        try:
+            products = res.json()
+        except Exception:
+            print(f"  ⚠️ [WooCommerce] Page {page} returned non-JSON body.")
+            break
+        if not isinstance(products, list) or not products:
+            break
+
+        # ── Products upsert ───────────────────────────────────────────────
+        batch_products, seen_ext_ids = [], set()
+        for p in products:
+            pid = p.get("id")
+            if not pid or str(pid) in seen_ext_ids:
+                continue
+            seen_ext_ids.add(str(pid))
+            name = p.get("name") or f"{brand_name}-{pid}"
+            cats = [c.get("name", "") for c in (p.get("categories") or [])]
+            category_raw  = cats[0] if cats else ""
+            category_norm = normalize_category(f"{' '.join(cats)} {name}")
+            gender        = normalize_gender(cats, "", name)
+            batch_products.append({
+                "brand":               brand_name,
+                "external_id":         str(pid),
+                "name":                name,
+                "category_raw":        category_raw,
+                "category_normalized": category_norm,
+                "gender":              gender,
+                "sizes_available":     [],
+                "url":                 p.get("permalink") or f"https://{domain}/",
+                "image_url":           (p.get("images") or [{}])[0].get("src") if p.get("images") else None,
+                "last_seen_at":        datetime.now(timezone.utc).isoformat(),
+                "is_active":           True,
+            })
+        if not batch_products:
+            break
+
+        product_upsert_rows = []
+        for i in range(0, len(batch_products), 100):
+            res_p = safe_db_execute(
+                supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id")
+            )
+            if res_p and res_p.data:
+                product_upsert_rows.extend(res_p.data)
+        product_id_map  = {row["external_id"]: row["id"] for row in product_upsert_rows}
+        products_seen  += len(batch_products)
+
+        # first_observed_price (honest baseline) — fires once per product lifecycle
+        for p in products:
+            db_pid = product_id_map.get(str(p.get("id")))
+            if not db_pid:
+                continue
+            prices = p.get("prices") or {}
+            minor  = prices.get("currency_minor_unit", 2)
+            cur    = _woo_price(prices.get("price"), minor)
+            if cur > 0:
+                safe_db_execute(
+                    supabase.table("products")
+                    .update({"first_observed_price": cur})
+                    .eq("id", db_pid)
+                    .is_("first_observed_price", "null")
+                )
+
+        # ── Variants upsert (one row per size label; sizeless → one row) ──
+        batch_variants, product_variant_tracking = [], {}
+        for p in products:
+            db_pid = product_id_map.get(str(p.get("id")))
+            if not db_pid:
+                continue
+            product_variant_tracking.setdefault(db_pid, [])
+            prices = p.get("prices") or {}
+            minor  = prices.get("currency_minor_unit", 2)
+            cur    = _woo_price(prices.get("price"), minor)
+            reg    = _woo_price(prices.get("regular_price"), minor)
+            on_sale = bool(p.get("on_sale"))
+            # Sanity bound: clothing in EGP — reject obviously broken parses so a
+            # bad value can never poison the baseline or fire a phantom alert.
+            if cur <= 0 or cur > 1_000_000:
+                continue
+            compare_at = reg if (on_sale and reg > cur) else None
+            is_avail   = bool(p.get("is_in_stock", True))
+            sizes, color = _woo_extract_sizes_colors(p)
+            size_list = sizes if sizes else [None]   # sizeless product → single variant
+
+            for sz in size_list:
+                sku_suffix = f"_{str(sz).replace(' ', '_')}" if sz else ""
+                sku        = f"{brand_name}_{p['id']}{sku_suffix}"
+                prev       = prev_stock_state.get(sku)
+                v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else cur
+                batch_variants.append({
+                    "product_id": db_pid, "external_sku": sku, "color": color, "size": sz,
+                    "is_in_stock": is_avail, "first_observed_price": v_baseline,
+                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                    "_meta_price": cur, "_meta_compare": compare_at, "_meta_baseline": v_baseline,
+                    "_meta_size": sz, "_meta_color": color, "_meta_available": is_avail,
+                })
+
+        if batch_variants:
+            db_payload = [{k: v for k, v in r.items() if not k.startswith("_meta_")} for r in batch_variants]
+            variant_upsert_rows = []
+            for i in range(0, len(db_payload), 100):
+                res_v = safe_db_execute(
+                    supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku")
+                )
+                if res_v and res_v.data:
+                    variant_upsert_rows.extend(res_v.data)
+            sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+            for vr in batch_variants:
+                vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
+                product_variant_tracking[vr["product_id"]].append(vr)
+
+            snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
+            if snap_rows:
+                safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
+
+            for db_pid, records in product_variant_tracking.items():
+                if not records:
+                    continue
+                sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+                for rec in records:
+                    prev_v = prev_stock_state.get(rec["external_sku"])
+                    if prev_v:
+                        detect_and_write_stockout(
+                            supabase, rec["variant_db_id"], db_pid, brand_name,
+                            rec["_meta_size"], rec["_meta_color"],
+                            prev_v["is_in_stock"], rec["_meta_available"],
+                            rec["_meta_price"], rec["_meta_baseline"]
+                        )
+                # Product-level price detection (v14.8 model).
+                curr_price = product_repr_price(records)
+                v_base     = product_repr_baseline(records)
+                if curr_price is None:
+                    continue
+                last_p = prev_prices.get(db_pid)
+                if last_p is None:
+                    prev_prices[db_pid] = curr_price
+                elif abs(last_p - curr_price) > 0.01:
+                    direction = "down" if curr_price < last_p else "up"
+                    price_changes += 1
+                    if direction == "down" and v_base and curr_price < v_base:
+                        prod = next((p for p in products if str(p.get("id")) ==
+                                     next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
+                        if prod:
+                            cats  = [c.get("name", "") for c in (prod.get("categories") or [])]
+                            p_cat = normalize_category(f"{' '.join(cats)} {prod.get('name','')}")
+                            p_url = prod.get("permalink") or f"https://{domain}/"
+                            for sz in set(sizes_in_stock):
+                                find_and_alert_users(
+                                    supabase, session, brand_name, p_cat,
+                                    sz, curr_price, prod.get("name", "Item"), p_url, v_base
+                                )
+                    honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+                    safe_db_execute(supabase.table("price_events").insert({
+                        "product_id":       db_pid, "brand": brand_name,
+                        "price_before":     last_p, "price_after": curr_price,
+                        "compare_at_price": records[0].get("_meta_compare"),
+                        "discount_pct":     honest_disc,
+                        "direction":        direction, "sizes_in_stock": sizes_in_stock,
+                        "recorded_at":      datetime.now(timezone.utc).isoformat(),
+                    }))
+                    prev_prices[db_pid] = curr_price
+                    sync_snapshot_price(supabase, db_pid, today, curr_price)
+
+        print(f"  [WooCommerce] Page {page} — {len(batch_products)} products processed.")
+        if len(products) < PER_PAGE:
+            break
+        page += 1
+        time.sleep(random.uniform(0.8, 1.5))
+
+    return products_seen, price_changes
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def scrape_brand(brand_name, domain):
@@ -1737,6 +2051,8 @@ def scrape_brand(brand_name, domain):
                 seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state)
         elif brand_config["engine"] == "defacto":
             seen, changes = scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state)
+        elif brand_config["engine"] == "woocommerce":
+            seen, changes = scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state)
         else:
             seen, changes = 0, 0
 
@@ -1749,18 +2065,21 @@ def scrape_brand(brand_name, domain):
 
 if __name__ == "__main__":
     # SCRAPE_TARGET controls which brands this run processes.
-    #   SCRAPE_TARGET=shopify  → Shopify brands + DeFacto (no proxy, runs 4x daily)
+    #   SCRAPE_TARGET=shopify  → Shopify + DeFacto + WooCommerce (no proxy, 4x daily)
     #   SCRAPE_TARGET=lcw      → LC Waikiki only (proxy, runs 1x daily)
     #   SCRAPE_TARGET=defacto  → DeFacto only (for isolated testing)
+    #   SCRAPE_TARGET=mobaco   → Mobaco (WooCommerce) only (for isolated testing)
     #   SCRAPE_TARGET=all      → everything (manual one-off runs)
     SCRAPE_TARGET = os.environ.get("SCRAPE_TARGET", "all").lower()
     if SCRAPE_TARGET == "shopify":
-        # DeFacto uses no proxy — it joins the no-cost daily group
-        active_brands = [b for b in BRANDS if b["engine"] in ("shopify", "defacto")]
+        # DeFacto + WooCommerce use no proxy — they join the no-cost daily group
+        active_brands = [b for b in BRANDS if b["engine"] in ("shopify", "defacto", "woocommerce")]
     elif SCRAPE_TARGET == "lcw":
         active_brands = [b for b in BRANDS if b["engine"] == "lcw_proxy"]
     elif SCRAPE_TARGET == "defacto":
         active_brands = [b for b in BRANDS if b["engine"] == "defacto"]
+    elif SCRAPE_TARGET == "mobaco":
+        active_brands = [b for b in BRANDS if b["engine"] == "woocommerce"]
     else:
         active_brands = BRANDS
     print(f"🚀 Khabar Scraper starting... target={SCRAPE_TARGET} ({len(active_brands)} brands)")
