@@ -124,6 +124,15 @@
 #         Shopify engine only routes Arabic-catalog brands through it. Unknown
 #         values pass through untouched, so an unmapped colour surfaces in the
 #         data (visible, addable to the dict) rather than being silently dropped.
+#  v14.16 Mobaco image-field crash fixed. The WooCommerce Store API usually
+#         returns `images` as a list, but some Mobaco products return it as a
+#         dict; the old `(p.get("images") or [{}])[0]` indexed that dict with
+#         [0] and raised KeyError: 0, which — thanks to the v14.14 per-product
+#         guard — skipped the whole product instead of crashing the brand. Two
+#         products (1207002, 1204625) were being dropped each run over nothing
+#         but a thumbnail. Replaced with _woo_first_image(), which handles list,
+#         dict, string, empty, and missing shapes without ever raising. The two
+#         lost products are recovered on the next run.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -1943,6 +1952,33 @@ def _woo_price(amount, minor_unit):
         except (ValueError, TypeError):
             return 0.0
 
+def _woo_first_image(product):
+    """
+    Robustly pull the first image URL from a Store API product. (v14.16)
+
+    The Store API USUALLY returns `images` as a list of {"src": ...} dicts, but
+    some Mobaco products return it as a DICT instead. Indexing a non-empty dict
+    with [0] raises `KeyError: 0`, and because the image sits in the products
+    dict literal, that error was discarding the ENTIRE product over a purely
+    cosmetic field (confirmed: products 1207002 and 1204625 went missing this
+    way). This handles list, dict, bare string, empty, and missing without ever
+    raising — it returns None when there is no usable URL, so a weird image
+    shape costs us only the thumbnail, never the product.
+    """
+    imgs = product.get("images")
+    if not imgs:
+        return None
+    first = None
+    if isinstance(imgs, list):
+        first = imgs[0] if imgs else None
+    elif isinstance(imgs, dict):
+        first = next(iter(imgs.values()), None)
+    if isinstance(first, dict):
+        return first.get("src")
+    if isinstance(first, str):
+        return first
+    return None
+
 def _woo_extract_sizes_colors(product):
     """
     Pull size labels and a single colour (if unambiguous) from a Store API
@@ -2043,7 +2079,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                     "gender":              gender,
                     "sizes_available":     [],
                     "url":                 p.get("permalink") or f"https://{domain}/",
-                    "image_url":           (p.get("images") or [{}])[0].get("src") if p.get("images") else None,
+                    "image_url":           _woo_first_image(p),
                     "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                     "is_active":           True,
                 })
