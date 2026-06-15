@@ -1,0 +1,34 @@
+name: Khabar Weekly Rollup
+
+on:
+  schedule:
+    # Mondays 03:00 UTC — after the ISO week has fully closed, and clear of the
+    # daily scraper slots. Self-healing: each run rebuilds every week still in
+    # the raw window, so a missed Monday is corrected on the next run.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  rollup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run weekly rollup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -u rollup.py
