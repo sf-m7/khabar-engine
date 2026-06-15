@@ -1591,7 +1591,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 print(f"  ⚠️ [DeFacto][{cat_name}] Page {page_index} returned non-JSON body.")
                 break
 
-            items = data.get("Data", {}).get("DataLayer") or []
+            items = (data.get("Data") or {}).get("DataLayer") or []
             if not items:
                 items = data.get("DataLayer") or []
 
@@ -1842,7 +1842,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
 
             print(f"  [{cat_name}] Page {page_index} — {len(items)} items processed.")
 
-            raw_next = data.get("Data", {}).get("NextDataUrl") or data.get("NextDataUrl")
+            raw_next = (data.get("Data") or {}).get("NextDataUrl") or data.get("NextDataUrl")
             if raw_next:
                 next_url = raw_next
                 time.sleep(random.uniform(0.8, 1.5))
