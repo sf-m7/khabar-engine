@@ -2464,5 +2464,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  ⚠️ Post-run intelligence detection error: {e}")
 
-run_health_check(active_brands)
     print(f"\n🏁 All done. Total price changes this run: {total}")
