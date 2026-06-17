@@ -166,6 +166,8 @@ WEBSHARE_PROXY = {
 
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",        "engine": "lcw_proxy"},
+    {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
+    {"name": "esla",       "domain": "esla-store.com",           "engine": "shopify"},
     {"name": "town_team",  "domain": "www.townteam.com",         "engine": "shopify"},
     {"name": "ravin",      "domain": "shop.iravin.com",          "engine": "shopify"},
     {"name": "mens_club",  "domain": "mensclubcollection.com",   "engine": "shopify"},
@@ -175,8 +177,6 @@ BRANDS = [
     {"name": "2s_egypt",   "domain": "www.2segypt.com",          "engine": "shopify"},
     {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
-    {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
-    {"name": "esla",       "domain": "esla-store.com",           "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
