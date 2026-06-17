@@ -175,6 +175,8 @@ BRANDS = [
     {"name": "2s_egypt",   "domain": "www.2segypt.com",          "engine": "shopify"},
     {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
+    {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
+    {"name": "esla",       "domain": "esla-store.com",           "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
@@ -189,6 +191,8 @@ BRAND_DISPLAY = {
     "2s_egypt":   "2S Egypt",
     "andora":     "Andora",
     "cizaro":     "Cizaro",
+    "dalydress":  "Dalydress",
+    "esla":       "Esla",
     "mobaco":     "Mobaco",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
