@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v14
+# KHABAR — Scraper v14  (current: v14.18)
 # Built on v13. Changes:
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
@@ -133,6 +133,33 @@
 #         but a thumbnail. Replaced with _woo_first_image(), which handles list,
 #         dict, string, empty, and missing shapes without ever raising. The two
 #         lost products are recovered on the next run.
+#  v14.17 EGRESS REDUCTION — eliminated the redundant per-brand FOP read.
+#         load_products_with_fop() issued a SECOND full-catalog read of the
+#         products table for every brand on every run, purely to learn which
+#         products already had first_observed_price set. That information is
+#         already implied by the variant preload scrape_brand() runs at the top
+#         of every brand: any product that already has a variant row has been
+#         scraped before, so its first_observed_price was set on first sighting.
+#         We now add product_id to that existing preload SELECT and derive
+#         fop_done_ids from it IN MEMORY — removing one catalog-sized read per
+#         brand per run with zero behaviour change. The DB keeps its
+#         `WHERE first_observed_price IS NULL` guard, so the baseline still can
+#         never be overwritten. load_products_with_fop() is removed; the four
+#         engines now receive fop_done_ids as a parameter instead of loading it.
+#         Paired with cutting the Shopify schedule from 4x to 3x daily, this is
+#         the change that pulls monthly egress back under the 5 GB free-tier cap.
+#  v14.18 Shopify pagination switched from ?page=N to ?since_id cursor paging.
+#         Shopify's offset (?page=N) pagination is unreliable on large catalogs:
+#         a single transient empty page mid-stream made the loop conclude the
+#         catalog had ended and silently under-scrape (dalydress returned 1,272
+#         of its ~5,400 products on one run, leaving ~4,000 products unchecked
+#         for price drops and stockouts that run). since_id asks the API for
+#         "products with id greater than X", advancing past the highest id seen
+#         each page, so it cannot skip or stall. A one-shot empty-page re-check
+#         guards against a transient empty 200 ending the crawl early, and a
+#         variant-less page now advances the cursor instead of breaking. No
+#         data-shape change — only WHICH products get seen, and now it's all of
+#         them. LCW / DeFacto / WooCommerce paging is untouched (different APIs).
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -520,46 +547,11 @@ def load_last_prices(supabase, brand_name):
         offset += 1000
     return prices
 
-def load_products_with_fop(supabase, brand_name):
-    """
-    Returns the set of product_ids for this brand whose first_observed_price
-    column is already populated.
-
-    Why this exists (v14.14):
-      Each engine used to issue an idempotent UPDATE for every product on every
-      run:
-          UPDATE products SET first_observed_price = $1
-          WHERE id = $2 AND first_observed_price IS NULL
-      The WHERE clause meant the server correctly no-op'd already-seeded rows,
-      so the BASELINE never got overwritten — that part stays unchanged. But
-      the network round-trip happened anyway. Across all 12 brands that
-      compounded to roughly 31,000 wasted calls per scrape run, adding minutes
-      of wall-clock time and Supabase load for zero database effect.
-
-      This helper loads the "already seeded" set ONCE per brand, into memory.
-      Each engine then checks membership before calling Supabase, and adds the
-      product_id to the set after a real write so the same row can't be hit
-      twice within the same run if it appears on multiple catalog pages.
-
-    Returns: set[int] of product.id values.
-    """
-    fop_ids = set()
-    offset  = 0
-    while True:
-        result = safe_db_execute(
-            supabase.table("products")
-            .select("id, first_observed_price")
-            .eq("brand", brand_name)
-            .range(offset, offset + 999)
-        )
-        rows = (result.data or []) if result else []
-        for r in rows:
-            if r.get("first_observed_price") is not None:
-                fop_ids.add(r["id"])
-        if len(rows) < 1000:
-            break
-        offset += 1000
-    return fop_ids
+# NOTE (v14.17): load_products_with_fop() was REMOVED here. It used to issue a
+# second full-catalog read of the products table per brand per run just to learn
+# which products already had first_observed_price. scrape_brand() now derives that
+# set (fop_done_ids) for free from the variant preload it already runs, and passes
+# it into each engine. See the v14.17 changelog entry at the top of the file.
 
 def product_repr_price(records):
     """
@@ -608,6 +600,9 @@ def sync_snapshot_price(supabase, db_pid, today, price):
     day re-compares the new price against the stale baseline and re-fires the
     same "down" event. Updating the snapshot to the latest price after each real
     change makes the baseline track reality, so the drop is recorded once.
+
+    This is ALSO what makes "the last run of the day = the day's close": whichever
+    run touches a product last writes the price the weekly aggregation rolls up.
     """
     safe_db_execute(
         supabase.table("price_snapshots")
@@ -636,13 +631,15 @@ def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
 
 # ── Shopify Scraper ───────────────────────────────────────────────────────────
 
-def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state):
-    page, products_seen, price_changes = 1, 0, 0
+def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
+    products_seen, price_changes = 0, 0
+    since_id, page = 0, 0   # v14.18: cursor pagination instead of ?page=N
     prev_prices = load_last_prices(supabase, brand_name)
-    # v14.14: track which products already have first_observed_price so we can
-    # skip the no-op UPDATE round-trip. This is read once and mutated locally
-    # as new products get seeded — never read back from the DB mid-run.
-    fop_done_ids = load_products_with_fop(supabase, brand_name)
+    # v14.17: fop_done_ids is passed in from scrape_brand (derived from the
+    # variant preload we already load). The separate load_products_with_fop()
+    # full-catalog read per brand per run is gone. The set is still mutated
+    # locally as new products get seeded so the same row can't be written twice
+    # if it appears on multiple catalog pages.
     existing_snapshot_ids = set()
     _snap_offset = 0
     while True:
@@ -660,17 +657,31 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         _snap_offset += 1000
     print(f"  {len(existing_snapshot_ids)} snapshots already exist for today.")
 
+    # v14.18: cursor (since_id) pagination — see header note. Replaces ?page=N,
+    # which silently under-scraped large catalogs when a transient empty page
+    # made the loop think the catalog had ended.
+    empty_confirm = False
     while True:
-        url = f"https://{domain}/products.json?limit=250&page={page}"
+        url = f"https://{domain}/products.json?limit=250&since_id={since_id}"
         try:
             response = execute_with_retry(session.get, url, timeout=30,
                                           headers={"User-Agent": "Mozilla/5.0"})
         except Exception as e:
-            print(f"  ⚠️ HTTP fault on page {page}: {e}")
+            print(f"  ⚠️ HTTP fault after id {since_id}: {e}")
             break
         if response.status_code != 200: break
         products = response.json().get("products", [])
-        if not products: break
+        if not products:
+            # since_id can't skip ahead, so an empty page is normally the true
+            # end of the catalog — but confirm once before trusting it, so a
+            # transient empty 200 can't end the crawl early.
+            if not empty_confirm:
+                empty_confirm = True
+                time.sleep(3)
+                continue
+            break
+        empty_confirm = False
+        page += 1
 
         batch_products = []
         for p in products:
@@ -689,7 +700,11 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                 "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                 "is_active":           True,
             })
-        if not batch_products: break
+        if not batch_products:
+            # v14.18: a page of variant-less products is NOT the end of the
+            # catalog — advance the cursor and keep going instead of breaking.
+            since_id = max(int(p["id"]) for p in products)
+            continue
 
         product_upsert_rows = []
         for i in range(0, len(batch_products), 100):
@@ -703,9 +718,9 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         for p in products:
             db_pid = product_id_map.get(str(p["id"]))
             if not db_pid: continue
-            # v14.14: skip if this product already has a baseline. The DB still
-            # has the IS NULL guard as a belt-and-braces safety net, but cutting
-            # the network call is where the time saving lives.
+            # v14.17: skip if this product already has a baseline (membership in
+            # fop_done_ids, now passed in). The DB still has the IS NULL guard as
+            # a belt-and-braces safety net, but cutting the call is the saving.
             if db_pid in fop_done_ids: continue
             first_variant_price = None
             for v in p.get("variants", []):
@@ -820,8 +835,8 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                     sync_snapshot_price(supabase, db_pid, today, curr_price)
 
         print(f"  Page {page} — {len(batch_products)} products processed.")
+        since_id = max(int(p["id"]) for p in products)   # v14.18: advance cursor past highest id
         time.sleep(1)
-        page += 1
     return products_seen, price_changes
 
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
@@ -1035,16 +1050,16 @@ def _parse_lcw_price(v):
     s = "".join(c for c in str(v) if c.isdigit() or c == ".")
     return float(s) if s else 0.0
 
-def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
+def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
     print(f"  [LCW] Proxy configured: {WEBSHARE_PROXY is not None}")
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
-    # v14.14: see load_products_with_fop. LCW carries the biggest gain because
-    # its catalog is ~5,000 products and ran once daily — that's 5,000 wasted
-    # network calls per run, every run, all of which were no-ops on the server.
-    fop_done_ids = load_products_with_fop(supabase, brand_name)
+    # v14.17: fop_done_ids is passed in from scrape_brand (derived from the
+    # variant preload). LCW carried the biggest gain from gating these no-op
+    # writes — ~5,000 products once daily — and now it doesn't even need the
+    # separate full-products read to do it.
     existing_snapshot_ids = set()
     _snap_offset = 0
     while True:
@@ -1175,8 +1190,9 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state):
             for item in items:
                 db_pid = product_id_map.get(str(item.get("ModelId")))
                 if not db_pid: continue
-                # v14.14: skip already-seeded products — the DB still enforces
-                # the IS NULL guard, but the network call no longer happens.
+                # v14.17: skip already-seeded products — fop_done_ids is passed
+                # in; the DB still enforces the IS NULL guard, but the network
+                # call no longer happens.
                 if db_pid in fop_done_ids: continue
                 is_disc  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
                 disc_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
@@ -1521,7 +1537,7 @@ def fetch_defacto_sizes_batch(session, domain, long_codes):
         print(f"  ⚠️ [DeFacto] CombinProduct batch error: {e}")
         return {}
 
-def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state):
+def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     """
     Scrapes DeFacto Egypt via the PartialIndexScrollResult API.
     """
@@ -1529,8 +1545,8 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
-    # v14.14: skip the no-op FOP write for products already seeded.
-    fop_done_ids = load_products_with_fop(supabase, brand_name)
+    # v14.17: fop_done_ids passed in from scrape_brand (derived from the variant
+    # preload) — the separate load_products_with_fop() read is gone.
     existing_snapshot_ids = set()
     _snap_offset = 0
     while True:
@@ -1662,7 +1678,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 db_pid = product_id_map.get(item.get("LongCode"))
                 if not db_pid:
                     continue
-                # v14.14: skip already-seeded products.
+                # v14.17: skip already-seeded products (fop_done_ids passed in).
                 if db_pid in fop_done_ids:
                     continue
                 disc_price = float(item.get("DiscountedPrice") or 0)
@@ -2001,7 +2017,7 @@ def _woo_extract_sizes_colors(product):
     color = colors[0] if len(colors) == 1 else None
     return sizes, color
 
-def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state):
+def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     """
     Scrapes a WooCommerce store via the public Store API.
     """
@@ -2010,8 +2026,8 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
     PER_PAGE = 100
 
     prev_prices = load_last_prices(supabase, brand_name)
-    # v14.14: skip the no-op FOP write for products already seeded.
-    fop_done_ids = load_products_with_fop(supabase, brand_name)
+    # v14.17: fop_done_ids passed in from scrape_brand (derived from the variant
+    # preload) — the separate load_products_with_fop() read is gone.
     existing_snapshot_ids = set()
     _snap_offset = 0
     while True:
@@ -2110,7 +2126,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 db_pid = product_id_map.get(str(p.get("id")))
                 if not db_pid:
                     continue
-                # v14.14: skip already-seeded products.
+                # v14.17: skip already-seeded products (fop_done_ids passed in).
                 if db_pid in fop_done_ids:
                     continue
                 prices = p.get("prices") or {}
@@ -2271,11 +2287,25 @@ def scrape_brand(brand_name, domain):
                 print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
                 return 0
 
+        # This single paginated read is the biggest egress line item, so as of
+        # v14.17 it does DOUBLE duty:
+        #   prev_stock_state — per-SKU stock/baseline for change & stockout detection
+        #   fop_done_ids     — the set of product_ids already present in the DB
+        #
+        # fop_done_ids replaces the old load_products_with_fop() call, which was a
+        # SEPARATE full-catalog read of the products table per brand per run. A
+        # product that already has a variant row here has been scraped before, so
+        # its products.first_observed_price was set on first sighting — making
+        # membership in this set a safe "already seeded" signal. The DB keeps its
+        # `WHERE first_observed_price IS NULL` guard, so the honest baseline can
+        # never be overwritten even in an edge case. product_id was added to the
+        # SELECT purely to make this derivation possible (one extra small column
+        # vs. an entire second catalog read — a clear net egress win).
         all_variant_rows, offset = [], 0
         while True:
             chunk = safe_db_execute(
                 supabase.table("product_variants")
-                .select("external_sku, is_in_stock, size, color, first_observed_price, last_updated_at, products!inner(brand)")
+                .select("product_id, external_sku, is_in_stock, size, color, first_observed_price, last_updated_at, products!inner(brand)")
                 .eq("products.brand", brand_name)
                 .range(offset, offset + 999)
             )
@@ -2284,19 +2314,20 @@ def scrape_brand(brand_name, domain):
             if len(rows) < 1000: break
             offset += 1000
         prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
+        fop_done_ids     = {row["product_id"] for row in all_variant_rows if row.get("product_id")}
 
         if brand_config["engine"] == "shopify":
-            seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state)
+            seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         elif brand_config["engine"] == "lcw_proxy":
             if not WEBSHARE_PROXY:
                 print("  ⚠️ WEBSHARE credentials not set. Skipping LCW.")
                 seen, changes = 0, 0
             else:
-                seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state)
+                seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         elif brand_config["engine"] == "defacto":
-            seen, changes = scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state)
+            seen, changes = scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         elif brand_config["engine"] == "woocommerce":
-            seen, changes = scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state)
+            seen, changes = scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         else:
             seen, changes = 0, 0
 
