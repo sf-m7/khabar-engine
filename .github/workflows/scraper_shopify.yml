@@ -2,23 +2,18 @@ name: Khabar Shopify Scraper
 
 on:
   schedule:
-    # 3x daily (reduced from 4x) — trims ~25% of the per-run database egress.
-    # Times are UTC. The LAST run (20:00 UTC ≈ 23:00 Cairo) is the day's "close":
-    # each day's snapshot keeps the LATEST price it sees (sync_snapshot_price),
-    # so whatever this final run records becomes the end-of-day price that the
-    # weekly aggregation rolls up.
-    #
-    # Why 20:00 and not later: snapshot_date is the runner's UTC date, evaluated
-    # per brand mid-run. The last run is started early enough to finish well
-    # before the 00:00 UTC rollover, so a long run never splits one day's
-    # snapshots across two calendar dates.
-    - cron: "0 4,12,20 * * *"
+    # No-proxy group: all Shopify brands + DeFacto + Mobaco (WooCommerce).
+    # Four runs daily at 01:00, 07:00, 13:00, 18:00 UTC.
+    # The LAST run is 18:00 UTC = 21:00 Cairo (EEST), pulled back from 19:00 so
+    # that GitHub scheduler delay can't push the end-of-day capture past Cairo
+    # midnight. These brands cost zero proxy bandwidth, so run frequency is free.
+    - cron: "0 1,7,13,18 * * *"
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 180
     steps:
       - name: Pull the code
         uses: actions/checkout@v4
@@ -34,13 +29,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # SCRAPE_TARGET=shopify runs the no-proxy group: all Shopify brands plus
-      # DeFacto and Mobaco (WooCommerce). LC Waikiki runs on its own proxied
-      # workflow (scraper_lcw.yml) and is untouched by this change.
-      - name: Run scraper (Shopify + DeFacto + WooCommerce group)
+      - name: Run Shopify + DeFacto + WooCommerce scraper
         env:
-          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          SCRAPE_TARGET:      shopify
+          SCRAPE_TARGET: shopify
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
