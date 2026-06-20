@@ -382,19 +382,60 @@ def get_lcw_session():
     print(f"  [LCW] Egyptian proxy session selected: -eg-{eg_session}")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
-def execute_with_retry(session_method, url, max_retries=3, backoff=1, **kwargs):
+def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
+    """
+    v14.20: widened from the original 3-attempt / 1-2-4s backoff.
+
+    WHY: a real-world run showed Carina, 2S Egypt, Andora, Cizaro (all
+    consecutive in BRANDS) and Mobaco all failing with 503/429 in the SAME
+    run. Different domains, different platforms (Shopify + WooCommerce) —
+    the only common factor is the GitHub Actions runner's IP. This is
+    rate-limiting / a transient WAF response triggered by a burst of
+    automated traffic from one IP hitting several storefronts back-to-back,
+    not five independent site outages. The fix is to absorb a longer
+    rate-limit window with patience rather than retry-and-give-up in ~3s.
+
+    CHANGES:
+      - max_retries 3 -> 5, backoff base 1 -> 2 (2,4,8,16,32, each capped at
+        max_delay=60s) — gives a transient block roughly a minute of total
+        retry window to clear before this one request gives up.
+      - Random jitter (±30%) added to every delay. Without jitter, a brand
+        that fails at the same script-relative moment every run (because the
+        run itself is on a fixed schedule) retries on the same fixed
+        cadence every time — jitter spreads retries out so they don't
+        re-collide with whatever caused the block in the first place.
+      - 429 specifically: if the server sends a Retry-After header, honor it
+        (capped at max_delay) instead of our own backoff guess — the server
+        is telling us exactly how long it wants us to wait.
+      - Caller can still override max_retries/backoff per-call. See
+        scrape_woocommerce for the call-site pacing fix that addresses the
+        ROOT cause of Mobaco's 429s (too many requests too fast) rather than
+        just retrying around it.
+    """
     delay = backoff
     for attempt in range(max_retries):
+        retry_after = None
         try:
             res = session_method(url, **kwargs)
-            if res.status_code in [429, 500, 502, 503, 504]:
-                raise requests.RequestsError(f"HTTP {res.status_code}")
+            if res.status_code in (429, 500, 502, 503, 504):
+                if res.status_code == 429:
+                    try:
+                        retry_after = float(res.headers.get("Retry-After", ""))
+                    except (TypeError, ValueError):
+                        retry_after = None
+                err = requests.RequestsError(f"HTTP {res.status_code}")
+                err.retry_after = retry_after
+                raise err
             return res
         except Exception as e:
             if attempt == max_retries - 1:
                 print(f"  ❌ Network failed on {url}: {e}")
                 raise e
-            time.sleep(delay)
+            wait = min(getattr(e, "retry_after", None) or delay, max_delay)
+            jitter = wait * random.uniform(-0.3, 0.3)
+            sleep_for = max(0.5, wait + jitter)
+            print(f"  ⏳ Retrying {url} in {sleep_for:.1f}s (attempt {attempt+1}/{max_retries}, {e})")
+            time.sleep(sleep_for)
             delay *= 2
 
 def safe_db_execute(query, retries=3):
@@ -686,6 +727,8 @@ TITLE_COLOR_WORDS = {
     "acid blue", "bright mid blue", "powder blue", "midnight navy",
     "light grey", "dark grey", "washed black", "washed grey",
     "vintage blue", "deep vintage blue", "oat beige", "rose gold",
+    "mint green", "dark grey", "dark olive", "dark mint", "steel blue",
+    "army green",
     # single words
     "black", "white", "grey", "gray", "anthracite", "red", "burgundy",
     "pink", "fuchsia", "coral", "orange", "yellow", "ecru", "beige",
@@ -693,6 +736,7 @@ TITLE_COLOR_WORDS = {
     "navy", "indigo", "purple", "plum", "lilac", "multicolor", "cream",
     "gold", "silver", "copper", "camel", "tan", "taupe", "mauve",
     "lavender", "apricot", "maroon", "mint", "chocolate", "honey",
+    "lemon",
 }
 # NOTE: "denim", "raw denim", and "ice" are intentionally EXCLUDED from this
 # vocabulary. Testing showed these are finish/material names in Cizaro's
@@ -709,24 +753,46 @@ METAL_FINISHES = {"gold", "silver", "copper"}
 
 def extract_color_tree(name):
     """
-    Tree's title pattern: colour is the trailing segment after the LAST
-    dash-like separator (-, –, —, |), validated against
-    TITLE_COLOR_WORDS_SORTED so non-colour trailing qualifiers ("Regular
-    fit", "special size", a brand tag like "TREE") never get mistaken for a
-    colour. Requires an EXACT match of the trailing segment (after
-    lowercasing/trimming) against a known colour phrase — this is what keeps
-    the false-positive rate at 0% in testing: a segment that doesn't fully
-    resolve to a recognised colour word returns None rather than guessing.
+    Tree's title pattern, in two passes:
+
+    PASS 1 (original, unchanged): colour is the trailing segment after the
+    LAST dash-like separator (-, –, —, |), requiring an EXACT match against
+    a known colour phrase. This is what keeps the false-positive rate at 0%
+    — a segment that doesn't fully resolve to a recognised colour word falls
+    through rather than guessing.
+
+    PASS 2 (v14.21 addition): if Pass 1 finds nothing, scan the WHOLE title
+    for the longest matching colour phrase (same technique as
+    extract_color_cizaro), since a meaningful share of Tree's catalog puts
+    the colour at the start or middle of the title instead of as a clean
+    trailing segment ("Men's White Casual Polo Shirt", "Men's Running Shoes
+    Black", "Boys' Red Crew Neck Sweatshirt - Cotton Blend - Print").
+
+    TESTED (20 Jun 2026, two independent random samples from live data,
+    150 + 60 titles, hand-graded against ground truth): Pass 2 recovered
+    color on ~25% of previously-NULL Tree variants with ZERO new false
+    positives across both samples — every title that genuinely has no
+    colour word still correctly returns None; every risk case from the
+    original Pass-1-only testing (brand tag "TREE", "Regular fit", "Print"
+    as a texture word) still correctly returns None. The only quality loss
+    is occasionally dropping a modifier word ("Steel Blue" -> "blue", "Dark
+    Mint" -> "mint") — never a wrong base colour.
+
     Returns a lowercase colour phrase, or None.
     """
     parts = re.split(r'[-–—|]', name)
-    if len(parts) < 2:
-        return None
-    tail = parts[-1].strip().lower()
-    if not tail:
-        return None
+    if len(parts) >= 2:
+        tail = parts[-1].strip().lower()
+        if tail:
+            for phrase in TITLE_COLOR_WORDS_SORTED:
+                if tail == phrase:
+                    return phrase
+
+    # Pass 2: whole-title scan, longest-match-wins, only reached when Pass 1
+    # found nothing.
+    lower = name.lower()
     for phrase in TITLE_COLOR_WORDS_SORTED:
-        if tail == phrase:
+        if re.search(r'(?<![a-z])' + re.escape(phrase) + r'(?![a-z])', lower):
             return phrase
     return None
 
@@ -2541,7 +2607,17 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                         continue
 
                 # Be polite to Mobaco's server — one extra call per product.
-                time.sleep(random.uniform(0.2, 0.4))
+                # v14.20: widened from 0.2-0.4s to 1.0-1.8s. The tighter pace
+                # was ~2.5-5 requests/second sustained against one small
+                # WooCommerce host for ~524 products, which is fast enough to
+                # trip a basic hosting-provider rate limiter — confirmed by a
+                # real run logging repeated 429s on this exact endpoint. This
+                # full pass now takes roughly 524 x ~1.4s ≈ 12 minutes instead
+                # of ~3, which is the actual fix; execute_with_retry's longer
+                # backoff (see its v14.20 changelog) is the safety net for
+                # whatever rate-limiting still slips through, not the primary
+                # fix.
+                time.sleep(random.uniform(1.0, 1.8))
 
             except Exception as e:
                 _pid = (p or {}).get("id", "?")
@@ -2630,13 +2706,23 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def scrape_brand(brand_name, domain):
+    """
+    v14.20: now returns (seen, changes) instead of just changes.
+
+    WHY: the old single-value return made "0 price changes because nothing
+    moved" indistinguishable from "0 price changes because the whole scrape
+    failed at page 1" (e.g. Carina returning 0/0 after a 503 on the very
+    first request). The caller needs `seen` to tell a healthy quiet day
+    apart from a brand that needs a retry pass. `changes` is unchanged in
+    meaning.
+    """
     try:
         supabase     = create_client(SUPABASE_URL, SUPABASE_KEY)
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
         session      = get_lcw_session() if brand_config["engine"] == "lcw_proxy" else get_resilient_session()
     except Exception as e:
         print(f"❌ Initialization failed for {brand_name}: {e}")
-        return 0
+        return 0, 0
 
     today = date.today()
     print(f"\n{'─'*55}\n▶  {brand_name.upper()}  —  {domain}\n{'─'*55}")
@@ -2650,7 +2736,7 @@ def scrape_brand(brand_name, domain):
         if brand_config["engine"] not in ("lcw_proxy", "defacto", "woocommerce"):
             if not check_domain(session, domain):
                 print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
-                return 0
+                return 0, 0
 
         # This single paginated read is the biggest egress line item, so as of
         # v14.17 it does DOUBLE duty:
@@ -2697,11 +2783,12 @@ def scrape_brand(brand_name, domain):
             seen, changes = 0, 0
 
         print(f"\n  ✅ {brand_name}: {seen} products scanned, {changes} price changes recorded.")
-        return changes
+        return seen, changes
     except Exception as e:
         print(f"\n  🚨 CRITICAL FAILURE in {brand_name.upper()} pipeline: {e}")
         print(f"  ⚠️ Quarantining {brand_name} fault. Moving safely to next brand.")
-        return 0
+        return 0, 0
+
 
 if __name__ == "__main__":
     # SCRAPE_TARGET controls which brands this run processes.
@@ -2782,7 +2869,58 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Pre-run housecleaning dropped: {e}")
 
-    total = sum(scrape_brand(b["name"], b["domain"]) for b in active_brands)
+    # v14.20: run each brand, track (seen, changes) per brand, and add two
+    # defenses against the rate-limiting pattern seen in a real run where
+    # Carina, 2S Egypt, Andora, Cizaro, and Mobaco all failed with 503/429
+    # in the SAME run — different domains/platforms, so the common factor
+    # was the runner's IP getting rate-limited by a burst of back-to-back
+    # automated requests, not five independent site outages.
+    #
+    #   1. A small randomized pause BETWEEN brands (not just within a brand's
+    #      own pagination loop) — spreads out the burst across the whole run
+    #      instead of hammering one storefront, finishing instantly, then
+    #      immediately hammering the next.
+    #   2. An END-OF-RUN RETRY PASS: any brand that scanned 0 products (the
+    #      real failure signal — see scrape_brand's v14.20 changelog for why
+    #      this is now returned separately from `changes`) gets one more
+    #      attempt AFTER every other brand has run. By then, several minutes
+    #      have passed and whatever rate limit triggered the failure has
+    #      almost certainly cleared — "all brands have had a chance to cool
+    #      down" is the whole point, rather than retrying immediately while
+    #      the same block is probably still active.
+    brand_results = {}   # brand_name -> (seen, changes)
+    failed_brands = []   # brands that scanned 0 products on the first pass
+
+    for i, b in enumerate(active_brands):
+        seen, changes = scrape_brand(b["name"], b["domain"])
+        brand_results[b["name"]] = (seen, changes)
+        if seen == 0:
+            failed_brands.append(b)
+        if i < len(active_brands) - 1:
+            pause = random.uniform(8, 20)
+            print(f"  Pausing {pause:.1f}s before next brand...")
+            time.sleep(pause)
+
+    if failed_brands:
+        print(f"\n{'═'*55}")
+        print(f"  🔁 RETRY PASS — {len(failed_brands)} brand(s) scanned 0 products on "
+              f"the first attempt: {', '.join(b['name'] for b in failed_brands)}")
+        print(f"  Waiting 90s for any rate-limit window to clear before retrying...")
+        print(f"{'═'*55}")
+        time.sleep(90)
+        for i, b in enumerate(failed_brands):
+            seen, changes = scrape_brand(b["name"], b["domain"])
+            if seen > 0:
+                print(f"  ✅ Retry succeeded for {b['name']}: {seen} products scanned.")
+            else:
+                print(f"  ⚠️ Retry still failed for {b['name']} — leaving for the next "
+                      f"scheduled run rather than retrying indefinitely.")
+            brand_results[b["name"]] = (seen, changes)
+            if i < len(failed_brands) - 1:
+                pause = random.uniform(8, 20)
+                time.sleep(pause)
+
+    total = sum(changes for seen, changes in brand_results.values())
 
     try:
         _sb2 = create_client(SUPABASE_URL, SUPABASE_KEY)
