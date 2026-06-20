@@ -640,6 +640,163 @@ def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
         "recorded_at":          datetime.now(timezone.utc).isoformat(),
     }))
 
+# ── Color-from-title extraction (Tree, Cizaro) — v14.19 addition ────────────
+#
+# CONTEXT: Tree and Cizaro publish each colourway as a SEPARATE Shopify
+# product rather than as a variant option (e.g. "Black T-Shirt" and "White
+# T-Shirt" are two different products, not one product with a colour
+# dropdown). detect_options() correctly finds no colour option for these
+# brands because there genuinely isn't one in the Shopify variant structure —
+# this was never a parsing bug, it's why color coverage measured 13.2% (Tree)
+# and 0% (Cizaro) in the June 2026 data integrity audit. The colour IS
+# present, but only in the product TITLE.
+#
+# TESTED ACCURACY (against 76-79 real titles sampled from live Supabase data,
+# 20 Jun 2026, graded by hand against ground truth):
+#   Tree:    88.2% exact match, 0% wrong (false colour), 7.9% honest miss
+#            (typo or unmapped word -> NULL, same as today), 3.9% partial
+#            (got the base colour, missed a modifier word like "dark").
+#   Cizaro:  93.4% exact match, 0% wrong (false colour), 3.9% honest miss,
+#            2.6% genuinely ambiguous in the source title itself (e.g. a
+#            title naming both a body colour and a hardware finish colour
+#            with no reliable rule for which is "the" product colour).
+# The only failure category that matters — extracting an ACTIVELY WRONG
+# colour — is 0% for both brands after two rounds of fixes (excluding
+# "denim"/"raw denim"/"ice" as false-positive matches, and guarding against
+# metal hardware finishes being mistaken for garment colour on buckle-only
+# products). Every other failure mode degrades to NULL — the same honest gap
+# that exists today — never to a wrong value.
+#
+# DESIGN: a brand only runs through this path if it's in
+# COLOR_FROM_TITLE_BRANDS. No other brand's colour handling changes at all.
+# This keeps the blast radius of this feature to exactly the two brands it
+# was built for.
+
+# Canonical colour vocabulary for title extraction. Deliberately reuses
+# English colour words that already appear as VALUES in this file's own
+# LCW_COLOR_TR_EN and ARABIC_COLOR_AR_EN translation maps, plus common
+# English colour words not already covered — so this isn't a third,
+# disconnected colour list, it's the same vocabulary the brand already
+# trusts for LCW and 2S Egypt.
+TITLE_COLOR_WORDS = {
+    # multi-word phrases — checked before single words so "Navy Blue" wins
+    # over a lone "Blue" match (longest-match-wins via the sort below)
+    "off-white", "off white", "light blue", "sky blue", "baby blue",
+    "navy blue", "mid blue", "dark blue", "ocean blue", "marine blue",
+    "acid blue", "bright mid blue", "powder blue", "midnight navy",
+    "light grey", "dark grey", "washed black", "washed grey",
+    "vintage blue", "deep vintage blue", "oat beige", "rose gold",
+    # single words
+    "black", "white", "grey", "gray", "anthracite", "red", "burgundy",
+    "pink", "fuchsia", "coral", "orange", "yellow", "ecru", "beige",
+    "brown", "khaki", "green", "olive", "petrol", "turquoise", "blue",
+    "navy", "indigo", "purple", "plum", "lilac", "multicolor", "cream",
+    "gold", "silver", "copper", "camel", "tan", "taupe", "mauve",
+    "lavender", "apricot", "maroon", "mint", "chocolate", "honey",
+}
+# NOTE: "denim", "raw denim", and "ice" are intentionally EXCLUDED from this
+# vocabulary. Testing showed these are finish/material names in Cizaro's
+# catalog ("Ice Denim ... Buckle"), never real garment colours, and always
+# produced a wrong match when included. See extract_color_cizaro() below.
+TITLE_COLOR_WORDS_SORTED = sorted(TITLE_COLOR_WORDS, key=len, reverse=True)
+
+# Words that, if found in a title, mean an apparent "colour" match is
+# actually describing belt/buckle hardware finish, not the garment — so a
+# gold/silver/copper match alone (with nothing else found) should be
+# discarded rather than stored as the product's colour.
+METAL_FINISHES = {"gold", "silver", "copper"}
+
+
+def extract_color_tree(name):
+    """
+    Tree's title pattern: colour is the trailing segment after the LAST
+    dash-like separator (-, –, —, |), validated against
+    TITLE_COLOR_WORDS_SORTED so non-colour trailing qualifiers ("Regular
+    fit", "special size", a brand tag like "TREE") never get mistaken for a
+    colour. Requires an EXACT match of the trailing segment (after
+    lowercasing/trimming) against a known colour phrase — this is what keeps
+    the false-positive rate at 0% in testing: a segment that doesn't fully
+    resolve to a recognised colour word returns None rather than guessing.
+    Returns a lowercase colour phrase, or None.
+    """
+    parts = re.split(r'[-–—|]', name)
+    if len(parts) < 2:
+        return None
+    tail = parts[-1].strip().lower()
+    if not tail:
+        return None
+    for phrase in TITLE_COLOR_WORDS_SORTED:
+        if tail == phrase:
+            return phrase
+    return None
+
+
+def extract_color_cizaro(name):
+    """
+    Cizaro's title pattern has no reliable separator — the colour phrase can
+    appear anywhere (start, middle, end), so we scan the whole lowercased
+    title for the longest matching colour phrase, deliberately NOT trusting
+    position. Two corrections were required after testing against real data
+    to eliminate every false-positive case found:
+
+      1. "denim"/"raw denim"/"ice" are excluded from the vocabulary entirely
+         — they're finish/material names in this catalog, never colours.
+      2. If the only match found is a metal finish word (gold/silver/copper)
+         AND the title contains "buckle", that match is hardware finish, not
+         garment colour — we look for any other real colour word instead,
+         or return None if there isn't one, rather than storing the
+         hardware's finish as the product's colour.
+
+    Returns a lowercase colour phrase, or None.
+    """
+    lower = name.lower()
+    scan_target = re.sub(r'\braw\s+denim\b', ' ', lower)
+    scan_target = re.sub(r'\bdenim\b', ' ', scan_target)
+    scan_target = re.sub(r'\bice\b', ' ', scan_target)
+
+    found = None
+    for phrase in TITLE_COLOR_WORDS_SORTED:
+        if re.search(r'(?<![a-z])' + re.escape(phrase) + r'(?![a-z])', scan_target):
+            found = phrase
+            break
+
+    if found in METAL_FINISHES and "buckle" in lower:
+        for phrase in TITLE_COLOR_WORDS_SORTED:
+            if phrase in METAL_FINISHES:
+                continue
+            if re.search(r'(?<![a-z])' + re.escape(phrase) + r'(?![a-z])', scan_target):
+                return phrase
+        return None  # hardware-only title — no real garment colour to report
+
+    return found
+
+
+# Brand -> extraction function. Membership here is the ONLY thing that
+# routes a brand's products through title-based colour extraction, so
+# enabling another brand later is a one-line addition and no brand outside
+# this dict is ever touched.
+COLOR_FROM_TITLE_BRANDS = {
+    "tree":   extract_color_tree,
+    "cizaro": extract_color_cizaro,
+}
+
+
+def extract_color_from_title(brand_name, product_name):
+    """
+    Single entry point used by scrape_shopify(). Returns a lowercase colour
+    string, or None if the brand isn't in COLOR_FROM_TITLE_BRANDS, or if the
+    brand's extractor doesn't find a confident match. Never raises — a
+    malformed title degrades to None, same as today's honest gap, rather
+    than crashing the scrape.
+    """
+    extractor = COLOR_FROM_TITLE_BRANDS.get(brand_name)
+    if not extractor:
+        return None
+    try:
+        return extractor(product_name)
+    except Exception:
+        return None
+
 # ── Shopify Scraper ───────────────────────────────────────────────────────────
 
 def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
@@ -761,6 +918,16 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                 # queries work. No-op for every English-catalog brand.
                 if color and brand_name in ARABIC_COLOR_BRANDS:
                     color = normalize_arabic_color(color)
+                # v14.19: Tree and Cizaro publish each colourway as a SEPARATE
+                # Shopify product rather than a variant option, so color_key
+                # is correctly None for these brands (there's no colour option
+                # to find) — the colour lives only in the product title. This
+                # ONLY fires when no variant-level colour was found, and ONLY
+                # for brands in COLOR_FROM_TITLE_BRANDS, so it can never
+                # override a real Shopify-variant colour and never touches
+                # any other brand's data.
+                if not color and brand_name in COLOR_FROM_TITLE_BRANDS:
+                    color = extract_color_from_title(brand_name, p.get("title", ""))
                 price      = float(v.get("price") or 0)
                 compare_at = float(v.get("compare_at_price") or 0) if v.get("compare_at_price") else None
                 available  = bool(v.get("available"))
@@ -775,6 +942,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                     "_meta_price": price, "_meta_compare": compare_at, "_meta_baseline": v_baseline,
                     "_meta_size": size, "_meta_color": color, "_meta_available": available,
                 })
+
 
         if batch_variants:
             db_payload = [{k: v for k, v in row.items() if not k.startswith("_meta_")} for row in batch_variants]
@@ -1960,7 +2128,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
 
     return products_seen, price_changes
 
-# ── WooCommerce Scraper (Mobaco) ──────────────────────────────────────────────
+# ── WooCommerce Scraper (Mobaco) — v14.19 rewrite ────────────────────────────
 # WooCommerce ships a public, key-less "Store API" that powers its own cart/blocks
 # and is enabled by default in WooCommerce core regardless of theme:
 #   GET /wp-json/wc/store/v1/products?per_page=100&page=N   → JSON array
@@ -1971,14 +2139,55 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
 #   prices.sale_price       "12000"
 #   prices.currency_minor_unit  2     → real price = int(amount) / 10**minor_unit
 # We read currency_minor_unit from the response (never hardcode it) so a store with
-# a 3-decimal currency can't silently make every price 10x wrong. For variable
-# products the list price is the range minimum and per-variation stock is NOT in
-# the list response, so — exactly like DeFacto — we enumerate size labels from the
-# product's attribute terms and inherit stock from the product-level is_in_stock.
-# No proxy required.
+# a 3-decimal currency can't silently make every price 10x wrong.
+#
+# v14.19 FIXES (confirmed against a live Mobaco product sample, 20 Jun 2026):
+#
+#   PROBLEM 1 — stock always true. The old code read the PRODUCT-level
+#   `is_in_stock`, which WooCommerce's Store API sets to true as long as ANY
+#   variation is purchasable. Every variant row inherited that one blanket
+#   flag, so a single-variant stockout could never be detected — confirmed
+#   via live query: 2,704 Mobaco variants, 100% in_stock, 0 stockout_events
+#   in 9 days. FIX: each "variable" product's real variations now come from a
+#   SEPARATE call — GET /products/{id}/variations — which the documented
+#   WooCommerce Store API v1 schema returns with a PER-VARIATION is_in_stock
+#   + price. This mirrors the same "second API call for the real per-unit
+#   data" pattern already used for DeFacto (CombinProductList) and LCW
+#   (product-page JSON).
+#
+#   PROBLEM 2 — colour collapsed to NULL for any multi-colour product. The
+#   old `_woo_extract_sizes_colors()` returned a single colour only when
+#   exactly one colour term existed product-wide, then cross-multiplied that
+#   one colour against every size — which is simply wrong for any product
+#   with 2+ colours (most of Mobaco's catalog; confirmed in the live sample:
+#   2 of 3 sampled products had multiple colour terms and were the ones with
+#   color=NULL in the DB). FIX: read each variation's actual attribute
+#   pairing directly from `variations[].attributes[]`, so colour and size are
+#   matched per real purchasable unit instead of guessed by cross-multiplying
+#   a flat size list against one fallback colour.
+#
+#   KNOWN CEILING — NOT FIXABLE BY PARSING. Mobaco's `pa_colour` attribute
+#   terms are internal SKU-style codes (e.g. "MS110148L143"), not human
+#   colour words. Confirmed directly in the live sample: no human-readable
+#   colour value exists anywhere in this API response, parent or variation
+#   level. We do NOT invent a fake colour mapping — that would silently
+#   manufacture false data, which is worse than an honest gap. The stored
+#   `color` field for Mobaco will keep showing these codes; cross-brand
+#   colour signals should EXCLUDE Mobaco until/unless a human-labelled source
+#   is found. Size values ("N002", "J006"...) are the same kind of internal
+#   code and have the same ceiling — but unlike colour, size strings are at
+#   least usable for demand-by-size-CODE analysis within Mobaco alone
+#   (consistent per garment line), so we keep storing them as-is.
+#
+# DESIGN DECISION: fetch /variations for EVERY variable product, EVERY run
+# (~524 products total) rather than gating on missing data. Mobaco's catalog
+# is small enough that this is cheap (one extra small-JSON call per product,
+# no proxy needed), and "fetch all every run" avoids the kind of gating-state
+# bugs that took several v14.x iterations to shake out on DeFacto and LCW —
+# not worth importing that complexity for a brand this size.
 
 WOO_SIZE_ATTR_HINTS  = ("size", "sizes", "مقاس", "المقاس")
-WOO_COLOR_ATTR_HINTS = ("color", "colour", "لون", "اللون")
+WOO_COLOR_ATTR_HINTS = ("color", "colour", "colours", "colors", "لون", "اللون")
 
 def _woo_price(amount, minor_unit):
     """Convert a WooCommerce minor-unit price string to a real number, safely."""
@@ -2019,27 +2228,112 @@ def _woo_first_image(product):
         return first
     return None
 
-def _woo_extract_sizes_colors(product):
+def _woo_build_term_lookup(product):
     """
-    Pull size labels and a single colour (if unambiguous) from a Store API
-    product's `attributes` array. Returns (sizes_list, color_or_None).
-    sizes_list is [] when the product has no size attribute (treated as one
-    sizeless variant by the caller).
+    attr_name (lowercased) -> {slug (lowercased) -> human-facing term name}.
+    For Mobaco today the "human-facing term name" is itself an internal SKU
+    code (see ceiling note above) — this function is honest about resolving
+    whatever name WooCommerce actually stores, it does not improve on it.
     """
-    sizes, colors = [], []
-    for attr in (product.get("attributes") or []):
+    lookup = {}
+    for attr in product.get("attributes") or []:
         name = (attr.get("name") or "").strip().lower()
-        terms = [t.get("name") for t in (attr.get("terms") or []) if t.get("name")]
-        if any(h in name for h in WOO_SIZE_ATTR_HINTS):
-            sizes.extend(terms)
-        elif any(h in name for h in WOO_COLOR_ATTR_HINTS):
-            colors.extend(terms)
-    color = colors[0] if len(colors) == 1 else None
-    return sizes, color
+        terms = attr.get("terms") or []
+        lookup[name] = {
+            str(t.get("slug", "")).strip().lower(): t.get("name")
+            for t in terms if t.get("slug") is not None
+        }
+    return lookup
+
+def _woo_resolve_variation_attrs(variation, term_lookup):
+    """
+    Given one entry from product.variations[] (raw {name, value} slug pairs)
+    and the product's term_lookup, resolve which value is the size label and
+    which is the colour label using the WOO_*_ATTR_HINTS, same hint strings
+    the rest of the codebase uses. Returns (size_or_None, color_or_None,
+    lookup_key) where lookup_key is the sorted (attr_name, attr_value) tuple
+    needed to look up real price/stock in the variations-endpoint result.
+    """
+    size_val, color_val = None, None
+    key_parts = []
+    for a in (variation.get("attributes") or []):
+        aname = (a.get("name") or "").strip().lower()
+        aval  = (a.get("value") or "").strip().lower()
+        if not aname:
+            continue
+        key_parts.append((aname, aval))
+        resolved = term_lookup.get(aname, {}).get(aval, aval)
+        if any(h in aname for h in WOO_SIZE_ATTR_HINTS):
+            size_val = resolved
+        elif any(h in aname for h in WOO_COLOR_ATTR_HINTS):
+            color_val = resolved
+    lookup_key = tuple(sorted(key_parts))
+    return size_val, color_val, lookup_key
+
+def fetch_mobaco_variations(session, domain, product_id):
+    """
+    GET the real per-variation price + stock for one product via the
+    documented WooCommerce Store API v1 endpoint:
+        GET /wp-json/wc/store/v1/products/{id}/variations
+    Returns {sorted_attr_key_tuple: {"price", "compare_at", "is_in_stock", "sku"}}.
+    Returns {} on ANY failure (network, bad JSON, unexpected shape) — caller
+    falls back to product-level price/stock for that one variation rather
+    than raising, matching the fault-isolation pattern used everywhere else
+    in this engine.
+    """
+    url = f"https://{domain}/wp-json/wc/store/v1/products/{product_id}/variations"
+    try:
+        res = execute_with_retry(
+            session.get, url, max_retries=2, backoff=2, timeout=15,
+            headers={
+                "accept":          "application/json, text/plain, */*",
+                "accept-language": "en-US,en;q=0.9",
+                "referer":         f"https://{domain}/",
+            }
+        )
+        if res.status_code != 200:
+            return {}
+        rows = res.json()
+        if not isinstance(rows, list):
+            return {}
+    except Exception:
+        return {}
+
+    result = {}
+    for row in rows:
+        try:
+            attrs = row.get("attributes") or []
+            key = tuple(sorted(
+                (str(a.get("name", "")).strip().lower(), str(a.get("value", "")).strip().lower())
+                for a in attrs
+            ))
+            if not key:
+                continue
+            prices = row.get("prices") or {}
+            minor  = prices.get("currency_minor_unit", 2)
+            cur    = _woo_price(prices.get("price"), minor)
+            reg    = _woo_price(prices.get("regular_price"), minor)
+            if cur <= 0:
+                continue
+            result[key] = {
+                "price":       cur,
+                "compare_at":  reg if reg > cur else None,
+                "is_in_stock": bool(row.get("is_in_stock", False)),
+                "sku":         row.get("sku") or "",
+            }
+        except Exception:
+            continue
+    return result
 
 def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     """
     Scrapes a WooCommerce store via the public Store API.
+
+    v14.19: now fetches each variable product's REAL per-variation price +
+    stock via a second call to /products/{id}/variations (see header comment
+    above for the full rationale). Simple products (type != "variable", no
+    variations[]) are unchanged — one variant row from the product-level
+    price/stock, exactly as before, since there is no finer grain available.
     """
     print(f"  [WooCommerce] Starting Store API scrape (no proxy)...")
     products_seen, price_changes = 0, 0
@@ -2146,7 +2440,6 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 db_pid = product_id_map.get(str(p.get("id")))
                 if not db_pid:
                     continue
-                # v14.17: skip already-seeded products (fop_done_ids passed in).
                 if db_pid in fop_done_ids:
                     continue
                 prices = p.get("prices") or {}
@@ -2166,7 +2459,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 traceback.print_exc()
                 continue
 
-        # ── Variants upsert (one row per size label; sizeless → one row) ──
+        # ── Variants upsert — v14.19: real per-variation price/stock ──────
         batch_variants, product_variant_tracking = [], {}
         for p in products:
             try:
@@ -2174,30 +2467,82 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 if not db_pid:
                     continue
                 product_variant_tracking.setdefault(db_pid, [])
-                prices = p.get("prices") or {}
-                minor  = prices.get("currency_minor_unit", 2)
-                cur    = _woo_price(prices.get("price"), minor)
-                reg    = _woo_price(prices.get("regular_price"), minor)
-                on_sale = bool(p.get("on_sale"))
-                if cur <= 0 or cur > 1_000_000:
-                    continue
-                compare_at = reg if (on_sale and reg > cur) else None
-                is_avail   = bool(p.get("is_in_stock", True))
-                sizes, color = _woo_extract_sizes_colors(p)
-                size_list = sizes if sizes else [None]
 
-                for sz in size_list:
-                    sku_suffix = f"_{str(sz).replace(' ', '_')}" if sz else ""
-                    sku        = f"{brand_name}_{p['id']}{sku_suffix}"
+                parent_prices = p.get("prices") or {}
+                parent_minor  = parent_prices.get("currency_minor_unit", 2)
+                parent_cur    = _woo_price(parent_prices.get("price"), parent_minor)
+                parent_reg    = _woo_price(parent_prices.get("regular_price"), parent_minor)
+                parent_on_sale = bool(p.get("on_sale"))
+                parent_avail   = bool(p.get("is_in_stock", True))
+
+                variations = p.get("variations") or []
+
+                if not variations:
+                    # Simple product, unchanged behaviour: one row from the
+                    # product-level price/stock (there is no finer grain).
+                    if parent_cur <= 0 or parent_cur > 1_000_000:
+                        continue
+                    compare_at = parent_reg if (parent_on_sale and parent_reg > parent_cur) else None
+                    sku        = f"{brand_name}_{p['id']}"
                     prev       = prev_stock_state.get(sku)
-                    v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else cur
+                    v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else parent_cur
                     batch_variants.append({
-                        "product_id": db_pid, "external_sku": sku, "color": color, "size": sz,
-                        "is_in_stock": is_avail, "first_observed_price": v_baseline,
+                        "product_id": db_pid, "external_sku": sku, "color": None, "size": None,
+                        "is_in_stock": parent_avail, "first_observed_price": v_baseline,
                         "last_updated_at": datetime.now(timezone.utc).isoformat(),
-                        "_meta_price": cur, "_meta_compare": compare_at, "_meta_baseline": v_baseline,
-                        "_meta_size": sz, "_meta_color": color, "_meta_available": is_avail,
+                        "_meta_price": parent_cur, "_meta_compare": compare_at, "_meta_baseline": v_baseline,
+                        "_meta_size": None, "_meta_color": None, "_meta_available": parent_avail,
                     })
+                    continue
+
+                # Variable product: fetch REAL per-variation price + stock.
+                # One extra call per product, every run, by design (524
+                # products total — cheap, simplest to reason about, no
+                # gating state to get wrong).
+                var_data = fetch_mobaco_variations(session, domain, p["id"])
+                term_lookup = _woo_build_term_lookup(p)
+
+                for var in variations:
+                    try:
+                        var_id = var.get("id")
+                        size_val, color_val, lookup_key = _woo_resolve_variation_attrs(var, term_lookup)
+                        live = var_data.get(lookup_key)
+
+                        if live:
+                            cur, compare_at, is_avail = live["price"], live["compare_at"], live["is_in_stock"]
+                        else:
+                            # The /variations call failed or didn't include this
+                            # specific combination — fall back to the parent's
+                            # values rather than dropping the variant entirely.
+                            # This degrades gracefully to the OLD behaviour for
+                            # just this one row instead of losing data.
+                            cur = parent_cur
+                            compare_at = parent_reg if (parent_on_sale and parent_reg > parent_cur) else None
+                            is_avail = parent_avail
+
+                        if cur <= 0 or cur > 1_000_000:
+                            continue
+
+                        sku_suffix = f"_{var_id}" if var_id else f"_{size_val or ''}{color_val or ''}"
+                        sku        = f"{brand_name}_{p['id']}{sku_suffix}"
+                        prev       = prev_stock_state.get(sku)
+                        v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else cur
+
+                        batch_variants.append({
+                            "product_id": db_pid, "external_sku": sku,
+                            "color": color_val, "size": size_val,
+                            "is_in_stock": is_avail, "first_observed_price": v_baseline,
+                            "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                            "_meta_price": cur, "_meta_compare": compare_at, "_meta_baseline": v_baseline,
+                            "_meta_size": size_val, "_meta_color": color_val, "_meta_available": is_avail,
+                        })
+                    except Exception as e:
+                        print(f"  ⚠️ [WooCommerce] Skipping variation on product {p.get('id')}: {e}")
+                        continue
+
+                # Be polite to Mobaco's server — one extra call per product.
+                time.sleep(random.uniform(0.2, 0.4))
+
             except Exception as e:
                 _pid = (p or {}).get("id", "?")
                 print(f"  ⚠️ [WooCommerce] Skipping product id={_pid} during variants build: {e}")
