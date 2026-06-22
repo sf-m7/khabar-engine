@@ -74,15 +74,40 @@ def archive_glob():
 
 
 def run_query(con, sql):
-    """Runs SQL where the table name `archive` means 'every Parquet file
-    currently in the folder, combined.' Returns rows as a list of dicts."""
+    """
+    Runs SQL where the table name `archive` means 'every Parquet file
+    currently in the folder, combined.' Returns (column_names, rows) —
+    deliberately using fetchall() + description rather than fetchdf().
+    fetchdf() pulls in pandas/numpy as a dependency for a conversion this
+    script doesn't actually need; fetchall() returns plain Python tuples
+    directly from DuckDB with nothing extra required, which removes that
+    whole category of "missing module" failure rather than chasing each
+    transitive dependency one at a time.
+    """
     full_sql = f"""
         WITH archive AS (
             SELECT * FROM read_parquet('{archive_glob()}')
         )
         {sql}
     """
-    return con.execute(full_sql).fetchdf()
+    result = con.execute(full_sql)
+    columns = [d[0] for d in result.description]
+    rows = result.fetchall()
+    return columns, rows
+
+
+def print_table(columns, rows):
+    """Plain-text table printer — no pandas needed just to display results
+    readably in a GitHub Actions log."""
+    if not rows:
+        print("   (no rows returned)")
+        return
+    widths = [max(len(str(c)), max((len(str(r[i])) for r in rows), default=0)) for i, c in enumerate(columns)]
+    header = "  ".join(str(c).ljust(w) for c, w in zip(columns, widths))
+    print("   " + header)
+    print("   " + "-" * len(header))
+    for r in rows:
+        print("   " + "  ".join(str(v).ljust(w) for v, w in zip(r, widths)))
 
 
 if __name__ == "__main__":
@@ -92,7 +117,7 @@ if __name__ == "__main__":
     # A first sanity query: how many rows are visible right now, and what
     # date range do they span. This works whether there's 1 file or 100.
     try:
-        summary = run_query(con, """
+        cols, rows = run_query(con, """
             SELECT
                 count(*)            AS total_rows,
                 count(DISTINCT brand) AS distinct_brands,
@@ -101,7 +126,7 @@ if __name__ == "__main__":
             FROM archive
         """)
         print("\n📦 Archive summary:")
-        print(summary.to_string(index=False))
+        print_table(cols, rows)
     except Exception as e:
         print(f"\n⚠️ Could not read the archive folder: {e}")
         print("   If this is the very first run and no files have landed yet,")
@@ -116,9 +141,9 @@ if __name__ == "__main__":
         # means "every Parquet file currently in the folder, combined."
         print(f"\n❓ Running your question:\n   {CUSTOM_QUERY}")
         try:
-            result = run_query(con, CUSTOM_QUERY)
+            cols, rows = run_query(con, CUSTOM_QUERY)
             print("\n📊 Result:")
-            print(result.to_string(index=False))
+            print_table(cols, rows)
         except Exception as e:
             print(f"\n⚠️ Your query failed: {e}")
             print("   Check the SQL — remember the table is always called `archive`,")
@@ -128,14 +153,14 @@ if __name__ == "__main__":
         # No question supplied — fall back to one more illustrative example
         # so the script still demonstrates something useful on its own.
         try:
-            by_brand = run_query(con, """
+            cols, rows = run_query(con, """
                 SELECT brand, count(*) AS rows, round(avg(price), 2) AS avg_price
                 FROM archive
                 GROUP BY brand
                 ORDER BY rows DESC
             """)
             print("\n📊 No question supplied — showing rows per brand as a default:")
-            print(by_brand.to_string(index=False))
+            print_table(cols, rows)
             print("\n   To ask your own question instead, supply it via the "
                   "ARCHIVE_QUERY_SQL input next time you run this.")
         except Exception as e:
