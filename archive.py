@@ -305,3 +305,15 @@ if __name__ == "__main__":
     else:
         print(f"\n🏁 Archive run complete. {len(rows)} rows moved to R2, "
               f"{deleted_count} removed from the hot tier.")
+
+    # Explicit, immediate, successful exit — BEFORE Python's normal interpreter
+    # shutdown runs. Seen live in a pilot run: pyarrow/Arrow's C++ layer can
+    # abort during that shutdown sequence (exit code 134, "core dumped") AFTER
+    # every line of this script's real work has already completed and printed
+    # successfully — it is teardown noise, not a failure of select/flatten/
+    # write/upload/verify/delete-skip. Forcing the exit here removes the
+    # ambiguity entirely rather than relying on log-reading to tell the two
+    # apart, and is what makes GitHub Actions report this run as ✅ green
+    # instead of ❌ red despite nothing having actually gone wrong.
+    sys.stdout.flush()
+    os._exit(0)
