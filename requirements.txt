@@ -2,3 +2,4 @@ curl_cffi>=0.7.0
 supabase>=2.3.0
 urllib3>=2.0.0
 httpx>=0.25.0
+psycopg2-binary>=2.9.0
