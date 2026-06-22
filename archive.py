@@ -45,9 +45,21 @@ R2_ACCOUNT_ID        = os.environ["R2_ACCOUNT_ID"]
 R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
 R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-ARCHIVE_THRESHOLD_DAYS = 35   # matches the hot window described in the
-                              # architecture report and the scraper's own
-                              # purge logic elsewhere in the codebase.
+ARCHIVE_THRESHOLD_DAYS = int(os.environ.get("ARCHIVE_THRESHOLD_DAYS_OVERRIDE", "35"))
+# Default is 35, matching the hot window described in the architecture
+# report and the scraper's own purge logic elsewhere in the codebase.
+# ARCHIVE_THRESHOLD_DAYS_OVERRIDE exists ONLY so a manual workflow_dispatch
+# run can pilot the full export -> upload -> verify pipeline against real
+# (but young) data before 35 real days have ever passed — see DRY_RUN below
+# for why this is still safe to do even with a shorter window.
+
+DRY_RUN = os.environ.get("ARCHIVE_DRY_RUN", "false").lower() == "true"
+# When true: every step runs for real EXCEPT the final delete — step 6 is
+# replaced with a print statement. This lets the riskiest, never-yet-tested
+# parts of this script (the actual R2 upload, the actual download-and-verify
+# readback) be exercised against real data with zero chance of deleting
+# anything, regardless of outcome. Intended for manual workflow_dispatch
+# pilot runs, never for the scheduled run.
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -228,10 +240,11 @@ def delete_archived_rows(snapshot_ids):
 
 
 if __name__ == "__main__":
-    print("🚀 Khabar cold archive starting...")
+    mode_label = "PILOT (dry run, no deletion)" if DRY_RUN else "PRODUCTION"
+    print(f"🚀 Khabar cold archive starting... mode={mode_label}")
     cutoff = date.today() - timedelta(days=ARCHIVE_THRESHOLD_DAYS)
     print(f"  Archiving price_snapshots older than {cutoff} "
-          f"({ARCHIVE_THRESHOLD_DAYS}-day hot window)...")
+          f"({ARCHIVE_THRESHOLD_DAYS}-day window{' — OVERRIDDEN for this pilot run' if DRY_RUN else ''})...")
 
     rows = fetch_aging_snapshot_ids(cutoff)
     if not rows:
@@ -254,8 +267,12 @@ if __name__ == "__main__":
     print(f"  Parquet file: {parquet_size_kb:.1f} KB for {len(flattened)} rows.")
 
     # One object per archive run, dated by the cutoff so files never collide
-    # and can be located later by the period they cover.
-    object_key = f"price_snapshots/{cutoff.isoformat()}_to_{rows[-1]['snapshot_date']}.parquet"
+    # and can be located later by the period they cover. Dry-run pilots are
+    # written under a separate prefix so they're trivially distinguishable
+    # from real archive files in the bucket — never mixed, easy to bulk-
+    # delete later once the pilot has served its purpose.
+    prefix = "_pilot_dry_run" if DRY_RUN else "price_snapshots"
+    object_key = f"{prefix}/{cutoff.isoformat()}_to_{rows[-1]['snapshot_date']}.parquet"
     print(f"  Uploading to R2 as: {object_key}")
     try:
         upload_to_r2(parquet_buf, object_key)
@@ -269,10 +286,22 @@ if __name__ == "__main__":
               "Will retry on the next scheduled run.")
         sys.exit(1)
 
-    snapshot_ids = [r["id"] for r in rows]
-    deleted_count = delete_archived_rows(snapshot_ids)
-    print(f"  🗑️  Deleted {deleted_count} rows from Supabase price_snapshots "
-          f"(verified present in R2 first).")
+    if DRY_RUN:
+        print(f"  🧪 DRY RUN — would have deleted {len(rows)} rows from "
+              f"Supabase price_snapshots (verified present in R2 first). "
+              f"Skipping the actual delete. Nothing in Supabase was touched.")
+        deleted_count = 0
+    else:
+        snapshot_ids = [r["id"] for r in rows]
+        deleted_count = delete_archived_rows(snapshot_ids)
+        print(f"  🗑️  Deleted {deleted_count} rows from Supabase price_snapshots "
+              f"(verified present in R2 first).")
 
-    print(f"\n🏁 Archive run complete. {len(rows)} rows moved to R2, "
-          f"{deleted_count} removed from the hot tier.")
+    if DRY_RUN:
+        print(f"\n🏁 Pilot run complete. {len(rows)} rows successfully round-tripped "
+              f"through export → R2 upload → verified readback. "
+              f"0 rows deleted (dry run). Pilot file is in R2 under _pilot_dry_run/ "
+              f"— safe to delete from the bucket once you've confirmed this worked.")
+    else:
+        print(f"\n🏁 Archive run complete. {len(rows)} rows moved to R2, "
+              f"{deleted_count} removed from the hot tier.")
