@@ -136,7 +136,7 @@
 #  v14.17 EGRESS REDUCTION — eliminated the redundant per-brand FOP read.
 #         load_products_with_fop() issued a SECOND full-catalog read of the
 #         products table for every brand on every run, purely to learn which
-#         products already had first_observed_price set. That information is
+#         products already had first_observed_price. That information is
 #         already implied by the variant preload scrape_brand() runs at the top
 #         of every brand: any product that already has a variant row has been
 #         scraped before, so its first_observed_price was set on first sighting.
@@ -171,6 +171,289 @@
 #         variants get NULL by default (correct — inline/backfill will populate
 #         them). This also unblocks LCW's size backfill, which was fighting the
 #         same losing battle at SIZE_CAP=65/day and could never make progress.
+#  v14.19 Color-from-title extraction for Tree and Cizaro (see COLOR_FROM_TITLE_BRANDS
+#         block below) — both publish each colourway as a separate product rather
+#         than a variant option, so colour only exists in the product title.
+#         Also: WooCommerce (Mobaco) rewrite to fetch real per-variation stock/price
+#         from /products/{id}/variations instead of trusting the parent product's
+#         blanket is_in_stock flag.
+#  v14.20 Widened retry backoff (3→5 attempts, longer max delay, jitter, Retry-After
+#         honoring) after a real run showed Carina/2S Egypt/Andora/Cizaro/Mobaco all
+#         failing with 503/429 in the same run — confirmed shared-IP rate-limiting,
+#         not independent outages. Also: end-of-run retry pass for brands that scanned
+#         0 products, and inter-brand pacing (8-20s) to spread bursty traffic out.
+#  v14.21 Color extraction fallback pass for Tree (extract_color_tree) and longest-
+#         match scan for Cizaro (extract_color_cizaro) — see COLOR_FROM_TITLE_BRANDS
+#         block below for full detail and tested accuracy figures.
+#  v14.22 TWO FIXES — see full rationale inline at each change site:
+#
+#         FIX 1 — LCW color-level is_in_stock corruption (size backfill was
+#         overwriting the wrong field). Diagnosed live via Supabase: 562 LCW
+#         stockout_events, 100% with size=NULL, several SKUs showing 3-5
+#         consecutive "restock" events with ZERO "stockout" events between them
+#         (e.g. lcw_5048758: restock@06-08, restock@06-11, restock@06-11 again).
+#         Root cause confirmed by inspecting the affected rows directly: the
+#         color-level parent row (lcw_{opt_id}) was being written TWICE by two
+#         different passes that disagree about what is_in_stock means for that
+#         row —
+#           (a) the catalog pass sets is_in_stock = (AvailableStock > 0), the
+#               correct COLOR-WIDE aggregate ("is any size of this color
+#               purchasable"), but
+#           (b) the size-backfill pass's `i == 0` branch was ALSO writing
+#               is_in_stock to that same parent row, using ONE size's stock
+#               state (whichever size happened to be first in that day's API
+#               response — order not guaranteed stable run to run).
+#         When the first size in the array was OOS while other sizes of the
+#         same color were in stock, pass (b) flipped the parent to False. The
+#         NEXT catalog run then saw AvailableStock > 0 (true — other sizes are
+#         still available) against a stale False baseline and logged a
+#         "restock" that never really happened. This could repeat indefinitely
+#         since size order isn't stable, manufacturing the exact multi-restock,
+#         zero-stockout pattern found in the data. Confirmed NOT a bug in
+#         detect_and_write_stockout() itself — it was faithfully recording
+#         whatever the row said; the row was just being corrupted by a second
+#         writer with a different idea of what the field meant.
+#         FIX: the size-backfill's i==0 branch no longer writes is_in_stock to
+#         the parent row at all. is_in_stock on the COLOR-level parent (the bare
+#         lcw_{opt_id} row) is now written EXCLUSIVELY by the catalog pass's
+#         AvailableStock read — the one source that actually represents "is
+#         this color, in any size, purchasable." The size-level CHILD rows
+#         (lcw_{opt_id}_{SIZE}) are unaffected by this fix and keep getting
+#         their own correct per-size is_in_stock from the sizes[] array, as
+#         before — those rows were never part of the bug (each size has its own
+#         external_sku, so they were never the same row being double-written).
+#         No backfill/repair needed: this only changes future writes. The
+#         parent row's is_in_stock will self-correct on its next catalog pass
+#         the same way any other stock-state field would.
+#
+#         FIX 2 — Carina is a women-only brand; the generic normalize_gender()
+#         keyword scan was returning "unisex" for 95% of its catalog (1,287 of
+#         1,358 products) because Carina's titles/tags don't reliably say
+#         "women" even though the brand sells exclusively women's basics and
+#         sleepwear. Added a brand-level override: FEMALE_ONLY_BRANDS = {"carina"}.
+#         scrape_shopify() now checks this set BEFORE falling back to
+#         normalize_gender() for any brand in it — gender is fixed to "women"
+#         unconditionally, no keyword scan involved, no chance of a unisex
+#         fallback. Every other brand's gender detection is completely
+#         unaffected; this is scoped to exactly one brand via the same opt-in
+#         set pattern already used for COLOR_FROM_TITLE_BRANDS and
+#         ARABIC_COLOR_BRANDS.
+#  v14.23 Mobaco and DeFacto both showed 100% in-stock across their entire
+#         variant sets (Mobaco: 7,879/7,879; DeFacto: 25,976/25,976) with zero
+#         stockout_events ever recorded for either brand. Diagnosed live via
+#         Supabase — these are TWO DIFFERENT root causes that happen to look
+#         identical on the surface:
+#
+#         DEFACTO — confirmed NOT a scraper bug, a permanent data ceiling.
+#         DeFacto's CombinProductListByProductLongCode API (the only source of
+#         per-size data DeFacto exposes) returns StockQuantity as null for
+#         every size, every product — this was already known and documented
+#         at that function's definition. Per-variant is_in_stock is correctly
+#         inherited from the product-level Stock field because there is no
+#         finer signal to read; this is the same category of structural blind
+#         spot as DeFacto's already-documented catalog-pagination gap. No code
+#         change made here — writing speculative logic against a field the
+#         API itself always returns empty would not produce real signal.
+#
+#         MOBACO — a real, fixable scraper bug, now fixed. v14.19 introduced
+#         fetch_mobaco_variations() to pull real per-variation price/stock
+#         from /products/{id}/variations, matched against the parent
+#         product's variations[] list by reconstructing a (attr_name,
+#         attr_value) tuple from both sides and comparing them as text.
+#         Confirmed live: across all 416 actively-tracked variable products,
+#         EVERY variant of EVERY product shared one identical price with no
+#         exceptions — the live lookup was matching 0% of the time, silently
+#         falling back to the parent's blanket is_in_stock/price every single
+#         run, every variant, the exact "blanket flag" problem v14.19 was
+#         built to eliminate. Root cause: the parent product's variations[]
+#         summary and the dedicated /variations endpoint are not guaranteed to
+#         describe an attribute the same way (one can report a human label,
+#         the other a taxonomy slug), so a text-based match across the two is
+#         not reliable. FIX: match on the variation's own numeric `id` instead
+#         — the one field both API responses are guaranteed to agree on,
+#         since they describe the exact same WordPress object. Also found
+#         (cosmetic, not actively harmful): 2,690 leftover variant rows across
+#         517 products from BEFORE the v14.19 rewrite, frozen at their last
+#         write the moment the new engine deployed (confirmed via
+#         last_updated_at clustering at the exact cutover timestamp) — these
+#         are dead rows under a different SKU-naming scheme, not actively
+#         being corrupted; no cleanup performed here since cleanup risks
+#         deleting history before Mohammed has had a chance to look. Added a
+#         one-run diagnostic print (first variable product only) confirming
+#         the id-based match rate, so the next real run leaves visible proof
+#         this landed — or a clear signal if Mobaco's actual API shape holds
+#         a further surprise.
+#  v14.24 NEW FEATURE — sub-category attribute extraction (sleeve length for
+#         tops, fit/cut for bottoms). Requested by Mohammed: can finer detail
+#         (long/short/no sleeves; wide-leg/skinny/regular; chino/jeans/
+#         sweatpants) be scraped reliably across brands? Investigated by
+#         sampling 10 random products per brand (all 14) plus a full-table
+#         regex pass against every actual top-like/bottom-like product
+#         (29,733 rows) before writing any extraction code. Findings:
+#
+#           - Neither attribute lives in one consistent field across brands.
+#             Sleeve length is the stronger signal in category_raw for
+#             town_team, ravin, mobaco; in the title for everyone else who
+#             states it at all (defacto 35%, ravin 43%, lc_waikiki 11%,
+#             town_team 17% — all measured post-implementation against the
+#             full catalog). Fit/cut is dominantly a TITLE signal everywhere
+#             EXCEPT town_team (ONLY in category_raw, e.g. "Men Jeans" vs
+#             "Men Pants" — 0% in title) and cizaro (strong in BOTH, but
+#             category_raw needed aggressive normalisation first — see below).
+#           - 2s_egypt and dott_jeans/mens_club have low coverage for one or
+#             both attributes; for 2s_egypt this is partly a genuine source
+#             gap (loungewear/basics catalog) and partly something worse —
+#             see the guard below.
+#
+#         IMPLEMENTATION: new module-level TOP_LIKE_CATEGORIES /
+#         BOTTOM_LIKE_CATEGORIES gate which category_normalized values each
+#         attribute even applies to. Two extractors — extract_sleeve_length()
+#         and extract_fit_cut() — each take a brand-specific field-priority
+#         order (SLEEVE_LENGTH_CATEGORY_FIRST_BRANDS / FIT_CUT_CATEGORY_FIRST_
+#         BRANDS opt-in sets, same pattern as COLOR_FROM_TITLE_BRANDS),
+#         checking one field first and falling back to the other, never
+#         guessing — both return None when nothing matches, exactly like the
+#         existing colour extractors. Cizaro's category_raw needed an
+#         aggressive normalisation pass (_normalize_for_fit_match: lowercase,
+#         collapse all punctuation/spacing to single spaces) before matching,
+#         since the same fit was found written 5+ different ways ("Wide Leg",
+#         "wide-leg", "Wide-Leg", "Wideleg", "Wide- leg") — a direct substring
+#         match on the raw field would have missed most of these. Results are
+#         combined by build_attributes_extracted() — the single entry point
+#         every engine calls — into the new products.attributes_extracted
+#         JSONB column (migration: add_attributes_extracted_to_products, GIN
+#         indexed), e.g. {"sleeve_length": "long sleeve"} or {"fit": "wide
+#         leg"}, never both keys on one product since a category is either
+#         top-like or bottom-like, never both.
+#
+#         GUARD — 2s_egypt pajama contamination. Confirmed live: 2,316 of
+#         2s_egypt's 3,091 products classified into a bottoms category
+#         (jeans/trousers/shorts/leggings/joggers/sweatpants) are actually
+#         PAJAMAS — the pre-existing normalize_category() keyword scan
+#         catches "jeans" or "sweatpant" used as a FABRIC/STYLE descriptor
+#         inside a pajama title (e.g. "بيجامه رجالي جينز" = "men's denim-look
+#         pyjama") and misfiles it as a real denim/sweatpants garment. Running
+#         fit/cut extraction on these would manufacture a false sub-category
+#         on top of an already-wrong base category. Added
+#         _is_2s_egypt_pajama_contaminated() — a narrow guard checked only for
+#         this one brand, scanning category_raw/name for "pajama"/"بيجام" and
+#         returning None (no extraction attempted) when found. This does NOT
+#         fix normalize_category() itself, which is the actual root cause and
+#         a pre-existing issue affecting category_normalized accuracy more
+#         broadly — that's flagged to Mohammed as a separate item, deliberately
+#         not bundled into this feature. Effect of the guard: 2s_egypt's false
+#         fit hits dropped from 5 to 3 (the 3 remaining are genuine, verified
+#         non-pajama trousers with real fit words in the title).
+#
+#         VALIDATION: tested against all 29,733 real top-like/bottom-like
+#         products in the live database (not synthetic examples) before this
+#         was considered done. Spot-checked dozens of real hits per brand by
+#         hand across every brand — zero observed false positives after the
+#         2s_egypt guard. Brands with near-zero coverage for one or both
+#         attributes (2s_egypt, dott_jeans, mens_club on sleeve length) were
+#         individually confirmed to be genuine source gaps (the catalog text
+#         itself doesn't state the attribute), not parsing misses.
+#  v14.25 EXTENDED the v14.24 sub-category pattern to five more category
+#         groups, after Mohammed asked whether the same concept generalises
+#         beyond tops/bottoms: dress length + dress silhouette (dresses),
+#         jacket type (jackets/coats), bra/lounge-top style + brief/bottom
+#         style (underwear, mutually exclusive — gated by which garment word
+#         the title actually contains, never guessed across that boundary),
+#         swimwear silhouette (swimwear), and bag type (bags). Same
+#         methodology as v14.24: real samples pulled and regex-checked
+#         against the live database BEFORE writing extraction code, every
+#         vocabulary validated against actual titles, every extractor
+#         returns None rather than guessing. Full detail and exact coverage
+#         numbers per group are in the block comment directly above the
+#         extractor functions (search "ROUND 2"). Also checked and
+#         deliberately EXCLUDED: footwear (sneakers/sandals/boots/loafers/
+#         heels/slippers) and belts/hats/jewelry — sampled the same way,
+#         found mostly Arabic titles with too little recurring English
+#         vocabulary to justify a list right now.
+#
+#         FULL-TABLE COVERAGE (measured against the live 47,972-row products
+#         table, 22 Jun 2026, this is the honest ceiling of what title/
+#         category TEXT PARSING can do across 14 differently-run catalogs):
+#           - 10,698 products (22.3%) get at least one sub-category attribute.
+#           - 37,274 products (77.7%) stay null — split roughly into:
+#               ~9,063 (19%) are in categories with no extractor at all
+#               (uncategorized, loungewear, socks, belts, jewelry, skirts,
+#               hats, scarves, jumpsuits, slippers, sportswear, footwear,
+#               kaftans, sunglasses) — checked and found too thin to build.
+#               ~28,200 (59%) ARE in a category we extract for, but the
+#               brand's own title/category text simply doesn't state the
+#               attribute for that specific product — an honest gap in the
+#               SOURCE, not a bug in the extractor.
+#           - Coverage is heavily brand-dependent: cizaro 49%, ravin 53%,
+#             esla 49%, defacto 48%, dott_jeans 47% vs. 2s_egypt 0.1% (almost
+#             entirely loungewear + Arabic titles, structurally out of reach
+#             for this method) and andora/carina/dalydress in the 15-16% band.
+#
+#         ── FUTURE DIRECTION: NLP / LLM / COMPUTER VISION ──────────────────
+#         Getting durably past this ~22% ceiling with MORE regex vocabulary
+#         is not the right lever — every group already checked (footwear,
+#         accessories) came back thin not because the word list was
+#         incomplete, but because the SOURCE TEXT genuinely doesn't contain
+#         the attribute in any language-pattern-matchable form (Arabic-only
+#         titles with no transliterated English term; bare SKU codes; one-
+#         or-two-word titles like "Dress" or "Baggage" with zero descriptive
+#         content). Closing that gap needs a fundamentally different
+#         technique, not a bigger dictionary. Two independent directions,
+#         not mutually exclusive, both deliberately NOT implemented yet:
+#
+#         1. LLM-BASED TEXT INFERENCE (the more immediately useful one).
+#            Send {brand, category_normalized, category_raw, name} for any
+#            product where build_attributes_extracted() currently returns
+#            {} to a small/cheap model (e.g. a Haiku-class model) with a
+#            constrained prompt asking ONLY for the same canonical labels
+#            this file already defines (the FIT_CUT_CANONICAL / DRESS_LENGTH_
+#            CANONICAL / etc. dicts above are the right place to source the
+#            allowed-value list from, so the LLM's output space matches what
+#            downstream queries already expect) — and explicitly allow
+#            "unknown" as a valid answer so the model doesn't hallucinate an
+#            attribute that genuinely isn't stated, mirroring the None-not-a-
+#            guess principle this whole file already follows. Arabic titles
+#            are the strongest case for this: an LLM can read "بنطلون حريمي
+#            رجل واسعه" and correctly infer "wide leg" the way a fluent human
+#            would, where a fixed regex dictionary structurally cannot
+#            without transliterating every possible Arabic phrasing by hand.
+#            Should run as a SEPARATE batch/offline pass against the
+#            DATABASE (read attributes_extracted = '{}', call the model,
+#            write back), not inline in the scraper's per-run hot path —
+#            keeps the scraper's existing reliability/speed/cost profile
+#            completely untouched, and makes it trivial to re-run only the
+#            still-null rows after improving the prompt, without re-scraping
+#            anything. Needs: a budget cap or row-count cap per run (this
+#            file's existing SIZE_CAP-style pattern is the right template),
+#            and a confidence/"unknown" path so a bad LLM call degrades to
+#            None, never to a wrong stored value, exactly like every
+#            extractor in this file already does on a regex miss.
+#
+#         2. COMPUTER VISION ON image_url (the harder, higher-ceiling one).
+#            Every product already has an image_url from the catalog API —
+#            completely unused for inference today. A vision model (or a
+#            cheaper dedicated classifier, if volume ever justifies training
+#            one) could in principle determine sleeve length, neckline,
+#            length, and silhouette DIRECTLY from the product photo,
+#            independent of whether the brand wrote anything descriptive in
+#            the title at all — which is exactly the population text-based
+#            extraction can never reach (the ~28,200 in-scope-but-unstated
+#            rows above). This is meaningfully more expensive per item than
+#            text inference (image tokens cost more than a short text prompt,
+#            and many products have 1 image but some brands' galleries have
+#            several — would need a rule for which image(s) to send) and
+#            current image_url values aren't guaranteed stable/non-expiring
+#            for every brand, so this needs its own small feasibility check
+#            (confirm image URLs are fetchable months after being scraped,
+#            confirm cost per call before committing to it at full catalog
+#            scale) before it's worth building. Likely the second phase, after
+#            text-based LLM inference above has been tried and its own ceiling
+#            measured — no need to reach for the more expensive tool first
+#            when the cheaper one hasn't been tested yet.
+#
+#         Neither direction is implemented in this file. This comment exists
+#         so the next iteration starts from "here's what was already tried
+#         and why," not from zero.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -235,6 +518,18 @@ BRAND_DISPLAY = {
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
 }
+
+# v14.22 FIX 2: brands whose ENTIRE catalog is a single gender regardless of
+# what normalize_gender()'s keyword scan finds in tags/product_type/title.
+# Carina is a women-only basics/sleepwear brand; its product titles don't
+# reliably contain a gender keyword, so the generic scan was defaulting 95%
+# of its catalog to "unisex" — masking the true gender on a brand where it's
+# never actually ambiguous. Membership here is the ONLY thing that activates
+# this override, so every other brand's gender detection (including the
+# normal "unisex" fallback for genuinely mixed-gender catalogs) is completely
+# unaffected. Same opt-in-set pattern as COLOR_FROM_TITLE_BRANDS and
+# ARABIC_COLOR_BRANDS below.
+FEMALE_ONLY_BRANDS = {"carina"}
 
 # ── Category Taxonomy ─────────────────────────────────────────────────────────
 CATEGORY_MAP = {
@@ -559,8 +854,8 @@ def load_last_prices(supabase, brand_name):
     RESILIENCE (v14.12): this previously looked back only ONE day (today, else
     yesterday). For a once-daily brand (LCW) that meant a single missed run —
     e.g. when GitHub's scheduler skipped the midnight slot — left "yesterday"
-    empty, so the next run found no baseline, silently re-seeded every product
-    as first-sighted, and detected zero price changes for that entire day.
+    empty, so the next run found no baseline, silently re-seeded the whole
+    catalog as first-sighted, and detected zero price changes for that day.
     We now pick the most recent snapshot_date that actually HAS data inside a
     14-day window. One skipped run no longer blinds detection: the next run
     just compares against the last day we do have, which correctly captures
@@ -863,6 +1158,527 @@ def extract_color_from_title(brand_name, product_name):
     except Exception:
         return None
 
+# ── Sub-category attribute extraction (sleeve length, bottoms fit/cut) ──────
+# v14.24 addition.
+#
+# CONTEXT: Mohammed asked whether finer sub-category detail (sleeve length on
+# tops; fit/cut — wide leg, skinny, baggy, chino vs jeans vs sweatpants — on
+# bottoms) could be scraped reliably across brands. Investigated by sampling
+# 10 random products per brand (all 14) plus full-table regex checks against
+# every top-like and bottom-like product. Findings, confirmed against live
+# Supabase data on 22 Jun 2026:
+#
+#   SLEEVE LENGTH lives in TWO different fields depending on the brand, never
+#   both, never neither for the brands where it's stated at all:
+#     - category_raw is the strong signal for: town_team (21% of tops; title
+#       has 0%), ravin (46% in category vs 21% in title), and to a lesser
+#       extent mobaco.
+#     - title is the strong signal for: defacto (55%), lc_waikiki (18%),
+#       andora, tree, carina.
+#     - 2s_egypt, dott_jeans, mens_club: low coverage either way — these
+#       catalogs (loungewear, basics) mostly don't state sleeve length at all,
+#       which is an honest gap in the SOURCE, not a parsing miss.
+#
+#   BOTTOMS FIT/CUT is dominantly a TITLE signal almost everywhere (cizaro
+#   90%, esla 91%, dott_jeans 87%, defacto 61%, ravin 69%, lc_waikiki 49%),
+#   with TWO exceptions where category_raw is the real signal instead:
+#     - town_team: fit/cut is ONLY in category_raw (e.g. "Men Jeans" vs
+#       "Men Pants" — 16% coverage), 0% in title.
+#     - cizaro: ALSO has strong category_raw coverage (178/232, 77%) in
+#       addition to title — but category_raw is written extremely
+#       inconsistently ("Wide Leg", "wide-leg", "Wide-Leg", "Wideleg", "Wide-
+#       leg", "Wide Leg , non denim , trousers" are all the same fit), so it
+#       must be aggressively normalised (strip spaces/punctuation, lowercase)
+#       before matching a canonical vocabulary — a direct substring match on
+#       the raw string would miss most of these variants.
+#     - mens_club: category_raw has some signal (e.g. "032 Chino") worth
+#       checking first since it's cleaner than mens_club's titles for this.
+#
+#   2s_egypt is a near-total gap (2/3,091 bottoms) for a DIFFERENT reason than
+#   "missing data": its catalog is dominated by pyjamas/loungewear, and several
+#   of its "jeans"/"leggings" classified products are actually pyjamas whose
+#   title mentions "jeans" only as a FABRIC LOOK descriptor (e.g. "بيجامه
+#   رجالي جينز" = men's denim-look pyjama) — normalize_category()'s keyword
+#   scan is catching the fabric word, not a real bottoms garment. This is a
+#   pre-existing category_normalized accuracy issue, NOT something this
+#   feature should paper over by inventing a fit value — flagged to Mohammed
+#   separately, left untouched here.
+#
+# DESIGN: two independent extractors, each gated to the categories where the
+# attribute is meaningful (sleeve length only for top-like categories; fit/cut
+# only for bottom-like categories), each checking fields in a BRAND-SPECIFIC
+# priority order discovered above, falling back to the other field if the
+# first is empty. Both return None — never a guess — when nothing matches,
+# exactly like the existing colour extractors. Result is stored in the new
+# products.attributes_extracted JSONB column as e.g. {"sleeve_length": "long
+# sleeve"} or {"fit": "wide leg"}, never both keys at once since a product is
+# either top-like or bottom-like, not both.
+
+TOP_LIKE_CATEGORIES    = {"t-shirts", "shirts", "polos", "sweatshirts", "hoodies",
+                          "cardigans", "sweaters", "bodysuits", "tank-tops", "blazers"}
+BOTTOM_LIKE_CATEGORIES = {"jeans", "trousers", "shorts", "leggings", "joggers", "sweatpants"}
+
+# Sleeve length vocabulary. Multi-word phrases first so "short sleeve" wins
+# over a lone "sleeve" — not that "sleeve" alone is in this list, but kept
+# consistent with the longest-match-wins pattern used by the colour lists.
+SLEEVE_LENGTH_WORDS = [
+    "short sleeve", "short-sleeve", "short sleeves", "short-sleeves",
+    "long sleeve", "long-sleeve", "long sleeves", "long-sleeves",
+    "half sleeve", "half-sleeve", "half sleeves",
+    "full sleeve", "full-sleeve", "full sleeves",
+    "sleeveless", "elbow sleeve", "elbow-sleeve",
+    "3/4 sleeve", "three-quarter sleeve",
+]
+SLEEVE_LENGTH_WORDS_SORTED = sorted(SLEEVE_LENGTH_WORDS, key=len, reverse=True)
+
+# Canonical sleeve-length labels each raw phrase maps to, so "short-sleeve"
+# and "short sleeves" both store as the same value rather than fragmenting
+# the signal by punctuation/plural variants.
+SLEEVE_LENGTH_CANONICAL = {
+    "short sleeve": "short sleeve", "short-sleeve": "short sleeve",
+    "short sleeves": "short sleeve", "short-sleeves": "short sleeve",
+    "long sleeve": "long sleeve", "long-sleeve": "long sleeve",
+    "long sleeves": "long sleeve", "long-sleeves": "long sleeve",
+    "half sleeve": "half sleeve", "half-sleeve": "half sleeve",
+    "half sleeves": "half sleeve",
+    "full sleeve": "long sleeve", "full-sleeve": "long sleeve",
+    "full sleeves": "long sleeve",
+    "sleeveless": "sleeveless",
+    "elbow sleeve": "elbow sleeve", "elbow-sleeve": "elbow sleeve",
+    "3/4 sleeve": "three-quarter sleeve", "three-quarter sleeve": "three-quarter sleeve",
+}
+
+def _find_sleeve_length(text):
+    """Longest-match scan for a sleeve-length phrase in already-lowercased text.
+    Returns the canonical label, or None."""
+    if not text:
+        return None
+    lower = text.lower()
+    for phrase in SLEEVE_LENGTH_WORDS_SORTED:
+        if phrase in lower:
+            return SLEEVE_LENGTH_CANONICAL.get(phrase, phrase)
+    return None
+
+# Brands where category_raw is the stronger sleeve-length signal — checked
+# FIRST for these, with title as fallback. Every other brand checks title
+# first, with category_raw as fallback. Confirmed from the live coverage
+# numbers in the block comment above.
+SLEEVE_LENGTH_CATEGORY_FIRST_BRANDS = {"town_team", "ravin", "mobaco"}
+
+def extract_sleeve_length(brand_name, category_normalized, category_raw, name):
+    """
+    Returns a canonical sleeve-length string, or None if not a top-like
+    category, or if neither field yields a confident match. Never raises.
+    """
+    if category_normalized not in TOP_LIKE_CATEGORIES:
+        return None
+    try:
+        if brand_name in SLEEVE_LENGTH_CATEGORY_FIRST_BRANDS:
+            return _find_sleeve_length(category_raw) or _find_sleeve_length(name)
+        return _find_sleeve_length(name) or _find_sleeve_length(category_raw)
+    except Exception:
+        return None
+
+# Bottoms fit/cut vocabulary. Longest-match-wins ordering via the sort below.
+# "mom fit"/"mom jeans" intentionally separate from "regular fit" — a "mom"
+# cut is a recognisable, named silhouette in this market's listings, not
+# interchangeable with a generic "regular fit" label.
+FIT_CUT_WORDS = [
+    "extreme wide leg", "super baggy", "loose baggy", "wide leg", "wide-leg",
+    "wideleg", "wide tailored", "skinny fit", "slim fit", "slim-fit",
+    "regular fit", "relaxed fit", "straight fit", "tapered fit",
+    "high waist", "high-waist", "boyfriend", "mom fit", "mom-fit", "momfit",
+    "mom jeans", "bootcut", "boot cut", "flare", "flared", "baggy",
+    "skinny", "slim", "straight", "tapered", "relaxed", "loose",
+    "jogger", "joggers", "cargo", "chino", "chinos", "sweatpants",
+    "sweatpant", "curvy fit", "skater",
+]
+FIT_CUT_WORDS_SORTED = sorted(FIT_CUT_WORDS, key=len, reverse=True)
+
+# Canonical fit/cut labels — collapses spelling/spacing/punctuation variants
+# to one stored value. This is required for Cizaro in particular: its
+# category_raw has been observed as "Wide Leg", "wide leg", "Wide-Leg",
+# "Wideleg", "Wide- leg", and "wide-leg" for the exact same fit.
+FIT_CUT_CANONICAL = {
+    "extreme wide leg": "wide leg", "wide leg": "wide leg", "wide-leg": "wide leg",
+    "wideleg": "wide leg", "wide tailored": "wide leg",
+    "super baggy": "baggy", "loose baggy": "baggy", "baggy": "baggy", "loose": "baggy",
+    "skinny fit": "skinny", "skinny": "skinny",
+    "slim fit": "slim", "slim-fit": "slim", "slim": "slim",
+    "regular fit": "regular", "straight fit": "straight", "straight": "straight",
+    "relaxed fit": "relaxed", "relaxed": "relaxed",
+    "tapered fit": "tapered", "tapered": "tapered",
+    "high waist": "high waist", "high-waist": "high waist",
+    "boyfriend": "boyfriend",
+    "mom fit": "mom fit", "mom-fit": "mom fit", "momfit": "mom fit", "mom jeans": "mom fit",
+    "bootcut": "bootcut", "boot cut": "bootcut",
+    "flare": "flare", "flared": "flare",
+    "jogger": "jogger", "joggers": "jogger",
+    "cargo": "cargo",
+    "chino": "chino", "chinos": "chino",
+    "sweatpants": "sweatpants", "sweatpant": "sweatpants",
+    "curvy fit": "curvy fit",
+    "skater": "skater",
+}
+
+def _normalize_for_fit_match(text):
+    """
+    Aggressive normalisation before fit/cut matching: lowercase, then collapse
+    every run of non-alphanumeric characters (spaces, dashes, commas, multiple
+    dashes, etc.) down to a single space. This is what lets "Wide-Leg",
+    "Wideleg" — wait, "Wideleg" has no separator at all, so it's listed as its
+    own vocabulary entry above rather than relying on normalisation to invent
+    a word boundary that isn't there. For every OTHER punctuation/spacing
+    variant ("Wide Leg" / "Wide-Leg" / "Wide- leg" / "wide-leg"), collapsing
+    separators to single spaces is what makes one canonical phrase match all
+    of them.
+    """
+    if not text:
+        return ""
+    return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+
+def _find_fit_cut(text):
+    """Longest-match scan for a fit/cut phrase in normalised text. Returns the
+    canonical label, or None."""
+    normalized = _normalize_for_fit_match(text)
+    if not normalized:
+        return None
+    for phrase in FIT_CUT_WORDS_SORTED:
+        phrase_normalized = _normalize_for_fit_match(phrase)
+        if phrase_normalized and phrase_normalized in normalized:
+            return FIT_CUT_CANONICAL.get(phrase, phrase)
+    return None
+
+# Brands where category_raw is the stronger (or, for Cizaro, an additional
+# strong) fit/cut signal — checked FIRST for these, with title as fallback.
+# Every other brand checks title first. Confirmed from the live coverage
+# numbers in the block comment above.
+FIT_CUT_CATEGORY_FIRST_BRANDS = {"town_team", "cizaro", "mens_club"}
+
+def _is_2s_egypt_pajama_contaminated(category_raw, name):
+    """
+    v14.24 guard: confirmed live (22 Jun 2026) that 75% of 2s_egypt's
+    products classified into a bottoms category (jeans/trousers/shorts/
+    leggings/joggers/sweatpants — 2,316 of 3,091) are actually PAJAMAS. The
+    pre-existing normalize_category() keyword scan catches "jeans" or
+    "sweatpant" used as a FABRIC/STYLE descriptor inside a pajama title
+    (e.g. "بيجامه رجالي جينز" = "men's denim-look pyjama") and misfiles it as
+    a real denim/sweatpants garment. Extracting a fit/cut value for these
+    would manufacture a false sub-category on top of an already-wrong base
+    category. This guard does NOT fix normalize_category() itself (a
+    separate, pre-existing issue flagged to Mohammed outside this feature)
+    — it only stops THIS feature from compounding that error. Scoped to
+    2s_egypt only; no other brand's fit/cut extraction is affected.
+    """
+    raw_lower = (category_raw or "").lower()
+    return "pajama" in raw_lower or "بيجام" in (name or "")
+
+def extract_fit_cut(brand_name, category_normalized, category_raw, name):
+    """
+    Returns a canonical fit/cut string, or None if not a bottom-like
+    category, or if neither field yields a confident match. Never raises.
+    """
+    if category_normalized not in BOTTOM_LIKE_CATEGORIES:
+        return None
+    if brand_name == "2s_egypt" and _is_2s_egypt_pajama_contaminated(category_raw, name):
+        return None
+    try:
+        if brand_name in FIT_CUT_CATEGORY_FIRST_BRANDS:
+            return _find_fit_cut(category_raw) or _find_fit_cut(name)
+        return _find_fit_cut(name) or _find_fit_cut(category_raw)
+    except Exception:
+        return None
+
+# ── Sub-category attribute extraction, ROUND 2 — v14.25 addition ───────────
+# Same generalised pattern as v14.24 (sleeve length / fit-cut), extended to
+# five more category groups after Mohammed asked whether the concept scales
+# beyond tops/bottoms. Investigated the same way: pulled real samples + ran
+# regex coverage checks against the live database BEFORE writing any
+# extraction code, for every group. Findings (22 Jun 2026, against the live
+# 47,972-row products table):
+#
+#   DRESSES (1,186 total) — THREE separate, independently-occurring
+#   attributes, not one: length (mini/midi/maxi — 252 hits, 21%), silhouette
+#   (a-line/bodycon/wrap/shirt dress/fit-and-flare — 170 hits, 14%), and
+#   sleeve length (136 hits, 11% — reuses the EXACT same vocabulary already
+#   built for tops, since "sleeveless"/"long sleeve" mean the same thing on
+#   a dress as on a shirt).
+#
+#   JACKETS/COATS (1,402 total) — ONE attribute, jacket type/style (puffer,
+#   bomber, denim jacket, leather jacket, blazer, parka, trench, quilted,
+#   windbreaker, biker — 402 hits in title, 29%; category_raw only adds 45
+#   more, title is clearly dominant here, no brand-specific override needed).
+#
+#   UNDERWEAR (964 total) — split into TWO attributes gated by which garment
+#   the product actually is (never both on one product): bra/lounge-top
+#   style (push-up, padded, unpadded, wireless, wired, strapless, bralette,
+#   seamless) when the title says bra/lingerie-top language, vs brief/panty
+#   style (thong, bikini, hipster, brazilian, boxer) when it says
+#   panty/knicker/boxer language. Combined coverage 364/964 (38%). Bundling
+#   these into one generic "underwear style" field would have produced
+#   nonsense — a brief's silhouette and a bra's support style are not the
+#   same axis, so they're stored under different keys.
+#
+#   SWIMWEAR (280 total) — ONE attribute, silhouette (one-piece, bikini,
+#   swimsuit, tankini, burkini, board short — 174 hits, 62%, the strongest
+#   coverage of any group checked in this round).
+#
+#   BAGS (1,014 total) — ONE attribute, bag type (shoulder bag, crossbody,
+#   tote, backpack, clutch, duffel, wallet, satchel, handbag, sling, messenger
+#   — 450 hits, 44%). NOTE: "wallet" is included in this vocabulary because
+#   it currently shares the bags base category (a pre-existing
+#   category_normalized grouping choice, not something this feature changes)
+#   — flagged to Mohammed, not fixed here.
+#
+#   CHECKED AND DELIBERATELY EXCLUDED — footwear (sneakers/sandals/boots/
+#   loafers/heels/slippers, ~307 combined) and belts/hats/jewelry (~1,359
+#   combined): sampled the same way, found mostly Arabic titles with little
+#   recurring English descriptive vocabulary and/or signal too scattered to
+#   justify a vocabulary list right now. Revisit if these brands' English
+#   title coverage improves, or if Mohammed has brand-specific knowledge of
+#   a pattern that isn't visible from text alone.
+#
+# DESIGN: identical pattern to v14.24 — category-gated, longest-match-wins,
+# canonical-label collapsing, returns None rather than guessing. None of
+# these five needed a brand-specific field-priority override the way
+# town_team/cizaro/mens_club did for fit-cut — title was the dominant signal
+# in every one of these five groups, so each new extractor checks title only
+# (category_raw's contribution was consistently small enough not to be worth
+# the added complexity of a fallback check, except where noted below).
+
+DRESS_CATEGORIES    = {"dresses"}
+JACKET_CATEGORIES   = {"jackets", "coats"}
+UNDERWEAR_CATEGORIES = {"underwear"}
+SWIMWEAR_CATEGORIES  = {"swimwear"}
+BAG_CATEGORIES        = {"bags"}
+
+# -- Dress length --
+DRESS_LENGTH_WORDS = ["mini dress", "midi dress", "maxi dress",
+                      "knee length", "knee-length", "ankle length", "ankle-length",
+                      "mini", "midi", "maxi"]
+DRESS_LENGTH_WORDS_SORTED = sorted(DRESS_LENGTH_WORDS, key=len, reverse=True)
+DRESS_LENGTH_CANONICAL = {
+    "mini dress": "mini", "midi dress": "midi", "maxi dress": "maxi",
+    "knee length": "knee-length", "knee-length": "knee-length",
+    "ankle length": "ankle-length", "ankle-length": "ankle-length",
+    "mini": "mini", "midi": "midi", "maxi": "maxi",
+}
+
+def extract_dress_length(category_normalized, name):
+    if category_normalized not in DRESS_CATEGORIES or not name:
+        return None
+    try:
+        lower = name.lower()
+        for phrase in DRESS_LENGTH_WORDS_SORTED:
+            if phrase in lower:
+                return DRESS_LENGTH_CANONICAL.get(phrase, phrase)
+        return None
+    except Exception:
+        return None
+
+# -- Dress silhouette --
+DRESS_SILHOUETTE_WORDS = ["fit and flare", "fit-and-flare", "fit & flare",
+                          "a-line", "a line", "bodycon", "shirt dress",
+                          "wrap dress", "shift dress", "slip dress", "bandage"]
+DRESS_SILHOUETTE_WORDS_SORTED = sorted(DRESS_SILHOUETTE_WORDS, key=len, reverse=True)
+DRESS_SILHOUETTE_CANONICAL = {
+    "fit and flare": "fit and flare", "fit-and-flare": "fit and flare",
+    "fit & flare": "fit and flare",
+    "a-line": "a-line", "a line": "a-line",
+    "bodycon": "bodycon", "shirt dress": "shirt dress",
+    "wrap dress": "wrap", "shift dress": "shift", "slip dress": "slip",
+    "bandage": "bandage",
+}
+
+def extract_dress_silhouette(category_normalized, name):
+    if category_normalized not in DRESS_CATEGORIES or not name:
+        return None
+    try:
+        lower = name.lower()
+        for phrase in DRESS_SILHOUETTE_WORDS_SORTED:
+            if phrase in lower:
+                return DRESS_SILHOUETTE_CANONICAL.get(phrase, phrase)
+        return None
+    except Exception:
+        return None
+
+# -- Jacket/coat type --
+JACKET_TYPE_WORDS = ["denim jacket", "leather jacket", "bomber jacket",
+                     "puffer jacket", "biker jacket",
+                     "puffer", "bomber", "blazer", "parka", "trench",
+                     "quilted", "windbreaker", "biker", "varsity"]
+JACKET_TYPE_WORDS_SORTED = sorted(JACKET_TYPE_WORDS, key=len, reverse=True)
+JACKET_TYPE_CANONICAL = {
+    "denim jacket": "denim", "leather jacket": "leather",
+    "bomber jacket": "bomber", "puffer jacket": "puffer", "biker jacket": "biker",
+    "puffer": "puffer", "bomber": "bomber", "blazer": "blazer",
+    "parka": "parka", "trench": "trench", "quilted": "quilted",
+    "windbreaker": "windbreaker", "biker": "biker", "varsity": "varsity",
+}
+
+def extract_jacket_type(category_normalized, name):
+    if category_normalized not in JACKET_CATEGORIES or not name:
+        return None
+    try:
+        lower = name.lower()
+        for phrase in JACKET_TYPE_WORDS_SORTED:
+            if phrase in lower:
+                return JACKET_TYPE_CANONICAL.get(phrase, phrase)
+        return None
+    except Exception:
+        return None
+
+# -- Underwear: bra/top style vs brief/bottom style — gated by garment word --
+UNDERWEAR_TOP_HINTS    = ("bra", "bralette", "lingerie top", "corset", "bustier")
+UNDERWEAR_BOTTOM_HINTS = ("panty", "panties", "brief", "knicker", "boxer", "thong")
+
+UNDERWEAR_TOP_STYLE_WORDS = ["push-up", "push up", "padded", "unpadded",
+                             "wireless", "wire-free", "wired", "non-wired",
+                             "strapless", "seamless", "bralette"]
+UNDERWEAR_TOP_STYLE_SORTED = sorted(UNDERWEAR_TOP_STYLE_WORDS, key=len, reverse=True)
+UNDERWEAR_TOP_STYLE_CANONICAL = {
+    "push-up": "push-up", "push up": "push-up",
+    "padded": "padded", "unpadded": "unpadded",
+    "wireless": "wireless", "wire-free": "wireless", "wired": "wired",
+    "non-wired": "wireless", "strapless": "strapless",
+    "seamless": "seamless", "bralette": "bralette",
+}
+
+UNDERWEAR_BOTTOM_STYLE_WORDS = ["bikini brief", "boy short", "boyshort",
+                                "brazilian", "hipster", "thong", "full coverage",
+                                "full brief"]
+UNDERWEAR_BOTTOM_STYLE_SORTED = sorted(UNDERWEAR_BOTTOM_STYLE_WORDS, key=len, reverse=True)
+UNDERWEAR_BOTTOM_STYLE_CANONICAL = {
+    "bikini brief": "bikini", "boy short": "boyshort", "boyshort": "boyshort",
+    "brazilian": "brazilian", "hipster": "hipster", "thong": "thong",
+    "full coverage": "full brief", "full brief": "full brief",
+}
+
+def extract_underwear_style(category_normalized, name):
+    """
+    Returns ("top_style", value) or ("bottom_style", value) or None — gated
+    by which garment-type word the title contains, so a bra's support
+    style and a brief's cut are never confused with each other. If the
+    title contains neither a top-garment word nor a bottom-garment word
+    (e.g. a generic "Lingerie Set"), returns None rather than guessing
+    which axis applies.
+    """
+    if category_normalized not in UNDERWEAR_CATEGORIES or not name:
+        return None
+    try:
+        lower = name.lower()
+        is_top    = any(h in lower for h in UNDERWEAR_TOP_HINTS)
+        is_bottom = any(h in lower for h in UNDERWEAR_BOTTOM_HINTS)
+        if is_top and not is_bottom:
+            for phrase in UNDERWEAR_TOP_STYLE_SORTED:
+                if phrase in lower:
+                    return ("top_style", UNDERWEAR_TOP_STYLE_CANONICAL.get(phrase, phrase))
+        elif is_bottom and not is_top:
+            for phrase in UNDERWEAR_BOTTOM_STYLE_SORTED:
+                if phrase in lower:
+                    return ("bottom_style", UNDERWEAR_BOTTOM_STYLE_CANONICAL.get(phrase, phrase))
+        return None
+    except Exception:
+        return None
+
+# -- Swimwear silhouette --
+SWIMWEAR_WORDS = ["board short", "one-piece", "one piece", "bikini",
+                  "swimsuit", "tankini", "burkini"]
+SWIMWEAR_WORDS_SORTED = sorted(SWIMWEAR_WORDS, key=len, reverse=True)
+SWIMWEAR_CANONICAL = {
+    "board short": "board short",
+    "one-piece": "one-piece", "one piece": "one-piece",
+    "bikini": "bikini", "swimsuit": "swimsuit",
+    "tankini": "tankini", "burkini": "burkini",
+}
+
+def extract_swimwear_silhouette(category_normalized, name):
+    if category_normalized not in SWIMWEAR_CATEGORIES or not name:
+        return None
+    try:
+        lower = name.lower()
+        for phrase in SWIMWEAR_WORDS_SORTED:
+            if phrase in lower:
+                return SWIMWEAR_CANONICAL.get(phrase, phrase)
+        return None
+    except Exception:
+        return None
+
+# -- Bag type --
+BAG_TYPE_WORDS = ["shoulder bag", "crossbody bag", "crossbody", "tote bag",
+                  "tote", "backpack", "clutch", "duffel", "wallet",
+                  "satchel", "handbag", "sling bag", "sling", "messenger bag",
+                  "messenger"]
+BAG_TYPE_WORDS_SORTED = sorted(BAG_TYPE_WORDS, key=len, reverse=True)
+BAG_TYPE_CANONICAL = {
+    "shoulder bag": "shoulder bag", "crossbody bag": "crossbody", "crossbody": "crossbody",
+    "tote bag": "tote", "tote": "tote", "backpack": "backpack", "clutch": "clutch",
+    "duffel": "duffel", "wallet": "wallet", "satchel": "satchel",
+    "handbag": "handbag", "sling bag": "sling", "sling": "sling",
+    "messenger bag": "messenger", "messenger": "messenger",
+}
+
+def extract_bag_type(category_normalized, name):
+    if category_normalized not in BAG_CATEGORIES or not name:
+        return None
+    try:
+        lower = name.lower()
+        for phrase in BAG_TYPE_WORDS_SORTED:
+            if phrase in lower:
+                return BAG_TYPE_CANONICAL.get(phrase, phrase)
+        return None
+    except Exception:
+        return None
+
+def build_attributes_extracted(brand_name, category_normalized, category_raw, name):
+    """
+    Single entry point used by every engine. Returns a dict suitable for the
+    products.attributes_extracted JSONB column. Each key is independently
+    optional and never raises; absence of a key means genuinely not stated
+    by the source, not a parsing failure. v14.24 added sleeve_length/fit;
+    v14.25 adds dress_length/dress_silhouette (dresses), jacket_type
+    (jackets/coats), top_style/bottom_style (underwear, mutually exclusive
+    per the garment-word gate in extract_underwear_style), swimwear_style,
+    and bag_type. A product only ever gets keys relevant to its own
+    category_normalized — e.g. a t-shirt never gets a bag_type key.
+    """
+    attrs = {}
+
+    sleeve = extract_sleeve_length(brand_name, category_normalized, category_raw, name)
+    if sleeve:
+        attrs["sleeve_length"] = sleeve
+
+    fit = extract_fit_cut(brand_name, category_normalized, category_raw, name)
+    if fit:
+        attrs["fit"] = fit
+
+    dress_len = extract_dress_length(category_normalized, name)
+    if dress_len:
+        attrs["dress_length"] = dress_len
+
+    dress_sil = extract_dress_silhouette(category_normalized, name)
+    if dress_sil:
+        attrs["dress_silhouette"] = dress_sil
+
+    jacket_type = extract_jacket_type(category_normalized, name)
+    if jacket_type:
+        attrs["jacket_type"] = jacket_type
+
+    underwear_result = extract_underwear_style(category_normalized, name)
+    if underwear_result:
+        key, value = underwear_result
+        attrs[key] = value
+
+    swim = extract_swimwear_silhouette(category_normalized, name)
+    if swim:
+        attrs["swimwear_style"] = swim
+
+    bag = extract_bag_type(category_normalized, name)
+    if bag:
+        attrs["bag_type"] = bag
+
+    return attrs
+
 # ── Shopify Scraper ───────────────────────────────────────────────────────────
 
 def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
@@ -922,18 +1738,35 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         for p in products:
             if not p.get("variants"): continue
             safe_image = p["images"][0]["src"] if p.get("images") else None
+            # v14.22 FIX 2: Carina is women-only. Skip the generic keyword scan
+            # entirely for brands in FEMALE_ONLY_BRANDS — gender is fixed to
+            # "women" unconditionally, so a catalog with no gender keywords in
+            # its titles/tags (Carina's actual situation) can never fall
+            # through to "unisex". No other brand's gender detection changes.
+            if brand_name in FEMALE_ONLY_BRANDS:
+                resolved_gender = "women"
+            else:
+                resolved_gender = normalize_gender(p.get("tags", []), p.get("product_type", ""), p["title"])
+            cat_norm = normalize_category(f"{p['title']} {p.get('product_type','')}")
             batch_products.append({
                 "brand":               brand_name,
                 "external_id":         str(p["id"]),
                 "name":                p["title"],
                 "category_raw":        p.get("product_type", ""),
-                "category_normalized": normalize_category(f"{p['title']} {p.get('product_type','')}"),
-                "gender":              normalize_gender(p.get("tags", []), p.get("product_type", ""), p["title"]),
+                "category_normalized": cat_norm,
+                "gender":              resolved_gender,
                 "sizes_available":     [],
                 "url":                 f"https://{domain}/products/{p['handle']}",
                 "image_url":           safe_image,
                 "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                 "is_active":           True,
+                # v14.24+v14.25: sub-category detail (sleeve length/fit for tops
+                # and bottoms; dress length/silhouette, jacket type, underwear
+                # style, swimwear style, bag type for their respective
+                # categories) — see build_attributes_extracted for the full list.
+                "attributes_extracted": build_attributes_extracted(
+                    brand_name, cat_norm, p.get("product_type", ""), p["title"]
+                ),
             })
         if not batch_products:
             break
@@ -1410,13 +2243,23 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 gender     = lcw_normalize_gender(breadcrumb, cat_gender)
                 model_url  = item.get("ModelUrl") or ""
                 url        = f"https://{domain}{model_url}" if model_url.startswith("/") else model_url
+                cat_raw    = breadcrumb.get("Level3") or breadcrumb.get("Level2") or ""
                 batch_products.append({
                     "brand": brand_name, "external_id": str(model_id), "name": name,
-                    "category_raw":        (breadcrumb.get("Level3") or breadcrumb.get("Level2") or ""),
+                    "category_raw":        cat_raw,
                     "category_normalized": category, "gender": gender,
                     "sizes_available": [], "url": url,
                     "image_url":   item.get("DefaultOptionImageUrl"),
                     "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True,
+                    # v14.24: LCW's strongest signal for both sleeve length and
+                    # fit/cut is the title — confirmed via live coverage check,
+                    # so this brand uses build_attributes_extracted's default
+                    # (title-first) priority order. Also picks up any v14.25
+                    # dress/jacket/underwear/swimwear/bag attributes if this
+                    # product's category matches one of those groups.
+                    "attributes_extracted": build_attributes_extracted(
+                        brand_name, category, cat_raw, name
+                    ),
                 })
 
             if not batch_products: continue
@@ -1498,6 +2341,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     # here made the upsert overwrite sizes populated by previous runs,
                     # forcing the backfill to redo work every run. Omitting the key
                     # means ON CONFLICT SET skips the column, preserving existing data.
+                    #
+                    # is_in_stock HERE is the COLOR-WIDE aggregate (AvailableStock > 0
+                    # across every size of this color) — this field's ONLY writer for
+                    # this row going forward (v14.22 FIX 1). The size-backfill pass
+                    # below populates "size" on size-suffixed CHILD rows and no longer
+                    # touches is_in_stock on THIS parent row at all.
                     "is_in_stock": is_avail, "first_observed_price": v_baseline,
                     "last_updated_at": datetime.now(timezone.utc).isoformat(),
                     "_meta_price": price, "_meta_compare": compare_at,
@@ -1610,6 +2459,23 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     #   - 0.6-1.4s random sleep between fetches (≈40-65/min sustained)
     #   - All traffic goes through Egyptian residential proxy session
     #   - Same headers a real browser sends, no robotic patterns
+    #
+    # v14.22 FIX 1: this pass used to ALSO write is_in_stock onto the PARENT
+    # (color-level, lcw_{opt_id}) row inside the `if i == 0` branch below,
+    # using just the FIRST size's stock state. That collided with the catalog
+    # pass above, which is the correct, color-wide source for that same field
+    # (AvailableStock > 0 across every size). Whichever pass ran more recently
+    # "won", and since the sizes[] array's order isn't guaranteed stable run to
+    # run, the parent row could flip is_in_stock back and forth with NOTHING
+    # about the product actually changing — confirmed live: several LCW SKUs
+    # showed 3-5 consecutive "restock" events with ZERO "stockout" events
+    # between them, which is only possible if a false transition was being
+    # manufactured. The size pass no longer writes is_in_stock to the parent
+    # row at all — see the full diagnosis in the v14.22 changelog at the top
+    # of this file. Per-size stock is UNCHANGED and still correct: it's written
+    # onto each size's own child row (the `else` branch a few lines down),
+    # which was never part of this bug (each size has its own external_sku, so
+    # those rows were never the parent row being double-written).
     SIZE_CAP     = 65
     SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
@@ -1679,6 +2545,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 # If both are missing, leave it NULL (better than guessing).
                 color        = row.get("color") or page_color
                 fop          = row.get("first_observed_price") or prev_prices.get(product_id)
+                # v14.22 FIX 1: parent_stock is STILL read here (used as the
+                # fallback for a size whose own stock count is missing — see
+                # size_in_stock below), but it is NEVER written back onto the
+                # parent row anymore. It only ever flows into CHILD rows now.
                 parent_stock = row.get("is_in_stock", True)
 
                 for i, sz in enumerate(sizes):
@@ -1687,11 +2557,20 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     size_value    = sz["size"]
 
                     if i == 0:
-                        # Also write the rescued colour back to the parent row so
-                        # the existing record stops being NULL after backfill.
+                        # v14.22 FIX 1: is_in_stock REMOVED from this payload.
+                        # This branch updates the PARENT row (row["id"], the
+                        # original lcw_{opt_id} color-level row) to attach the
+                        # first size's name — but it must NEVER write that
+                        # size's stock state onto the parent's is_in_stock,
+                        # because the parent's is_in_stock means "is ANY size
+                        # of this color available", a color-wide aggregate
+                        # that only the catalog pass's AvailableStock read is
+                        # entitled to set. Writing a single size's stock here
+                        # is what manufactured the phantom restock/stockout
+                        # flips — see the v14.22 changelog at the top of this
+                        # file for the full live-data diagnosis.
                         update_payload = {
                             "size":            size_value,
-                            "is_in_stock":     size_in_stock,
                             "last_updated_at": now_iso,
                         }
                         if not row.get("color") and color:
@@ -1702,6 +2581,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                             .eq("id", row["id"])
                         )
                     else:
+                        # Child rows (one per additional size) are UNAFFECTED by
+                        # FIX 1 — each has its OWN external_sku, so this is_in_stock
+                        # write has always belonged to this row alone, never shared
+                        # with the parent. This is the correct, real per-size signal.
                         new_sku = f"{row['external_sku']}_{size_value.replace(' ', '_')}"
                         safe_db_execute(
                             supabase.table("product_variants").upsert({
@@ -1904,6 +2787,14 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                     "image_url":           item.get("PictureName") or None,
                     "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                     "is_active":           True,
+                    # v14.24: DeFacto's titles are the strongest signal for
+                    # both sleeve length and fit/cut (confirmed: 55%/61% live
+                    # coverage) — default title-first priority order applies.
+                    # Also picks up any v14.25 dress/jacket/underwear/swimwear/
+                    # bag attributes if this product's category matches.
+                    "attributes_extracted": build_attributes_extracted(
+                        brand_name, category_norm, category_raw, name
+                    ),
                 })
 
             if not batch_products:
@@ -2255,6 +3146,11 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
 WOO_SIZE_ATTR_HINTS  = ("size", "sizes", "مقاس", "المقاس")
 WOO_COLOR_ATTR_HINTS = ("color", "colour", "colours", "colors", "لون", "اللون")
 
+# v14.23: one-time-per-run diagnostic flag for the variation id-matching fix.
+# Reset to {"done": False} at the top of scrape_woocommerce() so it prints
+# once per scheduled run, not once per script lifetime.
+_MOBACO_DIAG = {"done": False}
+
 def _woo_price(amount, minor_unit):
     """Convert a WooCommerce minor-unit price string to a real number, safely."""
     try:
@@ -2316,36 +3212,48 @@ def _woo_resolve_variation_attrs(variation, term_lookup):
     Given one entry from product.variations[] (raw {name, value} slug pairs)
     and the product's term_lookup, resolve which value is the size label and
     which is the colour label using the WOO_*_ATTR_HINTS, same hint strings
-    the rest of the codebase uses. Returns (size_or_None, color_or_None,
-    lookup_key) where lookup_key is the sorted (attr_name, attr_value) tuple
-    needed to look up real price/stock in the variations-endpoint result.
+    the rest of the codebase uses. Returns (size_or_None, color_or_None).
+
+    v14.23: no longer returns a lookup_key. Matching against the live
+    /variations endpoint now happens on the variation's own numeric `id`
+    (see fetch_mobaco_variations' v14.23 changelog) — attribute name/value
+    text is only used here for what it's actually reliable for: resolving
+    human-facing size/colour labels to store in the database.
     """
     size_val, color_val = None, None
-    key_parts = []
     for a in (variation.get("attributes") or []):
         aname = (a.get("name") or "").strip().lower()
         aval  = (a.get("value") or "").strip().lower()
         if not aname:
             continue
-        key_parts.append((aname, aval))
         resolved = term_lookup.get(aname, {}).get(aval, aval)
         if any(h in aname for h in WOO_SIZE_ATTR_HINTS):
             size_val = resolved
         elif any(h in aname for h in WOO_COLOR_ATTR_HINTS):
             color_val = resolved
-    lookup_key = tuple(sorted(key_parts))
-    return size_val, color_val, lookup_key
+    return size_val, color_val
 
 def fetch_mobaco_variations(session, domain, product_id):
     """
     GET the real per-variation price + stock for one product via the
     documented WooCommerce Store API v1 endpoint:
         GET /wp-json/wc/store/v1/products/{id}/variations
-    Returns {sorted_attr_key_tuple: {"price", "compare_at", "is_in_stock", "sku"}}.
+    Returns {variation_id (int): {"price", "compare_at", "is_in_stock", "sku"}}.
     Returns {} on ANY failure (network, bad JSON, unexpected shape) — caller
     falls back to product-level price/stock for that one variation rather
     than raising, matching the fault-isolation pattern used everywhere else
     in this engine.
+
+    v14.23: keyed by the variation's own numeric `id` instead of a
+    reconstructed (attr_name, attr_value) tuple. See the v14.23 changelog
+    entry at the top of this file for the full diagnosis — in short, the
+    parent product's embedded variations[] list and this dedicated endpoint
+    are NOT guaranteed to describe attributes the same way (one can use a
+    human label like "Size" / "N001", the other a taxonomy slug like
+    "pa_size" / "n001"), so building a matching key from name/value text
+    matched 0% of the time across the entire brand. The variation `id` field
+    is the one place both responses are guaranteed to agree, since they're
+    two different views of the exact same WordPress post object.
     """
     url = f"https://{domain}/wp-json/wc/store/v1/products/{product_id}/variations"
     try:
@@ -2368,12 +3276,8 @@ def fetch_mobaco_variations(session, domain, product_id):
     result = {}
     for row in rows:
         try:
-            attrs = row.get("attributes") or []
-            key = tuple(sorted(
-                (str(a.get("name", "")).strip().lower(), str(a.get("value", "")).strip().lower())
-                for a in attrs
-            ))
-            if not key:
+            var_id = row.get("id")
+            if not var_id:
                 continue
             prices = row.get("prices") or {}
             minor  = prices.get("currency_minor_unit", 2)
@@ -2381,7 +3285,7 @@ def fetch_mobaco_variations(session, domain, product_id):
             reg    = _woo_price(prices.get("regular_price"), minor)
             if cur <= 0:
                 continue
-            result[key] = {
+            result[int(var_id)] = {
                 "price":       cur,
                 "compare_at":  reg if reg > cur else None,
                 "is_in_stock": bool(row.get("is_in_stock", False)),
@@ -2404,6 +3308,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
     print(f"  [WooCommerce] Starting Store API scrape (no proxy)...")
     products_seen, price_changes = 0, 0
     PER_PAGE = 100
+    _MOBACO_DIAG["done"] = False  # v14.23: reset so the diagnostic prints once per run
 
     prev_prices = load_last_prices(supabase, brand_name)
     # v14.17: fop_done_ids passed in from scrape_brand (derived from the variant
@@ -2482,6 +3387,15 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                     "image_url":           _woo_first_image(p),
                     "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                     "is_active":           True,
+                    # v14.24: Mobaco is in SLEEVE_LENGTH_CATEGORY_FIRST_BRANDS
+                    # (some sleeve-length signal in category_raw); for fit/cut
+                    # it uses the default title-first order — Mobaco wasn't a
+                    # category-dominant brand for that attribute. Also picks up
+                    # any v14.25 dress/jacket/underwear/swimwear/bag attributes
+                    # if this product's category matches.
+                    "attributes_extracted": build_attributes_extracted(
+                        brand_name, category_norm, category_raw, name
+                    ),
                 })
             except Exception as e:
                 _pid = (p or {}).get("id", "?")
@@ -2568,20 +3482,44 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 var_data = fetch_mobaco_variations(session, domain, p["id"])
                 term_lookup = _woo_build_term_lookup(p)
 
+                # v14.23: one-time diagnostic on the FIRST variable product of
+                # the run only — confirms whether the id-based match is
+                # actually landing now. Printed once (not per-product) so it's
+                # easy to spot in the run log without flooding it. If
+                # var_data is non-empty but still produces zero matches against
+                # this product's variation ids, that's a second-order surprise
+                # worth seeing immediately rather than silently falling back
+                # again exactly like before.
+                if not _MOBACO_DIAG["done"]:
+                    _MOBACO_DIAG["done"] = True
+                    sample_ids = [v.get("id") for v in variations[:5]]
+                    matched = sum(1 for vid in sample_ids if vid and int(vid) in var_data)
+                    print(f"  [WooCommerce][diag] product={p.get('id')} "
+                          f"variations_endpoint_rows={len(var_data)} "
+                          f"sample_variation_ids={sample_ids} "
+                          f"matched={matched}/{len(sample_ids)}")
+
                 for var in variations:
                     try:
                         var_id = var.get("id")
-                        size_val, color_val, lookup_key = _woo_resolve_variation_attrs(var, term_lookup)
-                        live = var_data.get(lookup_key)
+                        size_val, color_val = _woo_resolve_variation_attrs(var, term_lookup)
+                        # v14.23: match on the variation's own numeric id — the
+                        # one field guaranteed to mean the same thing in both
+                        # the parent product's variations[] summary and the
+                        # dedicated /variations endpoint response. See
+                        # fetch_mobaco_variations' changelog for why the old
+                        # attribute-tuple key never matched.
+                        live = var_data.get(int(var_id)) if var_id else None
 
                         if live:
                             cur, compare_at, is_avail = live["price"], live["compare_at"], live["is_in_stock"]
                         else:
-                            # The /variations call failed or didn't include this
-                            # specific combination — fall back to the parent's
-                            # values rather than dropping the variant entirely.
-                            # This degrades gracefully to the OLD behaviour for
-                            # just this one row instead of losing data.
+                            # The /variations call failed, or this specific
+                            # variation id wasn't in its response — fall back
+                            # to the parent's values rather than dropping the
+                            # variant entirely. This degrades gracefully to
+                            # the OLD behaviour for just this one row instead
+                            # of losing data.
                             cur = parent_cur
                             compare_at = parent_reg if (parent_on_sale and parent_reg > parent_cur) else None
                             is_avail = parent_avail
