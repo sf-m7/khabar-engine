@@ -38,6 +38,13 @@ R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
 # specifically; it defaults to the real folder real data will use.)
 PREFIX = os.environ.get("ARCHIVE_QUERY_PREFIX", "price_snapshots")
 
+# The actual question to ask, supplied at run time (e.g. typed into the
+# GitHub Actions "Run workflow" box) rather than fixed inside this file.
+# When empty, falls back to the same two example queries this script
+# always ran — so it still does something useful with zero input, but is
+# no longer LIMITED to those two questions.
+CUSTOM_QUERY = os.environ.get("ARCHIVE_QUERY_SQL", "").strip()
+
 
 def connect():
     """
@@ -102,20 +109,37 @@ if __name__ == "__main__":
         print("   first real archive run (or a pilot test) writes a file.")
         sys.exit(0)
 
-    # A second example query, demonstrating this is real SQL, not just a
-    # fixed report — change this freely for whatever question comes up.
-    try:
-        by_brand = run_query(con, """
-            SELECT brand, count(*) AS rows, round(avg(price), 2) AS avg_price
-            FROM archive
-            GROUP BY brand
-            ORDER BY rows DESC
-        """)
-        print("\n📊 Rows per brand in the archive:")
-        print(by_brand.to_string(index=False))
-    except Exception as e:
-        print(f"\n⚠️ Breakdown query failed: {e}")
+    if CUSTOM_QUERY:
+        # A real question, typed in at run time (e.g. into the GitHub Actions
+        # "Run workflow" box), not fixed in this file. Write it as you would
+        # any SQL SELECT — the table is always called `archive` and always
+        # means "every Parquet file currently in the folder, combined."
+        print(f"\n❓ Running your question:\n   {CUSTOM_QUERY}")
+        try:
+            result = run_query(con, CUSTOM_QUERY)
+            print("\n📊 Result:")
+            print(result.to_string(index=False))
+        except Exception as e:
+            print(f"\n⚠️ Your query failed: {e}")
+            print("   Check the SQL — remember the table is always called `archive`,")
+            print("   e.g.: SELECT brand, avg(price) FROM archive GROUP BY brand")
+            sys.exit(1)
+    else:
+        # No question supplied — fall back to one more illustrative example
+        # so the script still demonstrates something useful on its own.
+        try:
+            by_brand = run_query(con, """
+                SELECT brand, count(*) AS rows, round(avg(price), 2) AS avg_price
+                FROM archive
+                GROUP BY brand
+                ORDER BY rows DESC
+            """)
+            print("\n📊 No question supplied — showing rows per brand as a default:")
+            print(by_brand.to_string(index=False))
+            print("\n   To ask your own question instead, supply it via the "
+                  "ARCHIVE_QUERY_SQL input next time you run this.")
+        except Exception as e:
+            print(f"\n⚠️ Default breakdown query failed: {e}")
 
-    print("\n✅ Done. Edit the SQL in this script's run_query() calls to ask "
-          "anything else — the `archive` table always means 'every file "
-          "currently in the folder, combined.'")
+    print("\n✅ Done. The `archive` table always means 'every file currently "
+          "in the folder, combined' — ask it anything a SELECT can answer.")
