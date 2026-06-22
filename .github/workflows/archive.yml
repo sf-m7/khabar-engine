@@ -9,8 +9,22 @@ on:
     # finds more eligible rows and processes them — nothing is lost by a
     # delay, since the gate (verify-before-delete) controls correctness,
     # not the schedule.
+    #
+    # NOTE: the scheduled trigger NEVER sets dry_run or threshold_override —
+    # those inputs only exist on the manual workflow_dispatch trigger below,
+    # specifically so a pilot test can never accidentally become the
+    # production schedule's behaviour.
     - cron: "0 4 * * 1"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pilot mode: run the full pipeline (export, upload, verify) but skip the actual delete. Use this to test before trusting a real run."
+        type: boolean
+        default: true
+      threshold_override_days:
+        description: "Archive rows older than this many days, for THIS manual run only. Leave at 35 for a realistic test; lower it (e.g. 5) to pilot against young real data."
+        type: string
+        default: "35"
 
 jobs:
   archive:
@@ -39,4 +53,11 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          # These two only ever resolve to a non-default value when this run
+          # was started by workflow_dispatch — github.event.inputs is empty
+          # on a schedule trigger, so a scheduled run always falls back to
+          # ARCHIVE_DRY_RUN=false and the real 35-day threshold, regardless
+          # of what any past manual run used.
+          ARCHIVE_DRY_RUN:                 ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          ARCHIVE_THRESHOLD_DAYS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.threshold_override_days || '35' }}
         run: python -u archive.py
