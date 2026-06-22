@@ -128,7 +128,7 @@ def fetch_lookup_tables(product_ids, variant_ids):
         chunk_ids = product_ids[i:i + 500]
         res = safe_db_execute(
             supabase.table("products")
-            .select("id, name, category_normalized, gender")
+            .select("id, name, category_normalized, category_raw, gender, attributes_extracted")
             .in_("id", chunk_ids)
         )
         for row in (res.data or []) if res else []:
@@ -154,27 +154,45 @@ def flatten_rows(rows, products_map, variants_map):
     variant_id is nullable (product-level snapshots, see build_snapshot_rows
     in scraper.py for why): size/color are only pulled when a variant_id
     is actually present, never guessed.
+
+    category_raw and attributes_extracted were added after a direct
+    comparison against the live Supabase schema showed they were the only
+    two product-level fields missing from the archive — everything else
+    (price/compare_at_price/discount_pct/snapshot_date/recorded_at/brand
+    from price_snapshots; name/category_normalized/gender from products;
+    size/color from product_variants) already matched the source column
+    names exactly. attributes_extracted is JSONB in Postgres (a small dict
+    like {"fit": "wide leg"} or {} when nothing was extracted) — Parquet has
+    no native dict type, so it's stored here as a JSON STRING column, which
+    is the standard lossless way to carry a variable-shaped object through
+    Parquet and is exactly the form DuckDB's json_extract() expects to query
+    directly (e.g. json_extract(attributes_extracted, '$.fit')).
     """
+    import json as _json
+
     flattened = []
     for r in rows:
         product = products_map.get(r.get("product_id")) or {}
         variant = variants_map.get(r.get("variant_id")) if r.get("variant_id") else {}
         variant = variant or {}
+        attrs = product.get("attributes_extracted")
         flattened.append({
-            "snapshot_id":         r["id"],
-            "product_id":          r.get("product_id"),
-            "variant_id":          r.get("variant_id"),
-            "brand":               r.get("brand"),
-            "product_name":        product.get("name"),
-            "category_normalized": product.get("category_normalized"),
-            "gender":              product.get("gender"),
-            "size":                variant.get("size"),
-            "color":               variant.get("color"),
-            "price":               float(r["price"]) if r.get("price") is not None else None,
-            "compare_at_price":    float(r["compare_at_price"]) if r.get("compare_at_price") is not None else None,
-            "discount_pct":        float(r["discount_pct"]) if r.get("discount_pct") is not None else None,
-            "snapshot_date":       str(r.get("snapshot_date")),
-            "recorded_at":         r.get("recorded_at"),
+            "snapshot_id":          r["id"],
+            "product_id":           r.get("product_id"),
+            "variant_id":           r.get("variant_id"),
+            "brand":                r.get("brand"),
+            "product_name":         product.get("name"),
+            "category_normalized":  product.get("category_normalized"),
+            "category_raw":         product.get("category_raw"),
+            "gender":               product.get("gender"),
+            "size":                 variant.get("size"),
+            "color":                variant.get("color"),
+            "attributes_extracted": _json.dumps(attrs) if attrs is not None else None,
+            "price":                float(r["price"]) if r.get("price") is not None else None,
+            "compare_at_price":     float(r["compare_at_price"]) if r.get("compare_at_price") is not None else None,
+            "discount_pct":         float(r["discount_pct"]) if r.get("discount_pct") is not None else None,
+            "snapshot_date":        str(r.get("snapshot_date")),
+            "recorded_at":          r.get("recorded_at"),
         })
     return flattened
 
