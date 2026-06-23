@@ -488,6 +488,8 @@ WEBSHARE_PROXY = {
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",        "engine": "lcw_proxy"},
     {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
+    {"name": "khotwh",     "domain": "khotwh.com",               "engine": "shopify"},
+    {"name": "tomato",     "domain": "www.tomatostores.com",     "engine": "shopify"},
     {"name": "esla",       "domain": "esla-store.com",           "engine": "shopify"},
     {"name": "town_team",  "domain": "www.townteam.com",         "engine": "shopify"},
     {"name": "ravin",      "domain": "shop.iravin.com",          "engine": "shopify"},
