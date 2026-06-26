@@ -3751,10 +3751,6 @@ if __name__ == "__main__":
     if SCRAPE_TARGET in ("lcw", "all"):
         try:
             _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-            cutoff_snap = str(date.today() - timedelta(days=35))
-            safe_db_execute(
-                _sb.table("price_snapshots").delete().lt("snapshot_date", cutoff_snap)
-            )
             cutoff_events = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
             safe_db_execute(
                 _sb.table("price_events").delete().lt("recorded_at", cutoff_events)
