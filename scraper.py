@@ -539,7 +539,7 @@ BRAND_DISPLAY = {
 # normal "unisex" fallback for genuinely mixed-gender catalogs) is completely
 # unaffected. Same opt-in-set pattern as COLOR_FROM_TITLE_BRANDS and
 # ARABIC_COLOR_BRANDS below.
-FEMALE_ONLY_BRANDS = {"carina"}
+FEMALE_ONLY_BRANDS = {"carina", "just_sbr", "mlameh"}
 
 # ── Category Taxonomy ─────────────────────────────────────────────────────────
 CATEGORY_MAP = {
