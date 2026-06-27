@@ -486,8 +486,11 @@ WEBSHARE_PROXY = {
 } if WEBSHARE_USER and WEBSHARE_PASS else None
 
 BRANDS = [
-    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",        "engine": "lcw_proxy"},
+    {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",       "engine": "lcw_proxy"},
     {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
+    {"name": "just_sbr",   "domain": "www.justsbr.com",          "engine": "shopify"},
+    {"name": "activ",      "domain": "activ.eg",                 "engine": "shopify"},
+    {"name": "mlameh",     "domain": "mlameh.com",               "engine": "shopify"},
     {"name": "khotwh",     "domain": "khotwh.com",               "engine": "shopify"},
     {"name": "tomato",     "domain": "www.tomatostores.com",     "engine": "shopify"},
     {"name": "esla",       "domain": "esla-store.com",           "engine": "shopify"},
@@ -507,6 +510,11 @@ BRANDS = [
 BRAND_DISPLAY = {
     "town_team":  "Town Team",
     "ravin":      "Ravin",
+    "mlameh":     "Mlameh",
+    "just_sbr":   "Just SBR",
+    "activ":      "Activ",
+    "khotwh":     "Khotwh",
+    "tomato":     "Tomato Stores",
     "mens_club":  "Men's Club",
     "tree":       "Tree",
     "dott_jeans": "Dott Jeans",
