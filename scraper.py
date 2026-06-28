@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v14  (current: v14.18)
+# KHABAR — Scraper v14  (current: v14.29)
 # Built on v13. Changes:
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
@@ -454,6 +454,41 @@
 #         Neither direction is implemented in this file. This comment exists
 #         so the next iteration starts from "here's what was already tried
 #         and why," not from zero.
+#  v14.29 THREE NEW DATA STREAMS — low-cost additions that deepen the
+#         intelligence products without significant egress or storage cost:
+#
+#         1. BRAND LAUNCH DATE (source_published_at). Shopify's /products.json
+#            includes `published_at` — the real date a product went live on
+#            the brand's storefront, often months or years before our scraper
+#            first saw it. WooCommerce's Store API has `date_created`. LCW
+#            and DeFacto's catalog APIs don't expose a launch date, so those
+#            stay NULL (honest). This is captured on the existing upsert —
+#            zero extra requests. The column reaches backwards in time:
+#            even though our price observations start June 2026, a product
+#            published in 2024 gives real lifecycle age for launch-to-
+#            markdown velocity and product-age cohort analysis.
+#
+#         2. BEST-SELLER RANK (top 150 per brand per day). Shopify's public
+#            /collections/all/products.json?sort_by=best-selling returns
+#            products ranked by the brand's own sales data — a DIRECT
+#            demand signal that corroborates stockout-inferred demand with
+#            an independent measurement. Capped at 150 per brand to keep
+#            storage bounded (~10-20 MB steady state). One request per
+#            brand per day (16 Shopify brands × 1 request = 16 requests
+#            total). Stored in `bestseller_rank` table. Not available for
+#            LCW/DeFacto/WooCommerce (no public sort-by-bestselling API).
+#            Runs as a post-run pass in __main__.
+#
+#         3. DAILY FX RATE (USD→EGP). A single number per day from
+#            frankfurter.app (free, no API key). Stored in `fx_rate`
+#            table. NOT a per-variant USD price — it's a contextual number
+#            joined by date to price_events, used to distinguish FX-driven
+#            repricing from genuine promotional markdowns. Critical for
+#            defending the honest-discount product against "the currency
+#            moved" objections. Runs once at the start of each run.
+#
+#         DB migration: add_published_at_bestseller_rank_fx_rate
+#         (adds source_published_at column + two new tables).
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -1770,6 +1805,11 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                 "image_url":           safe_image,
                 "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                 "is_active":           True,
+                # v14.29: brand's real launch date — Shopify's published_at
+                # is the date the product went live on the storefront, often
+                # predating our scraper by months/years. Captured for free
+                # (already in the /products.json response we download).
+                "source_published_at": p.get("published_at"),
                 # v14.24+v14.25: sub-category detail (sleeve length/fit for tops
                 # and bottoms; dress length/silhouette, jacket type, underwear
                 # style, swimwear style, bag type for their respective
@@ -3397,6 +3437,8 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                     "image_url":           _woo_first_image(p),
                     "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                     "is_active":           True,
+                    # v14.29: WooCommerce Store API exposes date_created.
+                    "source_published_at": p.get("date_created"),
                     # v14.24: Mobaco is in SLEEVE_LENGTH_CATEGORY_FIRST_BRANDS
                     # (some sleeve-length signal in category_raw); for fit/cut
                     # it uses the default title-first order — Mobaco wasn't a
@@ -3651,6 +3693,176 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
 
     return products_seen, price_changes
 
+# ── FX Rate (v14.29) ─────────────────────────────────────────────────────────
+#
+# One row per day recording the daily USD→EGP exchange rate. Used
+# analytically to distinguish FX-driven repricing from genuine promotional
+# markdowns. Fetched from frankfurter.app (free, open-source, no API key).
+# Idempotent: if today's rate already exists, this is a no-op.
+
+def fetch_and_store_fx_rate(supabase, session):
+    """
+    Fetch today's USD→EGP rate and store it. Runs once per scraper invocation
+    (the __main__ block calls it before the brand loop). If today's row
+    already exists (e.g. from an earlier run), this is a silent no-op.
+
+    Uses frankfurter.app — a free, open-source ECB-based API that covers
+    EGP. No API key needed. Falls back gracefully on any failure so the
+    scraper run continues regardless.
+    """
+    today_str = str(date.today())
+    try:
+        existing = safe_db_execute(
+            supabase.table("fx_rate")
+            .select("id")
+            .eq("rate_date", today_str)
+            .limit(1)
+        )
+        if existing and existing.data:
+            return  # already recorded today
+
+        res = execute_with_retry(
+            session.get,
+            f"https://api.frankfurter.app/latest?from=USD&to=EGP",
+            max_retries=2, backoff=3, timeout=10,
+            headers={"User-Agent": "Khabar-Scraper/1.0"}
+        )
+        if res.status_code != 200:
+            print(f"  ⚠️ FX rate API returned HTTP {res.status_code}. Skipping.")
+            return
+        data = res.json()
+        rate = data.get("rates", {}).get("EGP")
+        if not rate:
+            print(f"  ⚠️ FX rate API did not return EGP rate. Response: {data}")
+            return
+        safe_db_execute(
+            supabase.table("fx_rate").insert({
+                "rate_date": today_str,
+                "usd_egp":  float(rate),
+                "source":   "frankfurter",
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            })
+        )
+        print(f"  💱 FX rate recorded: 1 USD = {rate} EGP ({today_str})")
+    except Exception as e:
+        print(f"  ⚠️ FX rate fetch failed (non-fatal): {e}")
+
+
+# ── Best-Seller Rank (v14.29) ───────────────────────────────────────────────
+#
+# Shopify's public /collections/all/products.json endpoint supports
+# ?sort_by=best-selling, which returns products ranked by the brand's own
+# sales data. This is a DIRECT demand signal — the brand is literally
+# telling us what sells most, for free, via a sort parameter.
+#
+# Capped at top 150 per brand. One request per brand (limit=250 covers it).
+# Runs as a post-run pass, not inline with per-brand scraping, so it
+# doesn't slow down the main pipeline or pollute retry logic.
+#
+# Only available for Shopify brands — LCW/DeFacto/WooCommerce don't have
+# a public best-selling sort on their catalog APIs.
+
+BESTSELLER_CAP = 150  # max rank to record per brand per day
+
+def collect_bestseller_ranks(supabase, session):
+    """
+    For each Shopify brand, fetch the best-selling sort and record
+    rank 1–BESTSELLER_CAP. Idempotent: if today's ranks already exist
+    for a brand, that brand is skipped.
+    """
+    today_str = str(date.today())
+    shopify_brands = [b for b in BRANDS if b["engine"] == "shopify"]
+    total_recorded = 0
+
+    for brand in shopify_brands:
+        brand_name = brand["name"]
+        domain     = brand["domain"]
+        try:
+            # Check if we already have today's ranks for this brand
+            existing = safe_db_execute(
+                supabase.table("bestseller_rank")
+                .select("id")
+                .eq("brand", brand_name)
+                .eq("snapshot_date", today_str)
+                .limit(1)
+            )
+            if existing and existing.data:
+                continue  # already collected today
+
+            url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit=250"
+            try:
+                res = execute_with_retry(
+                    session.get, url, max_retries=2, backoff=3, timeout=30,
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+            except Exception as e:
+                print(f"  ⚠️ [Bestseller] {brand_name}: request failed ({e}). Skipping.")
+                continue
+
+            if res.status_code != 200:
+                print(f"  ⚠️ [Bestseller] {brand_name}: HTTP {res.status_code}. Skipping.")
+                continue
+
+            products = res.json().get("products", [])
+            if not products:
+                print(f"  ⚠️ [Bestseller] {brand_name}: empty response. Skipping.")
+                continue
+
+            # Map external_ids to product_ids in our DB. We need to look up
+            # each product's DB id from its Shopify external_id.
+            external_ids = [str(p["id"]) for p in products[:BESTSELLER_CAP]]
+
+            # Fetch in batches of 100 (PostgREST .in_() has practical limits)
+            db_id_map = {}
+            for i in range(0, len(external_ids), 100):
+                chunk_ids = external_ids[i:i+100]
+                result = safe_db_execute(
+                    supabase.table("products")
+                    .select("id, external_id")
+                    .eq("brand", brand_name)
+                    .in_("external_id", chunk_ids)
+                )
+                if result and result.data:
+                    for row in result.data:
+                        db_id_map[row["external_id"]] = row["id"]
+
+            # Build rank rows
+            rank_rows = []
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for rank_pos, p in enumerate(products[:BESTSELLER_CAP], start=1):
+                ext_id = str(p["id"])
+                db_pid = db_id_map.get(ext_id)
+                if not db_pid:
+                    continue  # product not in our DB (shouldn't happen, but safe)
+                rank_rows.append({
+                    "product_id":    db_pid,
+                    "brand":         brand_name,
+                    "rank":          rank_pos,
+                    "snapshot_date": today_str,
+                    "recorded_at":   now_iso,
+                })
+
+            # Insert in batches
+            if rank_rows:
+                for i in range(0, len(rank_rows), 100):
+                    safe_db_execute(
+                        supabase.table("bestseller_rank")
+                        .insert(rank_rows[i:i+100])
+                    )
+                total_recorded += len(rank_rows)
+
+            # Brief pause between brands (same pattern as main scraper)
+            time.sleep(random.uniform(1, 3))
+
+        except Exception as e:
+            print(f"  ⚠️ [Bestseller] {brand_name}: unexpected error ({e}). Skipping.")
+            continue
+
+    if total_recorded:
+        print(f"  🏆 Best-seller ranks recorded: {total_recorded} products across "
+              f"{len(shopify_brands)} Shopify brands.")
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 def scrape_brand(brand_name, domain):
@@ -3755,6 +3967,16 @@ if __name__ == "__main__":
     startup_jitter = random.uniform(0, 30)
     print(f"  Startup jitter: {startup_jitter:.1f}s")
     time.sleep(startup_jitter)
+
+    # v14.29: record today's USD→EGP rate (once per run, idempotent).
+    # Runs on every target — FX context is useful regardless of which
+    # brands this particular run processes.
+    try:
+        _fx_sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        _fx_session = get_resilient_session()
+        fetch_and_store_fx_rate(_fx_sb, _fx_session)
+    except Exception as e:
+        print(f"  ⚠️ FX rate step failed (non-fatal): {e}")
 
     if SCRAPE_TARGET in ("lcw", "all"):
         try:
@@ -3945,5 +4167,19 @@ if __name__ == "__main__":
                         print(f"  📊 Detected {stat_count} statistical deal events (L1·07).")
     except Exception as e:
         print(f"  ⚠️ Post-run intelligence detection error: {e}")
+
+    # v14.29: collect best-seller ranks for Shopify brands (post-run pass).
+    # Only runs on targets that include Shopify brands, and only once daily
+    # (idempotent — skips brands that already have today's ranks).
+    if SCRAPE_TARGET in ("shopify", "all"):
+        try:
+            print(f"\n{'═'*55}")
+            print(f"  🏆 BEST-SELLER RANK COLLECTION")
+            print(f"{'═'*55}")
+            _bs_sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+            _bs_session = get_resilient_session()
+            collect_bestseller_ranks(_bs_sb, _bs_session)
+        except Exception as e:
+            print(f"  ⚠️ Best-seller rank collection failed (non-fatal): {e}")
 
     print(f"\n🏁 All done. Total price changes this run: {total}")
