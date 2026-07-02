@@ -244,44 +244,84 @@ def flatten_with_product(rows):
 # scraper.py, no longer gated on the LCW run)
 # ─────────────────────────────────────────────
 def delist_stale_products():
+    """
+    Drains the FULL backlog each run rather than a fixed 500/200-row slice.
+    The old scraper version capped at 500 products / 200 variants per call
+    — fine if it ran daily without fail, silently inadequate once it
+    started skipping days (a 22,843-variant backlog was found sitting
+    behind that cap in production). This version keeps re-fetching and
+    updating in batches of 500 until nothing stale remains, however large
+    the backlog is. Each production batch flips is_active/delisted_at
+    before the next fetch, so the same rows are never re-selected — the
+    loop provably terminates.
+
+    DRY_RUN never mutates state, so a repeated fetch would return the same
+    500 rows forever. Instead it asks Supabase directly for an exact count
+    — giving an honest total rather than a batch-sized guess.
+    """
     print(f"\n🏷️  [delisting] flagging products unseen for "
           f"{STALE_PRODUCT_DAYS}+ days ...")
     now_iso     = datetime.now(timezone.utc).isoformat()
     cutoff_seen = (datetime.now(timezone.utc)
                    - timedelta(days=STALE_PRODUCT_DAYS)).isoformat()
 
-    stale_products = safe_db_execute(
-        supabase.table("products")
-        .select("id, brand")
-        .eq("is_active", True)
-        .lt("last_seen_at", cutoff_seen)
-        .limit(500)
-    )
-    pids = [r["id"] for r in (stale_products.data or [])] if stale_products else []
-
-    stale_variants = safe_db_execute(
-        supabase.table("product_variants")
-        .select("id, product_id, size, color, products!inner(brand, last_seen_at)")
-        .is_("delisted_at", "null")
-        .lt("products.last_seen_at", cutoff_seen)
-        .limit(200)
-    )
-    vrows = (stale_variants.data or []) if stale_variants else []
-
     if DRY_RUN:
-        print(f"  🧪 DRY RUN — would delist {len(pids)} products and "
-              f"{len(vrows)} variants. No flags changed.")
+        p_count = safe_db_execute(
+            supabase.table("products")
+            .select("id", count="exact")
+            .eq("is_active", True)
+            .lt("last_seen_at", cutoff_seen)
+        )
+        v_count = safe_db_execute(
+            supabase.table("product_variants")
+            .select("id, products!inner(last_seen_at)", count="exact")
+            .is_("delisted_at", "null")
+            .lt("products.last_seen_at", cutoff_seen)
+        )
+        total_p = p_count.count if p_count and p_count.count is not None else 0
+        total_v = v_count.count if v_count and v_count.count is not None else 0
+        print(f"  🧪 DRY RUN — would delist {total_p} products and "
+              f"{total_v} variants (full backlog, not a batch cap). "
+              f"No flags changed.")
         return True
 
-    if pids:
+    # ---- Products: drain in batches of 500 until none remain ----
+    total_products = 0
+    while True:
+        batch = safe_db_execute(
+            supabase.table("products")
+            .select("id, brand")
+            .eq("is_active", True)
+            .lt("last_seen_at", cutoff_seen)
+            .limit(500)
+        )
+        rows = (batch.data or []) if batch else []
+        if not rows:
+            break
+        pids = [r["id"] for r in rows]
         safe_db_execute(
             supabase.table("products")
             .update({"is_active": False, "delisted_at": now_iso})
             .in_("id", pids)
         )
-        print(f"  Marked {len(pids)} stale products as delisted.")
+        total_products += len(pids)
+    if total_products:
+        print(f"  Marked {total_products} stale products as delisted.")
 
-    if vrows:
+    # ---- Variants: drain in batches of 500 until none remain ----
+    total_variants = 0
+    while True:
+        batch = safe_db_execute(
+            supabase.table("product_variants")
+            .select("id, product_id, size, color, products!inner(brand, last_seen_at)")
+            .is_("delisted_at", "null")
+            .lt("products.last_seen_at", cutoff_seen)
+            .limit(500)
+        )
+        vrows = (batch.data or []) if batch else []
+        if not vrows:
+            break
+
         event_rows = [{
             "variant_id":            v["id"],
             "product_id":            v.get("product_id"),
@@ -296,16 +336,18 @@ def delist_stale_products():
         } for v in vrows]
         for i in range(0, len(event_rows), 100):
             safe_db_execute(supabase.table("stockout_events").insert(event_rows[i:i + 100]))
-        vids = [v["id"] for v in vrows]
-        for i in range(0, len(vids), 200):
-            safe_db_execute(
-                supabase.table("product_variants")
-                .update({"delisted_at": now_iso, "is_in_stock": False})
-                .in_("id", vids[i:i + 200])
-            )
-        print(f"  Recorded {len(event_rows)} variant delisting events.")
 
-    if not pids and not vrows:
+        vids = [v["id"] for v in vrows]
+        safe_db_execute(
+            supabase.table("product_variants")
+            .update({"delisted_at": now_iso, "is_in_stock": False})
+            .in_("id", vids)
+        )
+        total_variants += len(vids)
+    if total_variants:
+        print(f"  Recorded {total_variants} variant delisting events.")
+
+    if not total_products and not total_variants:
         print("  Nothing stale — catalog is fully fresh.")
     return True
 
