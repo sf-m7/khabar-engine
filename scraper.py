@@ -3978,62 +3978,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  ⚠️ FX rate step failed (non-fatal): {e}")
 
-    if SCRAPE_TARGET in ("lcw", "all"):
-        try:
-            _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-            cutoff_events = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            safe_db_execute(
-                _sb.table("price_events").delete().lt("recorded_at", cutoff_events)
-            )
-            now_iso     = datetime.now(timezone.utc).isoformat()
-            cutoff_seen = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
-            stale_products = safe_db_execute(
-                _sb.table("products")
-                .select("id, brand")
-                .eq("is_active", True)
-                .lt("last_seen_at", cutoff_seen)
-                .limit(500)
-            )
-            if stale_products and stale_products.data:
-                pids = [r["id"] for r in stale_products.data]
-                safe_db_execute(
-                    _sb.table("products")
-                    .update({"is_active": False, "delisted_at": now_iso})
-                    .in_("id", pids)
-                )
-                print(f"  Marked {len(pids)} stale products as delisted.")
-            stale_variants = safe_db_execute(
-                _sb.table("product_variants")
-                .select("id, product_id, size, color, products!inner(brand, last_seen_at)")
-                .is_("delisted_at", "null")
-                .lt("products.last_seen_at", cutoff_seen)
-                .limit(200)
-            )
-            if stale_variants and stale_variants.data:
-                event_rows = [{
-                    "variant_id":            v["id"],
-                    "product_id":            v.get("product_id"),
-                    "brand":                 (v.get("products") or {}).get("brand"),
-                    "size":                  v.get("size"),
-                    "color":                 v.get("color"),
-                    "event_type":            "delisted",
-                    "price_at_event":        None,
-                    "discount_pct_at_event": None,
-                    "was_on_discount":       False,
-                    "recorded_at":           now_iso,
-                } for v in stale_variants.data]
-                for i in range(0, len(event_rows), 100):
-                    safe_db_execute(_sb.table("stockout_events").insert(event_rows[i:i+100]))
-                vids = [v["id"] for v in stale_variants.data]
-                for i in range(0, len(vids), 200):
-                    safe_db_execute(
-                        _sb.table("product_variants")
-                        .update({"delisted_at": now_iso, "is_in_stock": False})
-                        .in_("id", vids[i:i+200])
-                    )
-                print(f"  Recorded {len(event_rows)} variant delisting events.")
-        except Exception as e:
-            print(f"⚠️ Pre-run housecleaning dropped: {e}")
+    # NOTE: the price_events purge and stale-product/variant delisting that
+    # used to run here (gated on SCRAPE_TARGET == "lcw") were moved to
+    # housekeeping.py, its own weekly workflow. Two reasons: (1) this block
+    # deleted price_events with no archive step first — the same mistake
+    # already caught and fixed for price_snapshots; (2) tying maintenance
+    # to the LCW run meant it silently didn't happen whenever LCW failed,
+    # which is often. housekeeping.py archives-then-deletes on its own
+    # schedule regardless of any scraper's daily luck.
 
     # v14.20: run each brand, track (seen, changes) per brand, and add two
     # defenses against the rate-limiting pattern seen in a real run where
