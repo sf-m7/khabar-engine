@@ -1,0 +1,64 @@
+name: Khabar Housekeeping
+
+on:
+  schedule:
+    # Mondays 05:00 UTC — after the weekly rollup (03:00) and the
+    # price_snapshots cold archive (04:00), so this job always operates on
+    # a week that has already been rolled up and archived. Same
+    # self-healing philosophy: a missed Monday just means the next run
+    # finds more eligible rows. The verify-before-delete gate controls
+    # correctness, not the schedule.
+    #
+    # NOTE: the scheduled trigger NEVER sets dry_run or any threshold
+    # override — those inputs only exist on the manual workflow_dispatch
+    # trigger, so a pilot test can never leak into production behaviour.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pilot mode: run every archive pipeline (export, upload, verify) but skip all deletes and skip delisting flag changes."
+        type: boolean
+        default: true
+      stockout_days:
+        description: "Archive stockout_events older than this many days, for THIS run only."
+        type: string
+        default: "60"
+      price_event_days:
+        description: "Archive price_events older than this many days, for THIS run only."
+        type: string
+        default: "30"
+      weekly_summary_weeks:
+        description: "Archive weekly_product_summary rows with week_start older than this many weeks, for THIS run only."
+        type: string
+        default: "12"
+
+jobs:
+  housekeeping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Run housekeeping
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:         ${{ secrets.SUPABASE_KEY }}
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          # github.event.inputs is empty on schedule triggers, so scheduled
+          # runs always fall back to production defaults regardless of what
+          # any past manual run used — same guard as archive.yml.
+          HK_DRY_RUN:                        ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          HK_STOCKOUT_DAYS_OVERRIDE:         ${{ github.event_name == 'workflow_dispatch' && inputs.stockout_days || '60' }}
+          HK_PRICE_EVENT_DAYS_OVERRIDE:      ${{ github.event_name == 'workflow_dispatch' && inputs.price_event_days || '30' }}
+          HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE:  ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_summary_weeks || '12' }}
+        run: python -u housekeeping.py
