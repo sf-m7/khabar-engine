@@ -142,7 +142,7 @@ def db():
     return psycopg2.connect(DB_URL)
 
 
-def gemini(prompt_parts, expect_json=True, retries=4):
+def gemini(prompt_parts, expect_json=True, retries=6):
     """One Gemini call with budget guard, backoff, and JSON cleanup.
     prompt_parts: list of dicts, e.g. [{"text": ...}] or with inline images.
     """
@@ -157,15 +157,24 @@ def gemini(prompt_parts, expect_json=True, retries=4):
 
     body = {"contents": [{"parts": prompt_parts}]}
     for attempt in range(retries):
-        resp = requests.post(
-            GEMINI_URL,
-            params={"key": GEMINI_API_KEY},
-            json=body,
-            timeout=120,
-        )
-        if resp.status_code == 429:  # rate limited: wait and retry
-            wait = 15 * (attempt + 1)
-            print(f"  rate-limited, waiting {wait}s ...")
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                params={"key": GEMINI_API_KEY},
+                json=body,
+                timeout=120,
+            )
+        except requests.exceptions.RequestException as e:
+            # Network hiccup (timeout, dropped connection): wait and retry
+            wait = 20 * (attempt + 1)
+            print(f"  network error ({e.__class__.__name__}), waiting {wait}s ...")
+            time.sleep(wait)
+            continue
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # 429 = "you're calling too fast", 5xx = "Google is overloaded".
+            # Both are temporary: wait longer each time and redial.
+            wait = 20 * (attempt + 1)
+            print(f"  Gemini busy (HTTP {resp.status_code}), waiting {wait}s ...")
             time.sleep(wait)
             continue
         resp.raise_for_status()
@@ -182,7 +191,11 @@ def gemini(prompt_parts, expect_json=True, retries=4):
             return json.loads(cleaned)
         except json.JSONDecodeError:
             return None
-    raise RuntimeError("Gemini kept rate-limiting; try again later.")
+    raise RuntimeError(
+        "Gemini stayed unavailable after 6 patient retries. Nothing is "
+        "lost — wait a while and re-run the same pass; it resumes "
+        "exactly where it stopped."
+    )
 
 
 def fetch_image_b64(url):
