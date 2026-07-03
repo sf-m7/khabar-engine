@@ -21,9 +21,10 @@ Passes (run in this order):
   all            Everything above, in order
 
 Usage:  python taxonomy_backfill.py --pass colors
-Env:    SUPABASE_DB_URL   (Postgres connection string)
-        GEMINI_API_KEY    (from Google AI Studio)
-        MAX_GEMINI_CALLS  (optional, default 5000)
+Env:    SUPABASE_DB_URL              (Postgres connection string)
+        GOOGLE_SERVICE_ACCOUNT_KEY   (JSON key for Vertex AI auth)
+        GOOGLE_CLOUD_PROJECT         (optional, read from key if omitted)
+        MAX_GEMINI_CALLS             (optional, default 5000)
 """
 
 import argparse
@@ -32,6 +33,7 @@ import os
 import re
 import sys
 import time
+import tempfile
 
 import psycopg2
 import psycopg2.extras
@@ -41,18 +43,24 @@ import requests
 # Configuration
 # ----------------------------------------------------------------------
 DB_URL = os.environ.get("SUPABASE_DB_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "5000"))
 
-# If this model name ever errors, replace with the current Flash model
-# shown at https://aistudio.google.com (Flash = the cheap, fast tier).
-GEMINI_MODEL = "gemini-flash-latest"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+# Vertex AI uses a stable model name, not an alias.
+# gemini-2.5-flash: cheap, fast, vision-capable, well within $300 budget.
+GEMINI_MODEL = "gemini-2.5-flash"
+VERTEX_REGION = "us-central1"
 
 CALLS_MADE = 0  # global budget counter
+_LAST_CALL_AT = 0.0  # for pacing
+
+# Vertex AI paid tier allows ~200+ RPM, so 1 second between calls is
+# plenty of breathing room while keeping the job fast.
+MIN_CALL_INTERVAL = 1.0
+
+# These get populated at startup by _init_vertex_auth()
+_ACCESS_TOKEN = None
+_TOKEN_EXPIRY = 0.0
+_PROJECT_ID = None
 
 # ---------------- FROZEN COLOR TAXONOMY (approved by Mohammed) --------
 COLOR_FAMILIES = [
@@ -142,38 +150,85 @@ def db():
     return psycopg2.connect(DB_URL)
 
 
+def _init_vertex_auth():
+    """Set up Vertex AI authentication from the service account key.
+    Called once at startup. Refreshes the token automatically."""
+    global _ACCESS_TOKEN, _TOKEN_EXPIRY, _PROJECT_ID
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+
+    key_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
+    if not key_json:
+        sys.exit(
+            "ERROR: GOOGLE_SERVICE_ACCOUNT_KEY env var is missing.\n"
+            "See Backfill_Setup_Guide.md for how to create and store it."
+        )
+    info = json.loads(key_json)
+    _PROJECT_ID = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or info.get("project_id")
+    )
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    creds.refresh(Request())
+    _ACCESS_TOKEN = creds.token
+    _TOKEN_EXPIRY = time.monotonic() + 3000  # refresh well before 1hr
+    print(f"  Vertex AI auth OK (project: {_PROJECT_ID})")
+
+
+def _get_token():
+    """Return a valid access token, refreshing if needed."""
+    global _ACCESS_TOKEN, _TOKEN_EXPIRY
+    if time.monotonic() > _TOKEN_EXPIRY:
+        print("  refreshing Vertex AI token ...")
+        _init_vertex_auth()
+    return _ACCESS_TOKEN
+
+
+def _vertex_url():
+    return (
+        f"https://{VERTEX_REGION}-aiplatform.googleapis.com/v1/"
+        f"projects/{_PROJECT_ID}/locations/{VERTEX_REGION}/"
+        f"publishers/google/models/{GEMINI_MODEL}:generateContent"
+    )
+
+
 def gemini(prompt_parts, expect_json=True, retries=6):
-    """One Gemini call with budget guard, backoff, and JSON cleanup.
+    """One Gemini call via Vertex AI with budget guard, pacing, and backoff.
     prompt_parts: list of dicts, e.g. [{"text": ...}] or with inline images.
     """
-    global CALLS_MADE
+    global CALLS_MADE, _LAST_CALL_AT
     if CALLS_MADE >= MAX_GEMINI_CALLS:
         raise RuntimeError(
             f"Budget guard: reached MAX_GEMINI_CALLS={MAX_GEMINI_CALLS}. "
             "Re-run later to continue (the script resumes where it stopped)."
         )
-    if not GEMINI_API_KEY:
-        sys.exit("ERROR: GEMINI_API_KEY env var is missing.")
+
+    # Pace ourselves: paid tier is generous (~200 RPM) but no reason to
+    # sprint. 1 second between calls is fast and safe.
+    elapsed = time.monotonic() - _LAST_CALL_AT
+    if elapsed < MIN_CALL_INTERVAL:
+        time.sleep(MIN_CALL_INTERVAL - elapsed)
 
     body = {"contents": [{"parts": prompt_parts}]}
+    url = _vertex_url()
     for attempt in range(retries):
+        _LAST_CALL_AT = time.monotonic()
+        headers = {
+            "Authorization": f"Bearer {_get_token()}",
+            "Content-Type": "application/json",
+        }
         try:
-            resp = requests.post(
-                GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
-                json=body,
-                timeout=120,
-            )
+            resp = requests.post(url, headers=headers, json=body, timeout=120)
         except requests.exceptions.RequestException as e:
-            # Network hiccup (timeout, dropped connection): wait and retry
             wait = 20 * (attempt + 1)
             print(f"  network error ({e.__class__.__name__}), waiting {wait}s ...")
             time.sleep(wait)
             continue
         if resp.status_code == 429 or resp.status_code >= 500:
-            # 429 = "you're calling too fast", 5xx = "Google is overloaded".
-            # Both are temporary: wait longer each time and redial.
-            wait = 20 * (attempt + 1)
+            wait = min(20 * (attempt + 1), 90)
             print(f"  Gemini busy (HTTP {resp.status_code}), waiting {wait}s ...")
             time.sleep(wait)
             continue
@@ -361,7 +416,7 @@ def pass_subcat_text():
     rows = cur.fetchall()
     print(f"  products needing text classification: {len(rows)}")
 
-    BATCH = 50
+    BATCH = 25
     done = 0
     for i in range(0, len(rows), BATCH):
         batch = rows[i : i + BATCH]
@@ -576,6 +631,12 @@ if __name__ == "__main__":
     }
     order = (["colors", "subcat-rules", "subcat-text", "subcat-vision",
               "audit"] if args.which == "all" else [args.which])
+
+    # Authenticate with Vertex AI (skip for pure-SQL passes that need no AI)
+    needs_ai = any(p != "subcat-rules" for p in order)
+    if needs_ai:
+        _init_vertex_auth()
+
     for name in order:
         steps[name]()
     print(f"\nDone. Gemini calls used this run: {CALLS_MADE}")
