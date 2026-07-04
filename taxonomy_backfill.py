@@ -21,9 +21,10 @@ Passes (run in this order):
   all            Everything above, in order
 
 Usage:  python taxonomy_backfill.py --pass colors
-Env:    SUPABASE_DB_URL   (Postgres connection string)
-        GEMINI_API_KEY    (from Google AI Studio — already stored)
-        MAX_GEMINI_CALLS  (optional, default 5000)
+Env:    SUPABASE_DB_URL              (Postgres connection string)
+        GOOGLE_SERVICE_ACCOUNT_KEY   (preferred: Vertex AI, uses $300 credits)
+        GEMINI_API_KEY               (fallback: free tier, small daily quota)
+        MAX_GEMINI_CALLS             (optional, default 5000)
 """
 
 import argparse
@@ -42,20 +43,25 @@ import requests
 # ----------------------------------------------------------------------
 DB_URL = os.environ.get("SUPABASE_DB_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SERVICE_ACCOUNT_KEY = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
 MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "5000"))
 
 GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+VERTEX_REGION = "us-central1"
 
-CALLS_MADE = 0  # global budget counter
+CALLS_MADE = 0
 _LAST_CALL_AT = 0.0
+_PRINTED_429_BODY = False  # print Google's full explanation once
 
-# Pace: 4 seconds between calls keeps us safely under the free tier's
-# RPM *and* TPM ceilings, as long as prompts stay compact.
-MIN_CALL_INTERVAL = 4.0
+# Backend state (set by _init_backend at startup)
+_BACKEND = None          # "vertex" or "apikey"
+_ACCESS_TOKEN = None
+_TOKEN_EXPIRY = 0.0
+_PROJECT_ID = None
+
+# Pacing between calls. Vertex paid tier is generous; free tier is not.
+MIN_CALL_INTERVAL_VERTEX = 1.0
+MIN_CALL_INTERVAL_APIKEY = 5.0
 
 # ---------------- FROZEN COLOR TAXONOMY (approved by Mohammed) --------
 COLOR_FAMILIES = [
@@ -145,45 +151,120 @@ def db():
     return psycopg2.connect(DB_URL)
 
 
+def _init_backend():
+    """Pick the best available lane, once, at startup.
+    Vertex AI (the $300 credits) if the service account key exists;
+    otherwise fall back to the free-tier API key."""
+    global _BACKEND
+    if SERVICE_ACCOUNT_KEY:
+        _refresh_vertex_token()
+        _BACKEND = "vertex"
+        print(f"  backend: Vertex AI / paid credits (project: {_PROJECT_ID})")
+    elif GEMINI_API_KEY:
+        _BACKEND = "apikey"
+        print("  backend: API key / free tier (small daily quota — "
+              "expect slow progress and possible daily cutoffs)")
+    else:
+        sys.exit(
+            "ERROR: no Google credentials found. Add either "
+            "GOOGLE_SERVICE_ACCOUNT_KEY (preferred) or GEMINI_API_KEY "
+            "as a repository secret."
+        )
+
+
+def _refresh_vertex_token():
+    """Log in as the service account and get a fresh access token."""
+    global _ACCESS_TOKEN, _TOKEN_EXPIRY, _PROJECT_ID
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+
+    info = json.loads(SERVICE_ACCOUNT_KEY)
+    _PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or info.get("project_id")
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    creds.refresh(Request())
+    _ACCESS_TOKEN = creds.token
+    _TOKEN_EXPIRY = time.monotonic() + 3000  # refresh well before the 1h expiry
+
+
+def _request_target():
+    """Return (url, headers, params) for whichever lane we're on."""
+    if _BACKEND == "vertex":
+        global _ACCESS_TOKEN
+        if time.monotonic() > _TOKEN_EXPIRY:
+            print("  refreshing Vertex AI token ...")
+            _refresh_vertex_token()
+        url = (
+            f"https://{VERTEX_REGION}-aiplatform.googleapis.com/v1/"
+            f"projects/{_PROJECT_ID}/locations/{VERTEX_REGION}/"
+            f"publishers/google/models/{GEMINI_MODEL}:generateContent"
+        )
+        return url, {"Authorization": f"Bearer {_ACCESS_TOKEN}",
+                     "Content-Type": "application/json"}, None
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent"
+    )
+    return url, {"Content-Type": "application/json"}, {"key": GEMINI_API_KEY}
+
+
 def gemini(prompt_parts, expect_json=True, retries=6):
-    """One Gemini call with budget guard, pacing, backoff, and JSON cleanup."""
-    global CALLS_MADE, _LAST_CALL_AT
+    """One Gemini call: budget guard, pacing, backoff, verbose errors."""
+    global CALLS_MADE, _LAST_CALL_AT, _PRINTED_429_BODY
     if CALLS_MADE >= MAX_GEMINI_CALLS:
         raise RuntimeError(
             f"Budget guard: reached MAX_GEMINI_CALLS={MAX_GEMINI_CALLS}. "
             "Re-run later to continue (the script resumes where it stopped)."
         )
-    if not GEMINI_API_KEY:
-        sys.exit("ERROR: GEMINI_API_KEY env var is missing.")
 
+    interval = (MIN_CALL_INTERVAL_VERTEX if _BACKEND == "vertex"
+                else MIN_CALL_INTERVAL_APIKEY)
     elapsed = time.monotonic() - _LAST_CALL_AT
-    if elapsed < MIN_CALL_INTERVAL:
-        time.sleep(MIN_CALL_INTERVAL - elapsed)
+    if elapsed < interval:
+        time.sleep(interval - elapsed)
 
     body = {"contents": [{"parts": prompt_parts}]}
     for attempt in range(retries):
         _LAST_CALL_AT = time.monotonic()
+        url, headers, params = _request_target()
         try:
-            resp = requests.post(
-                GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
-                json=body,
-                timeout=120,
-            )
+            resp = requests.post(url, headers=headers, params=params,
+                                 json=body, timeout=120)
         except requests.exceptions.RequestException as e:
             wait = 20 * (attempt + 1)
             print(f"  network error ({e.__class__.__name__}), waiting {wait}s ...")
             time.sleep(wait)
             continue
+
+        if resp.status_code == 403:
+            # Permission problem: retrying won't help. Print Google's own
+            # explanation and stop with clear guidance.
+            print("\n  === GOOGLE'S FULL EXPLANATION (403) ===")
+            print(f"  {resp.text[:1200]}")
+            print("  =======================================\n")
+            raise RuntimeError(
+                "Google refused for permission reasons (403). The message "
+                "above says exactly why. Most common fix: in Google Cloud "
+                "Console -> IAM, confirm the khabar-backfill service "
+                "account has the Editor role, save, wait 3 minutes, re-run."
+            )
+
         if resp.status_code == 429 or resp.status_code >= 500:
+            if resp.status_code == 429 and not _PRINTED_429_BODY:
+                _PRINTED_429_BODY = True
+                print("\n  === GOOGLE'S FULL EXPLANATION (429, printed once) ===")
+                print(f"  {resp.text[:1200]}")
+                print("  =====================================================\n")
             wait = min(20 * (attempt + 1), 90)
             print(f"  Gemini busy (HTTP {resp.status_code}), waiting {wait}s ...")
             time.sleep(wait)
             continue
+
         if resp.status_code != 200:
-            # Print the actual error body so we can diagnose remotely
             print(f"  ERROR {resp.status_code}: {resp.text[:500]}")
             resp.raise_for_status()
+
         CALLS_MADE += 1
         data = resp.json()
         try:
@@ -198,9 +279,10 @@ def gemini(prompt_parts, expect_json=True, retries=6):
         except json.JSONDecodeError:
             return None
     raise RuntimeError(
-        "Gemini stayed unavailable after 6 patient retries. Nothing is "
-        "lost — wait a while and re-run the same pass; it resumes "
-        "exactly where it stopped."
+        "Gemini stayed unavailable after 6 patient retries. If the printed "
+        "explanation above mentions a DAILY limit, waiting within the run "
+        "cannot help — re-run tomorrow, or switch to the Vertex lane. "
+        "Nothing is lost; the script resumes where it stopped."
     )
 
 
@@ -582,6 +664,11 @@ if __name__ == "__main__":
     }
     order = (["colors", "subcat-rules", "subcat-text", "subcat-vision",
               "audit"] if args.which == "all" else [args.which])
+
+    # Pick the Google lane (skip for subcat-rules, which needs no AI)
+    if any(p != "subcat-rules" for p in order):
+        _init_backend()
+
     for name in order:
         steps[name]()
     print(f"\nDone. Gemini calls used this run: {CALLS_MADE}")
