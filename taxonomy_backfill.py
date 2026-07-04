@@ -47,7 +47,7 @@ SERVICE_ACCOUNT_KEY = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
 MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "5000"))
 
 GEMINI_MODEL = "gemini-2.5-flash"
-VERTEX_REGION = "us-central1"
+VERTEX_REGION = "global"  # 'global' endpoint has better shared capacity than us-central1
 
 CALLS_MADE = 0
 _LAST_CALL_AT = 0.0
@@ -196,6 +196,10 @@ def _request_target():
             print("  refreshing Vertex AI token ...")
             _refresh_vertex_token()
         url = (
+            f"https://aiplatform.googleapis.com/v1/"
+            f"projects/{_PROJECT_ID}/locations/global/"
+            f"publishers/google/models/{GEMINI_MODEL}:generateContent"
+        ) if VERTEX_REGION == "global" else (
             f"https://{VERTEX_REGION}-aiplatform.googleapis.com/v1/"
             f"projects/{_PROJECT_ID}/locations/{VERTEX_REGION}/"
             f"publishers/google/models/{GEMINI_MODEL}:generateContent"
@@ -287,15 +291,28 @@ def gemini(prompt_parts, expect_json=True, retries=6):
 
 
 def fetch_image_b64(url):
-    """Download a product image and return (base64, mime) or None."""
+    """Download a product image, downscale it, return (base64, mime) or None.
+    Smaller images = smaller requests = less likely to hit Vertex quota."""
     import base64
+    import io
     try:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
-        mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
-        if not mime.startswith("image/"):
-            mime = "image/jpeg"
-        return base64.b64encode(r.content).decode(), mime
+        try:
+            from PIL import Image
+            im = Image.open(io.BytesIO(r.content))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.thumbnail((512, 512))  # long edge max 512px — plenty for classification
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=80)
+            return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
+        except Exception:
+            # If PIL isn't available or image is odd, fall back to raw bytes
+            mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+            if not mime.startswith("image/"):
+                mime = "image/jpeg"
+            return base64.b64encode(r.content).decode(), mime
     except Exception:
         return None
 
