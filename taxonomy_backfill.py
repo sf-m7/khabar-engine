@@ -224,7 +224,7 @@ def gemini(prompt_parts, expect_json=True, retries=6):
     if elapsed < interval:
         time.sleep(interval - elapsed)
 
-    body = {"contents": [{"parts": prompt_parts}]}
+    body = {"contents": [{"role": "user", "parts": prompt_parts}]}
     for attempt in range(retries):
         _LAST_CALL_AT = time.monotonic()
         url, headers, params = _request_target()
