@@ -1177,6 +1177,34 @@ def extract_color_cizaro(name):
     return found
 
 
+def extract_color_activ(name):
+    """
+    Activ's title pattern (confirmed live, 100% of catalog): the colour is
+    the trailing segment after the LAST " - " separator, and it is in
+    ARABIC. Examples:
+        "ACTIV MEN'S FLIP FLOP - BLACK"           -> "black"
+        "سويت شيرت اكتف بناتي - بني"                -> "بني" (brown)
+        "حذاء اكتف اطفالي فاشون - كحلي*ازرق"        -> "كحلي*ازرق" (navy/white two-tone)
+
+    We do NOT try to match against a fixed vocabulary here, because Activ's
+    colours are Arabic free-text that the colour dictionary (color_map)
+    resolves downstream — the same machine that handles every other brand's
+    raw colours. So this extractor's only job is to isolate the trailing
+    segment cleanly. The dictionary decides what family it maps to.
+
+    Returns the trailing segment (lowercased, trimmed) or None if there's no
+    dash separator or the segment is implausible as a colour (too long/short).
+    """
+    if " - " not in name:
+        return None
+    tail = name.rsplit(" - ", 1)[-1].strip().lower()
+    # Sanity: a real colour segment is short. Reject anything that's clearly
+    # not a colour (a whole sentence, or an empty tail).
+    if not tail or len(tail) > 30:
+        return None
+    return tail
+
+
 # Brand -> extraction function. Membership here is the ONLY thing that
 # routes a brand's products through title-based colour extraction, so
 # enabling another brand later is a one-line addition and no brand outside
@@ -1184,6 +1212,7 @@ def extract_color_cizaro(name):
 COLOR_FROM_TITLE_BRANDS = {
     "tree":   extract_color_tree,
     "cizaro": extract_color_cizaro,
+    "activ":  extract_color_activ,
 }
 
 
@@ -2526,7 +2555,11 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # onto each size's own child row (the `else` branch a few lines down),
     # which was never part of this bug (each size has its own external_sku, so
     # those rows were never the parent row being double-written).
-    SIZE_CAP     = 65
+    # SIZE_CAP: how many LCW product pages to fetch for sizes per run.
+    # Controlled by the LCW_SIZE_CAP repository variable so it can be raised
+    # (to clear a backlog) or lowered (to conserve proxy bandwidth) WITHOUT
+    # editing this file. Defaults to 65 if the variable isn't set.
+    SIZE_CAP     = int(os.environ.get("LCW_SIZE_CAP", "65"))
     SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
 
