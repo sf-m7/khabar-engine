@@ -38,7 +38,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install psycopg2-binary requests google-auth
+        run: pip install psycopg2-binary requests google-auth Pillow
 
       - name: Run backfill pass
         env:
