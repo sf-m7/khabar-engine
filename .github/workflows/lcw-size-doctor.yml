@@ -1,0 +1,117 @@
+name: LCW Size Doctor (one-off diagnostic)
+
+# Manual trigger only — click "Run workflow" in the Actions tab.
+# Fetches ONE LCW product page and reports what's actually inside it.
+# Does NOT write to Supabase. Does NOT change the scraper. Safe to re-run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Fetch one LCW page and inspect it
+        env:
+          WEBSHARE_USER: ${{ secrets.WEBSHARE_USER }}
+          WEBSHARE_PASS: ${{ secrets.WEBSHARE_PASS }}
+          WEBSHARE_HOST: ${{ secrets.WEBSHARE_HOST }}
+          WEBSHARE_PORT: ${{ secrets.WEBSHARE_PORT }}
+        run: |
+          python <<'PY'
+          import os, random, re, requests
+
+          TEST_URL = "https://www.lcwaikiki.eg/en/crew-neck-jersey-mens-t-shirt-black-o-4827601"
+
+          user = os.environ.get("WEBSHARE_USER", "")
+          pw   = os.environ.get("WEBSHARE_PASS", "")
+          host = os.environ.get("WEBSHARE_HOST", "")
+          port = os.environ.get("WEBSHARE_PORT", "")
+
+          # Same Egyptian sticky-session pattern the scraper uses
+          n = random.randint(1, 900)
+          proxy_user = f"{user}-eg-{n}"
+          proxies = {
+              "http":  f"http://{proxy_user}:{pw}@{host}:{port}",
+              "https": f"http://{proxy_user}:{pw}@{host}:{port}",
+          } if user and pw and host and port else None
+
+          headers = {
+              "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "accept-language": "en-US,en;q=0.9",
+              "accept-encoding": "gzip, deflate, br",
+              "user-agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          }
+
+          print(f"Fetching: {TEST_URL}")
+          print(f"Proxy session: eg-{n}")
+          r = requests.get(TEST_URL, headers=headers, proxies=proxies, timeout=20)
+          html = r.text
+          print(f"HTTP status: {r.status_code}")
+          print(f"HTML length: {len(html):,} chars")
+          print("=" * 70)
+
+          # 1) Which known-name JavaScript blobs are present?
+          candidates = [
+              "cartOperationViewModel",
+              "optimizedDetailModel",
+              "productDetailViewModel",
+              "productViewModel",
+              "detailModel",
+              "__NEXT_DATA__",
+              "__NUXT__",
+              "ProductSizes",
+              "productSizes",
+              "Sizes",
+              "ProductDetail",
+          ]
+          print("\n[1] Which known variable/key names appear in the HTML?")
+          for name in candidates:
+              hits = len(re.findall(re.escape(name), html))
+              flag = "✅" if hits > 0 else "❌"
+              print(f"  {flag} {name}: {hits} occurrence(s)")
+
+          # 2) Show the first snippet around cartOperationViewModel, if present
+          print("\n[2] Context around 'cartOperationViewModel' (first 800 chars after it):")
+          m = re.search(r"cartOperationViewModel", html)
+          if m:
+              print(html[m.start(): m.start() + 800])
+          else:
+              print("  Not found in HTML.")
+
+          # 3) Try the scraper's current regex — report what it captures
+          print("\n[3] Does the scraper's current regex find a JSON blob?")
+          cart_m = re.search(r'var\s+cartOperationViewModel\s*=\s*(\{.*?\});\s*$',
+                             html, re.MULTILINE | re.DOTALL)
+          if not cart_m:
+              cart_m = re.search(r'var\s+cartOperationViewModel\s*=\s*(\{.+?\});',
+                                 html, re.DOTALL)
+          if cart_m:
+              captured = cart_m.group(1)
+              print(f"  ✅ Regex matched. Captured JSON length: {len(captured):,} chars")
+              print(f"  First 300 chars of capture: {captured[:300]}")
+              print(f"  Last 300 chars of capture:  {captured[-300:]}")
+          else:
+              print("  ❌ Neither regex pattern matched. The variable name or format has changed.")
+
+          # 4) Is size data hiding somewhere else (JSON-LD, ld+json script tag)?
+          print("\n[4] Are there <script type='application/ld+json'> blocks?")
+          ld_blocks = re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+                                 html, re.DOTALL | re.IGNORECASE)
+          print(f"  Found {len(ld_blocks)} ld+json block(s)")
+          for i, blk in enumerate(ld_blocks[:2]):
+              print(f"  Block {i+1} (first 400 chars): {blk.strip()[:400]}")
+
+          # 5) Full HTML preview (first 3000 chars) — helps spot changes at a glance
+          print("\n[5] HTML head+opening body (first 3000 chars):")
+          print(html[:3000])
+          PY
