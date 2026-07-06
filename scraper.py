@@ -2059,96 +2059,124 @@ def parse_lcw_page_data(html):
     """
     Extract structured variant data from an LCW product page.
 
-    Confirmed from page source inspection (9 Jun 2026):
-    The page embeds two JSON blobs as JavaScript variables:
-      var cartOperationViewModel = {...};    ← per-color: sizes + stock + price
-      var optimizedDetailModel   = {...};    ← model-wide: all colors (Options[])
+    v14.27 REWRITE (7 Jul 2026) — schema.org ld+json source
+    ---------------------------------------------------------
+    Around mid-June 2026 LCW moved cartOperationViewModel out of the page
+    HTML. Their own on-page comment states:
+        "cartOperationViewModel is now loaded securely via props,
+         no longer exposed globally"
+    The old regex-based parser silently returned None for every page from
+    June 15 onward, which is why size population dropped to 0% overnight
+    and never recovered — 13,512 variants touched since June 15, only 1
+    got a size populated (a fluke).
 
-    Returns:
+    New source: the schema.org Product block delivered as
+        <script type="application/ld+json">{ ... }</script>
+    LCW cannot remove this without losing Google search visibility, so it
+    is a more stable long-term surface than the JS variable was.
+
+    Trade-off vs the old parser:
+      GAINED  size name list works again (was 100% broken since June 15)
+      LOST    per-size stock (schema.org exposes ONE overall availability)
+      LOST    per-size price (schema.org exposes ONE price for the model)
+      LOST    Options[] enumeration of other colors (the catalog pass
+              already enumerates colors upstream, so this loss is
+              defensive-only — no downstream signal depended on it)
+
+    Downstream effect: for LCW specifically, all sizes within one color
+    will share the same is_in_stock (inherited from the color-level flag
+    the catalog pass writes). Signals that depend on per-size stock
+    variation (Size Asymmetry, Size Demand Map) become less informative
+    for LCW while remaining unaffected for other brands. This is a known
+    and documented LCW-specific limitation, not a bug.
+
+    Return shape is intentionally identical to the old parser so the
+    size-backfill loop calling this function needs zero changes:
       {
-        "current_option_id": int,         # OptionId this page belongs to
-        "sizes": [                        # all sizes for THIS color
-          {"size": "M", "stock": 4, "price": 1499.0, "size_id": 13542}, ...
+        "current_option_id": None,   # no longer available
+        "sizes": [
+          {"size": "M", "stock": None, "price": <overall>, "size_id": None},
+          ...
         ],
-        "option_stock": int,              # total stock for THIS color
-        "color_name": str,                # English color name
-        "color_code": str,                # ColorCode (e.g. "R9J")
-        "category_tree": dict,            # breadcrumb levels
-        "all_options": [                  # every color of the same model
-          {"option_id": int, "color": str, "in_stock": bool, "url": str}, ...
-        ],
+        "option_stock": None,        # no longer per-color
+        "color_name": "",            # ld+json lists ALL colors, not this URL
+        "color_code": "",
+        "category_tree": {"Level1": "...", ...},
+        "all_options": [],
       }
-
-    Returns None if either JSON blob is missing or unparseable. The caller
-    handles None by skipping the row — we never partially populate.
+    Returns None if no ld+json Product block is found or is unparseable.
     """
-    # Grab cartOperationViewModel — contains ProductSizes[] with per-size stock
-    cart_m = re.search(r'var\s+cartOperationViewModel\s*=\s*(\{.*?\});\s*$',
-                       html, re.MULTILINE | re.DOTALL)
-    if not cart_m:
-        # Fallback: try without trailing semicolon anchor
-        cart_m = re.search(r'var\s+cartOperationViewModel\s*=\s*(\{.+?\});',
-                           html, re.DOTALL)
-    detail_m = re.search(r'var\s+optimizedDetailModel\s*=\s*(\{.+?\});',
-                         html, re.DOTALL)
-    if not cart_m or not detail_m:
+    # 1) Pull all ld+json script blocks from the page
+    ld_blocks = re.findall(
+        r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    if not ld_blocks:
         return None
 
-    try:
-        cart   = json.loads(cart_m.group(1))
-        detail = json.loads(detail_m.group(1))
-    except (json.JSONDecodeError, ValueError) as e:
-        # JSON malformed — most likely a non-greedy regex caught too little
+    # 2) Locate the block whose @type is "Product" (a BreadcrumbList block
+    #    also appears; ignore it)
+    product_data = None
+    for blk in ld_blocks:
+        try:
+            parsed = json.loads(blk.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and parsed.get("@type") == "Product":
+            product_data = parsed
+            break
+    if not product_data:
         return None
+
+    # 3) Extract sizes — schema.org "size" is a list of strings (occasionally
+    #    a single string for one-size products)
+    size_field = product_data.get("size") or []
+    if isinstance(size_field, str):
+        size_field = [size_field]
+
+    # 4) Extract the single overall price from offers
+    offers = product_data.get("offers") or {}
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
+    try:
+        overall_price = float(offers.get("price") or 0)
+    except (TypeError, ValueError):
+        overall_price = 0.0
 
     sizes = []
-    for ps in (cart.get("ProductSizes") or []):
-        sz_obj = ps.get("Size") or {}
-        price_obj = ps.get("Price") or {}
-        size_val = sz_obj.get("Value")
-        if not size_val:
+    for sz_val in size_field:
+        sz_str = str(sz_val).strip()
+        if not sz_str:
             continue
         sizes.append({
-            "size":     str(size_val).strip(),
-            "stock":    int(ps.get("Stock") or 0),
-            "price":    float(price_obj.get("Price") or 0),
-            "size_id":  sz_obj.get("SizeId"),
+            "size":    sz_str,
+            "stock":   None,           # per-size stock no longer exposed
+            "price":   overall_price,  # single price applies to all sizes
+            "size_id": None,
         })
 
-    # Walk Options[] inside optimizedDetailModel.ModelInfo to enumerate colors
-    all_options = []
-    model_info = (detail.get("ModelInfo") or {})
-    for opt in (model_info.get("Options") or []):
-        opt_id = opt.get("OptionId")
-        if not opt_id:
-            continue
-        all_options.append({
-            "option_id": int(opt_id),
-            "color":     opt.get("MainColorName") or opt.get("Title") or "",
-            "color_code": opt.get("ColorCode"),
-            "in_stock":  bool(opt.get("IsStockAvailable")),
-            "url":       opt.get("Url") or "",
-        })
+    if not sizes:
+        # No usable size data — treat as parse failure so the caller
+        # (which checks `not page_data or not page_data.get("sizes")`)
+        # skips this row cleanly instead of writing empty rows.
+        return None
 
-    option_obj = (detail.get("Option") or {})
-    category_tree = option_obj.get("MainCategoryTree") or {}
-    # Flatten the tree for compatibility with lcw_normalize_category which
-    # expects {"Level1": "...", "Level2": "...", ...} string values.
+    # 5) Category tree from Product.category (e.g. "Men > Men Clothing > Men T-Shirts")
+    cat_str = product_data.get("category") or ""
     cat_flat = {}
-    for k, v in category_tree.items():
-        if isinstance(v, dict):
-            cat_flat[k] = v.get("LevelValue") or ""
-        elif isinstance(v, list) and v:
-            cat_flat[k] = (v[0] or {}).get("LevelValue") or ""
+    if cat_str:
+        parts = [p.strip() for p in cat_str.split(">") if p.strip()]
+        for i, part in enumerate(parts, start=1):
+            cat_flat[f"Level{i}"] = part
 
     return {
-        "current_option_id": int(cart.get("OptionId") or 0),
+        "current_option_id": None,
         "sizes":             sizes,
-        "option_stock":      int(cart.get("OptionStock") or 0),
-        "color_name":        cart.get("Color") or option_obj.get("MainColorName") or "",
-        "color_code":        option_obj.get("ColorCode") or "",
+        "option_stock":      None,
+        "color_name":        "",
+        "color_code":        "",
         "category_tree":     cat_flat,
-        "all_options":       all_options,
+        "all_options":       [],
     }
 
 def fetch_lcw_product_page(session, url):
