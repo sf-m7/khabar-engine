@@ -1,0 +1,115 @@
+name: LCW Size Doctor v2 (find new size location)
+
+# Manual trigger only. Fetches ONE LCW product page and finds where the
+# size data was moved to. Does NOT write to Supabase. Safe to re-run.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Locate the new size data source
+        env:
+          WEBSHARE_USER: ${{ secrets.WEBSHARE_USER }}
+          WEBSHARE_PASS: ${{ secrets.WEBSHARE_PASS }}
+          WEBSHARE_HOST: ${{ secrets.WEBSHARE_HOST }}
+          WEBSHARE_PORT: ${{ secrets.WEBSHARE_PORT }}
+        run: |
+          python <<'PY'
+          import os, random, re, requests
+
+          TEST_URL = "https://www.lcwaikiki.eg/en/crew-neck-jersey-mens-t-shirt-black-o-4827601"
+
+          user = os.environ.get("WEBSHARE_USER", "")
+          pw   = os.environ.get("WEBSHARE_PASS", "")
+          host = os.environ.get("WEBSHARE_HOST", "")
+          port = os.environ.get("WEBSHARE_PORT", "")
+
+          n = random.randint(1, 900)
+          proxy_user = f"{user}-eg-{n}"
+          proxies = {
+              "http":  f"http://{proxy_user}:{pw}@{host}:{port}",
+              "https": f"http://{proxy_user}:{pw}@{host}:{port}",
+          } if user and pw and host and port else None
+
+          headers = {
+              "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "accept-language": "en-US,en;q=0.9",
+              "accept-encoding": "gzip, deflate, br",
+              "user-agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          }
+
+          print(f"Fetching: {TEST_URL}")
+          print(f"Proxy session: eg-{n}")
+          r = requests.get(TEST_URL, headers=headers, proxies=proxies, timeout=20)
+          html = r.text
+          print(f"HTTP {r.status_code} — {len(html):,} chars")
+          print("=" * 70)
+
+          # 1) DUMP THE FULL PRODUCT ld+json BLOCK
+          print("\n[1] FULL Product ld+json block (the schema.org Product one):")
+          ld_blocks = re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+                                 html, re.DOTALL | re.IGNORECASE)
+          for blk in ld_blocks:
+              blk_s = blk.strip()
+              if '"@type"' in blk_s and 'Product' in blk_s and 'BreadcrumbList' not in blk_s[:200]:
+                  print(blk_s)
+                  print("---END OF PRODUCT ld+json BLOCK---")
+                  break
+          else:
+              print("  No Product-typed ld+json block found.")
+
+          # 2) SEARCH FOR AJAX/API ENDPOINTS FOR PRODUCT DETAIL / SIZES
+          print("\n[2] Product/size/stock-related URLs found in the HTML:")
+          patterns = [
+              r'/en/ajax/[A-Za-z/]*(?:Product|Size|Stock|Detail|Option)[A-Za-z/]*',
+              r'/api/[A-Za-z/]*(?:Product|Size|Stock|Detail|Option)[A-Za-z/]*',
+              r'"/[A-Za-z/]*(?:Product|Size|Stock|Detail|Option)[A-Za-z/]*"',
+          ]
+          found_urls = set()
+          for p in patterns:
+              for m in re.findall(p, html):
+                  found_urls.add(m.strip('"'))
+          if found_urls:
+              for u in sorted(found_urls)[:40]:
+                  print(f"  {u}")
+          else:
+              print("  None found.")
+
+          # 3) LOOK FOR REACT/NEXT/HYDRATION PAYLOADS
+          print("\n[3] Hydration / initial-state payloads:")
+          hydration_names = [
+              "__INITIAL_STATE__", "__PRELOADED_STATE__", "__APP_STATE__",
+              "window.appState", "window.initialData",
+              "data-props=", "data-hydrate=", 'id="__NEXT_DATA__"',
+              'window.__DATA__', 'window._DATA_', "ReactDOM.hydrate",
+          ]
+          for name in hydration_names:
+              hits = len(re.findall(re.escape(name), html))
+              print(f"  {'✅' if hits else '❌'} {name}: {hits}")
+
+          # 4) LOOK FOR "ProductDetail" CONTEXT (22 hits in previous diag)
+          print("\n[4] First 3 mentions of ProductDetail in context (400 chars each):")
+          for i, m in enumerate(list(re.finditer(r'ProductDetail', html))[:3]):
+              start = max(0, m.start() - 80)
+              end   = m.start() + 320
+              print(f"  --- match {i+1} ---")
+              print(f"  {html[start:end]}")
+
+          # 5) HTML AROUND cartOperationViewModel — DUMP MORE (2500 chars)
+          print("\n[5] Full context around 'cartOperationViewModel' (2500 chars):")
+          m = re.search(r"cartOperationViewModel", html)
+          if m:
+              print(html[m.start(): m.start() + 2500])
+          PY
