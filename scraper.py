@@ -524,6 +524,7 @@ BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",       "engine": "lcw_proxy"},
     {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
     {"name": "arafa",      "domain": "arafastores.com",          "engine": "shopify"},
+    {"name": "eagle",      "domain": "eagle.com.eg",             "engine": "shopify"},
     {"name": "just_sbr",   "domain": "www.justsbr.com",          "engine": "shopify"},
     {"name": "activ",      "domain": "activ.eg",                 "engine": "shopify"},
     {"name": "mlameh",     "domain": "mlameh.com",               "engine": "shopify"},
@@ -564,6 +565,7 @@ BRAND_DISPLAY = {
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
     "arafa":      "Arafa Stores",
+    "eagle":      "Eagle",
 }
 
 # v14.22 FIX 2: brands whose ENTIRE catalog is a single gender regardless of
