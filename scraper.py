@@ -523,6 +523,7 @@ WEBSHARE_PROXY = {
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",       "engine": "lcw_proxy"},
     {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
+    {"name": "arafa",      "domain": "arafastores.com",          "engine": "shopify"},
     {"name": "just_sbr",   "domain": "www.justsbr.com",          "engine": "shopify"},
     {"name": "activ",      "domain": "activ.eg",                 "engine": "shopify"},
     {"name": "mlameh",     "domain": "mlameh.com",               "engine": "shopify"},
@@ -562,6 +563,7 @@ BRAND_DISPLAY = {
     "mobaco":     "Mobaco",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
+    "arafa":      "Arafa Stores",
 }
 
 # v14.22 FIX 2: brands whose ENTIRE catalog is a single gender regardless of
