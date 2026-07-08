@@ -2351,7 +2351,15 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers,
         "LastSeenOptionIdsJson":  json.dumps(seen_ids or []),
     }
     try:
-        res = execute_with_retry(session.post, url, json=body, timeout=30, headers=headers)
+        # v14.33: shortened from timeout=30/max_retries=5 (the general-purpose
+        # defaults). On a genuinely dead DataImpulse residential IP, those
+        # defaults meant up to ~3 minutes (5 attempts x 30s + backoff) before
+        # we even considered rotating to a new session — that's the entire
+        # 4x slowdown after moving off Webshare. A live IP answers this
+        # endpoint in 1-3s, so 12s/2-attempt is generous for a good peer and
+        # cheap to burn through for a bad one.
+        res = execute_with_retry(session.post, url, json=body, timeout=12, headers=headers,
+                                  max_retries=2, backoff=2, max_delay=15)
         if res.status_code not in [200, 404]:
             print(f"  ⚠️ LCW API unexpected HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
@@ -2383,16 +2391,25 @@ def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
     using the returned session for subsequent pages so a good IP, once
     found, is kept rather than being discarded after one lucky page.
     """
+    # v14.33: now that lcw_fetch_page fails fast (12s/2 attempts instead of
+    # 30s/5), a single bad IP costs ~25s to detect instead of ~3 minutes —
+    # so we can afford to try up to 2 rotations (3 sessions total) before
+    # giving up on a page, instead of just 1. This matters because the
+    # DataImpulse Egyptian pool has shown runs of several consecutive bad
+    # peers in a row (not just one flaky IP), likely Akamai treating a chunk
+    # of that pool's IP range as suspect.
     data = lcw_fetch_page(session, domain, category_id, page_index, headers,
                           seen_ids=seen_ids, category_params=category_params)
-    if data is None and DATAIMPULSE_CONFIGURED:
-        print(f"  ⚠️ [LCW] cat={category_id} page={page_index} failed after retries — "
-              f"this sticky IP looks bad. Rotating to a fresh DataImpulse session "
-              f"and retrying this page once.")
+    attempts = 1
+    while data is None and DATAIMPULSE_CONFIGURED and attempts < 3:
+        print(f"  ⚠️ [LCW] cat={category_id} page={page_index} failed — "
+              f"sticky IP looks bad (rotation {attempts}/2). Rotating to a "
+              f"fresh DataImpulse session.")
         session = get_lcw_session()
-        time.sleep(random.uniform(2, 4))
+        time.sleep(random.uniform(1, 2))
         data = lcw_fetch_page(session, domain, category_id, page_index, headers,
                               seen_ids=seen_ids, category_params=category_params)
+        attempts += 1
     return data, session
 
 def _parse_lcw_price(v):
