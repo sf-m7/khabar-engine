@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v14  (current: v14.29)
+# KHABAR — Scraper v14  (current: v14.30)
 # Built on v13. Changes:
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
@@ -489,6 +489,17 @@
 #
 #         DB migration: add_published_at_bestseller_rank_fx_rate
 #         (adds source_published_at column + two new tables).
+#  v14.30 429 diagnostic logging (execute_with_retry). khotwh/ravin/tree have
+#         now failed with 429 across 3 consecutive runs, spanning gaps well
+#         over 12h — too long for a real traffic-burst rate limit to still be
+#         active. This is the same shape of problem LCW needed a residential
+#         proxy for: a WAF blocking the GitHub Actions IP/ASN outright, not
+#         measuring our request rate. On the first 429 seen per request, we
+#         now log Server / CF-RAY / cf-mitigated / Retry-After / X-RateLimit-
+#         Reset — Cloudflare's bot-management headers, plus whether the
+#         server gave a real wait time at all. Purely diagnostic: no retry
+#         timing, backoff, or control flow changed. Next failing run tells us
+#         definitively WAF-block vs. genuine rate limit instead of guessing.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -765,6 +776,29 @@ def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=
                         retry_after = float(res.headers.get("Retry-After", ""))
                     except (TypeError, ValueError):
                         retry_after = None
+                    # v14.30: one-time diagnostic on the FIRST 429 for this request.
+                    # WHY: khotwh/ravin/tree have now failed with 429 across 3
+                    # consecutive runs spanning 12h+ gaps — too long for a real
+                    # traffic-burst rate limit to still be active. This is the same
+                    # shape of problem LCW needed a residential proxy for: a WAF
+                    # blocking the GitHub Actions IP/ASN outright, not measuring
+                    # our request rate. Server/CF-RAY/cf-mitigated identify
+                    # Cloudflare's bot-management layer; whether Retry-After is
+                    # present at all tells us if the server is giving a real wait
+                    # time or just refusing. Logged once per request (not per
+                    # attempt) so a 5-attempt retry doesn't spam five copies of
+                    # the same headers.
+                    if attempt == 0:
+                        diag = {
+                            "Server":            res.headers.get("Server"),
+                            "CF-RAY":            res.headers.get("CF-RAY"),
+                            "CF-Mitigated":      res.headers.get("cf-mitigated"),
+                            "Retry-After":       res.headers.get("Retry-After"),
+                            "X-RateLimit-Reset": res.headers.get("X-RateLimit-Reset"),
+                        }
+                        present = {k: v for k, v in diag.items() if v}
+                        print(f"  🔍 429 diagnostic on {url}: "
+                              f"{present or '(no identifying headers — likely a bare WAF block, not a timed rate limit)'}")
                 err = requests.RequestsError(f"HTTP {res.status_code}")
                 err.retry_after = retry_after
                 raise err
