@@ -35,8 +35,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
-          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          WEBSHARE_PROXY_USERNAME: ${{ secrets.WEBSHARE_PROXY_USERNAME }}
+          WEBSHARE_PROXY_PASSWORD: ${{ secrets.WEBSHARE_PROXY_PASSWORD }}
           SCRAPE_TARGET: lcw
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
