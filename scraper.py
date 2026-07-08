@@ -524,12 +524,13 @@ TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # Keeps alerts genuine and naturally caps alert volume.
 MIN_ALERT_DISCOUNT_PCT = 10
 
-WEBSHARE_USER  = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
-WEBSHARE_PASS  = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
-WEBSHARE_PROXY = {
-    "http":  f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
-    "https": f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
-} if WEBSHARE_USER and WEBSHARE_PASS else None
+DATAIMPULSE_USER  = os.environ.get("DATAIMPULSE_PROXY_USERNAME", "")
+DATAIMPULSE_PASS  = os.environ.get("DATAIMPULSE_PROXY_PASSWORD", "")
+# Note: Adjust the host (gw.dataimpulse.com) and port (823) if your dashboard specifies otherwise.
+DATAIMPULSE_PROXY = {
+    "http":  f"http://{DATAIMPULSE_USER}:{DATAIMPULSE_PASS}@gw.dataimpulse.com:823",
+    "https": f"http://{DATAIMPULSE_USER}:{DATAIMPULSE_PASS}@gw.dataimpulse.com:823",
+} if DATAIMPULSE_USER and DATAIMPULSE_PASS else None
 
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",       "engine": "lcw_proxy"},
@@ -725,14 +726,16 @@ ARABIC_COLOR_BRANDS = {"2s_egypt"}
 def get_resilient_session():
     return requests.Session(impersonate="chrome124")
 
-def get_lcw_session():
-    if not WEBSHARE_PROXY:
+def get_proxy_session(brand_name="Unknown"):
+    if not DATAIMPULSE_PROXY:
         return requests.Session(impersonate="chrome124")
-    base_user  = WEBSHARE_USER.split("-")[0]
-    eg_session = random.randint(1, 900)
-    eg_user    = f"{base_user}-eg-{eg_session}"
-    proxy_url  = f"http://{eg_user}:{WEBSHARE_PASS}@p.webshare.io:80"
-    print(f"  [LCW] Egyptian proxy session selected: -eg-{eg_session}")
+    
+    # DataImpulse sticky session + Egypt targeting format: username__cr.eg__session.123456
+    session_id = random.randint(1, 999999)
+    di_user    = f"{DATAIMPULSE_USER}__cr.eg__session.{session_id}"
+    proxy_url  = f"http://{di_user}:{DATAIMPULSE_PASS}@gw.dataimpulse.com:823"
+    
+    print(f"  [{brand_name}] Egyptian proxy session selected: {session_id}")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
@@ -2271,7 +2274,7 @@ def _parse_lcw_price(v):
 
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
-    print(f"  [LCW] Proxy configured: {WEBSHARE_PROXY is not None}")
+    print(f"  [LCW] Proxy configured: {DATAIMPULSE_PROXY is not None}")
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
@@ -3976,7 +3979,9 @@ def scrape_brand(brand_name, domain):
     try:
         supabase     = create_client(SUPABASE_URL, SUPABASE_KEY)
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
-        session      = get_lcw_session() if brand_config["engine"] == "lcw_proxy" else get_resilient_session()
+        
+        PROXY_BRANDS = {"lc_waikiki", "tree", "ravin", "khotwh"}
+        session      = get_proxy_session(brand_name) if brand_name in PROXY_BRANDS else get_resilient_session()
     except Exception as e:
         print(f"❌ Initialization failed for {brand_name}: {e}")
         return 0, 0
@@ -4027,8 +4032,8 @@ def scrape_brand(brand_name, domain):
         if brand_config["engine"] == "shopify":
             seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         elif brand_config["engine"] == "lcw_proxy":
-            if not WEBSHARE_PROXY:
-                print("  ⚠️ WEBSHARE credentials not set. Skipping LCW.")
+            if not DATAIMPULSE_PROXY:
+                print("  ⚠️ DATAIMPULSE credentials not set. Skipping LCW.")
                 seen, changes = 0, 0
             else:
                 seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
