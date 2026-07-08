@@ -10,7 +10,7 @@
 # connection (via SUPABASE_DB_URL), which is NOT subject to that 8s cap.
 #
 # Per-week dispatch is kept (rather than one big call) because it's the right
-# shape regardless of transport: the rolling 21-day window is self-healing by
+# shape regardless of transport: the rolling 30-day window is self-healing by
 # design (a missed or failed week is simply rebuilt on the next run), so
 # bounding failures to a single week — instead of all-or-nothing — means one
 # slow/failed week can never block the others, and forward progress is never
@@ -33,7 +33,7 @@ DB_URL       = os.environ["SUPABASE_DB_URL"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-WINDOW_DAYS       = 21   # matches the rolling self-healing window the function uses
+WINDOW_DAYS       = 30   # matches the rolling self-healing window the function uses
 STATEMENT_TIMEOUT = "90s"  # generous explicit ceiling — if a week ever needs longer
                             # than this, that's a real signal worth investigating,
                             # not something to silently wait forever on.
