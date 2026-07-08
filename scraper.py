@@ -730,6 +730,18 @@ def get_proxy_session(brand_name="Unknown"):
     if not DATAIMPULSE_PROXY:
         return requests.Session(impersonate="chrome124")
     
+    # LCW needs sticky sessions; Shopify brands run much faster with pure rotation
+    if brand_name == "lc_waikiki":
+        session_id = random.randint(1, 999999)
+        di_user    = f"{DATAIMPULSE_USER}__cr.eg__session.{session_id}"
+    else:
+        # No session suffix = DataImpulse assigns a fresh, fast IP per request
+        di_user    = f"{DATAIMPULSE_USER}__cr.eg"
+        
+    proxy_url  = f"http://{di_user}:{DATAIMPULSE_PASS}@gw.dataimpulse.com:823"
+    print(f"  [{brand_name}] DataImpulse Egyptian proxy connection initialized.")
+    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    
     # DataImpulse sticky session + Egypt targeting format: username__cr.eg__session.123456
     session_id = random.randint(1, 999999)
     di_user    = f"{DATAIMPULSE_USER}__cr.eg__session.{session_id}"
@@ -2253,7 +2265,7 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers,
         "LastSeenOptionIdsJson":  json.dumps(seen_ids or []),
     }
     try:
-        res = execute_with_retry(session.post, url, json=body, timeout=30, headers=headers)
+        res = execute_with_retry(session.post, url, json=body, timeout=12, headers=headers)
         if res.status_code not in [200, 404]:
             print(f"  ⚠️ LCW API unexpected HTTP {res.status_code} (cat={category_id}, page={page_index})")
             return None
