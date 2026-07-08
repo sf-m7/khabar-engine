@@ -34,13 +34,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # SCRAPE_TARGET=shopify runs the no-proxy group: all Shopify brands plus
-      # DeFacto and Mobaco (WooCommerce). LC Waikiki runs on its own proxied
-      # workflow (scraper_lcw.yml) and is untouched by this change.
+      # SCRAPE_TARGET=shopify runs the no-proxy-by-default group: all Shopify
+      # brands plus DeFacto and Mobaco (WooCommerce). LC Waikiki runs on its
+      # own proxied workflow (scraper_lcw.yml) and is untouched by this change.
+      #
+      # DATAIMPULSE_PROXY_* (v14.31): a WAF is blocking the runner IP for a
+      # subset of brands in this job (see scraper.py's DATAIMPULSE_PROXY_BRANDS
+      # for the current, up-to-date list — it changes as brands recover or new
+      # ones get blocked, so it's not duplicated here). Only those brands route
+      # through the DataImpulse residential proxy; every other brand in this
+      # job stays direct, so this doesn't add DataImpulse bandwidth cost for
+      # brands that already work fine. Safe to leave these secrets unset for
+      # runs that don't need them — the scraper falls back to a direct
+      # connection with a warning rather than failing the whole job.
       - name: Run scraper (Shopify + DeFacto + WooCommerce group)
         env:
-          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          SCRAPE_TARGET:      shopify
+          SUPABASE_URL:               ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:               ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SCRAPE_TARGET:              shopify
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
         run: python -u scraper.py
