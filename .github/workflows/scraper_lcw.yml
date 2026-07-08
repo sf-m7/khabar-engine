@@ -6,8 +6,9 @@ on:
     # Deliberately 3 hours before Cairo midnight so that even if GitHub's
     # scheduler runs late (commonly 15–60 min, occasionally more), the run
     # still lands on the same calendar day and captures the day's prices.
-    # Runs once daily — LCW is the only proxy (Webshare) brand and must stay
-    # within the 1 GB/month bandwidth cap.
+    # Runs once daily — LCW is a DataImpulse (residential, pay-per-GB)
+    # consumer, so keeping it to one run/day still matters for cost, same
+    # as it did under Webshare.
     - cron: "0 18 * * *"
   workflow_dispatch:
 
@@ -30,13 +31,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # v14.31: moved off Webshare onto DataImpulse (pricing). Same role as
+      # before — Egyptian residential exit IP for LCW's WAF.
       - name: Run LCW scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          WEBSHARE_PROXY_USERNAME: ${{ secrets.WEBSHARE_PROXY_USERNAME }}
-          WEBSHARE_PROXY_PASSWORD: ${{ secrets.WEBSHARE_PROXY_PASSWORD }}
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
           SCRAPE_TARGET: lcw
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
