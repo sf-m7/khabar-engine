@@ -500,6 +500,29 @@
 #         server gave a real wait time at all. Purely diagnostic: no retry
 #         timing, backoff, or control flow changed. Next failing run tells us
 #         definitively WAF-block vs. genuine rate limit instead of guessing.
+#  v14.31 Move off Webshare onto DataImpulse residential proxy (pricing was
+#         the reason for the switch) — this touches BOTH consumers of a
+#         proxy, not just the new one:
+#         • LCW (get_lcw_session): same Egyptian-exit-IP, one-sticky-session-
+#           per-run behavior as before, just expressed in DataImpulse's
+#           syntax (__cr.eg + ;sessid.<id>) instead of Webshare's "-eg-<id>"
+#           sub-user suffix. WEBSHARE_* env vars and the p.webshare.io proxy
+#           are gone from the codebase entirely.
+#         • Shopify/WooCommerce brands a WAF is blocking by IP/ASN
+#           (DATAIMPULSE_PROXY_BRANDS, get_shopify_session): the v14.30 note
+#           only had khotwh/ravin/tree confirmed. The actual post-deploy run
+#           showed FIVE more Shopify brands now failing outright at the
+#           check_domain pre-flight — dalydress, eagle, just_sbr, mlameh,
+#           tomato — plus mobaco (WooCommerce), which wasn't failing but had
+#           gone much slower: nearly every per-product /variations call was
+#           hitting Cloudflare's "challenge" mitigation and needing a retry,
+#           the same WAF signature just masked by execute_with_retry usually
+#           succeeding on attempt 2. All 9 are now in DATAIMPULSE_PROXY_BRANDS.
+#           Every brand NOT in that set (arafa, activ, esla, town_team,
+#           mens_club, dott_jeans, carina, andora, cizaro, defacto) is
+#           confirmed still working direct in that same run and is untouched.
+#         Both session builders fall back to a direct connection (with a
+#         warning, not a crash) if DATAIMPULSE credentials aren't set.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -524,12 +547,32 @@ TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # Keeps alerts genuine and naturally caps alert volume.
 MIN_ALERT_DISCOUNT_PCT = 10
 
-WEBSHARE_USER  = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
-WEBSHARE_PASS  = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
-WEBSHARE_PROXY = {
-    "http":  f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
-    "https": f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@p.webshare.io:80",
-} if WEBSHARE_USER and WEBSHARE_PASS else None
+# v14.31: DataImpulse residential proxy — replaces Webshare everywhere
+# (pricing was the reason for the move). Used for LCW (previously the only
+# Webshare consumer) AND for the Shopify/WooCommerce brands a WAF is
+# currently blocking by IP/ASN. gw.dataimpulse.com:823 is the standard HTTP
+# gateway.
+DATAIMPULSE_USER      = os.environ.get("DATAIMPULSE_PROXY_USERNAME", "")
+DATAIMPULSE_PASS      = os.environ.get("DATAIMPULSE_PROXY_PASSWORD", "")
+DATAIMPULSE_HOST      = "gw.dataimpulse.com"
+DATAIMPULSE_PORT      = 823
+DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
+
+# Brands whose storefronts are currently WAF-blocking the GitHub Actions
+# runner IP. UPDATED from the actual post-deploy run log (not just the
+# v14.30 diagnostic note): dalydress, eagle, just_sbr, mlameh, tomato — plus
+# khotwh/ravin/tree already known from v14.30 — all came back "Domain
+# unreachable" (429 at check_domain, before scrape_shopify even starts).
+# mobaco (WooCommerce) is included too: it didn't fail outright, but nearly
+# every /variations request hit Cloudflare's "challenge" mitigation and had
+# to retry, which is the same WAF signature — it was just masked because
+# execute_with_retry succeeded on attempt 2 most of the time, at the cost of
+# ~1.5-2.5s per product instead of one clean request.
+# Edit this set directly as brands recover or new ones get blocked.
+DATAIMPULSE_PROXY_BRANDS = {
+    "dalydress", "eagle", "just_sbr", "mlameh", "khotwh", "tomato",
+    "ravin", "tree", "mobaco",
+}
 
 BRANDS = [
     {"name": "lc_waikiki", "domain": "www.lcwaikiki.eg",       "engine": "lcw_proxy"},
@@ -725,14 +768,51 @@ ARABIC_COLOR_BRANDS = {"2s_egypt"}
 def get_resilient_session():
     return requests.Session(impersonate="chrome124")
 
+def get_dataimpulse_session():
+    """
+    v14.31: DataImpulse residential proxy session. Mirrors get_lcw_session()'s
+    shape — same __cr.eg Egyptian exit-IP reasoning, since these are Egyptian
+    storefronts (LCW uses "-eg-" on Webshare; DataImpulse's equivalent syntax
+    is "__cr.eg" appended to the username). Returns None if credentials
+    aren't set so the caller can fall back to a direct connection.
+    """
+    if not DATAIMPULSE_CONFIGURED:
+        return None
+    proxy_user = f"{DATAIMPULSE_USER}__cr.eg"
+    proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
+    print(f"  [DataImpulse] Egyptian residential proxy session selected.")
+    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+
+def get_shopify_session(brand_name):
+    """
+    v14.31: brands in DATAIMPULSE_PROXY_BRANDS route through the DataImpulse
+    residential proxy (see note above them); every other brand keeps using
+    get_resilient_session() exactly as before — no behavior change, no added
+    bandwidth cost for brands that were never broken.
+    """
+    if brand_name in DATAIMPULSE_PROXY_BRANDS:
+        session = get_dataimpulse_session()
+        if session:
+            print(f"  [{brand_name}] Routing via DataImpulse residential proxy.")
+            return session
+        print(f"  ⚠️ [{brand_name}] DATAIMPULSE credentials not set — "
+              f"falling back to a direct connection (will likely still 429).")
+    return get_resilient_session()
+
 def get_lcw_session():
-    if not WEBSHARE_PROXY:
+    """
+    v14.31: moved off Webshare onto DataImpulse (pricing). Same intent as
+    before — an Egyptian residential exit IP, held steady for this one run
+    via a random sticky-session id — just expressed in DataImpulse's syntax
+    (__cr.eg for country, ;sessid.<id> for stickiness up to ~30min) instead
+    of Webshare's "-eg-<id>" sub-user suffix.
+    """
+    if not DATAIMPULSE_CONFIGURED:
         return requests.Session(impersonate="chrome124")
-    base_user  = WEBSHARE_USER.split("-")[0]
     eg_session = random.randint(1, 900)
-    eg_user    = f"{base_user}-eg-{eg_session}"
-    proxy_url  = f"http://{eg_user}:{WEBSHARE_PASS}@p.webshare.io:80"
-    print(f"  [LCW] Egyptian proxy session selected: -eg-{eg_session}")
+    proxy_user = f"{DATAIMPULSE_USER}__cr.eg;sessid.{eg_session}"
+    proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
+    print(f"  [LCW] Egyptian proxy session selected: sessid.{eg_session}")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
@@ -2271,7 +2351,7 @@ def _parse_lcw_price(v):
 
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
-    print(f"  [LCW] Proxy configured: {WEBSHARE_PROXY is not None}")
+    print(f"  [LCW] Proxy configured: {DATAIMPULSE_CONFIGURED}")
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
@@ -3866,6 +3946,13 @@ def collect_bestseller_ranks(supabase, session):
     For each Shopify brand, fetch the best-selling sort and record
     rank 1–BESTSELLER_CAP. Idempotent: if today's ranks already exist
     for a brand, that brand is skipped.
+
+    v14.31: `session` (the caller's shared, non-proxied session) is now only
+    the fallback for brands that don't need a proxy. Brands in
+    DATAIMPULSE_PROXY_BRANDS get their own get_shopify_session(brand_name)
+    call instead — the earlier version reused one shared direct session for
+    every brand, so this pass would have still 429'd on the same brands the
+    main scrape had to route around.
     """
     today_str = str(date.today())
     shopify_brands = [b for b in BRANDS if b["engine"] == "shopify"]
@@ -3874,6 +3961,7 @@ def collect_bestseller_ranks(supabase, session):
     for brand in shopify_brands:
         brand_name = brand["name"]
         domain     = brand["domain"]
+        brand_session = get_shopify_session(brand_name) if brand_name in DATAIMPULSE_PROXY_BRANDS else session
         try:
             # Check if we already have today's ranks for this brand
             existing = safe_db_execute(
@@ -3889,7 +3977,7 @@ def collect_bestseller_ranks(supabase, session):
             url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit=250"
             try:
                 res = execute_with_retry(
-                    session.get, url, max_retries=2, backoff=3, timeout=30,
+                    brand_session.get, url, max_retries=2, backoff=3, timeout=30,
                     headers={"User-Agent": "Mozilla/5.0"}
                 )
             except Exception as e:
@@ -3976,7 +4064,7 @@ def scrape_brand(brand_name, domain):
     try:
         supabase     = create_client(SUPABASE_URL, SUPABASE_KEY)
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
-        session      = get_lcw_session() if brand_config["engine"] == "lcw_proxy" else get_resilient_session()
+        session      = get_lcw_session() if brand_config["engine"] == "lcw_proxy" else get_shopify_session(brand_name)
     except Exception as e:
         print(f"❌ Initialization failed for {brand_name}: {e}")
         return 0, 0
@@ -4027,8 +4115,8 @@ def scrape_brand(brand_name, domain):
         if brand_config["engine"] == "shopify":
             seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         elif brand_config["engine"] == "lcw_proxy":
-            if not WEBSHARE_PROXY:
-                print("  ⚠️ WEBSHARE credentials not set. Skipping LCW.")
+            if not DATAIMPULSE_CONFIGURED:
+                print("  ⚠️ DATAIMPULSE credentials not set. Skipping LCW.")
                 seen, changes = 0, 0
             else:
                 seen, changes = scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
@@ -4061,6 +4149,10 @@ if __name__ == "__main__":
     else:
         active_brands = BRANDS
     print(f"🚀 Khabar Scraper starting... target={SCRAPE_TARGET} ({len(active_brands)} brands)")
+    if any(b["name"] in DATAIMPULSE_PROXY_BRANDS or b["engine"] == "lcw_proxy" for b in active_brands):
+        routed = sorted(DATAIMPULSE_PROXY_BRANDS | {b["name"] for b in active_brands if b["engine"] == "lcw_proxy"})
+        print(f"  [DataImpulse] Proxy configured: {DATAIMPULSE_CONFIGURED} "
+              f"(routed brands: {', '.join(routed)})")
     startup_jitter = random.uniform(0, 30)
     print(f"  Startup jitter: {startup_jitter:.1f}s")
     time.sleep(startup_jitter)
