@@ -822,18 +822,24 @@ def get_shopify_session(brand_name):
 
 def get_lcw_session():
     """
-    v14.31: moved off Webshare onto DataImpulse (pricing). Same intent as
-    before — an Egyptian residential exit IP, held steady for this one run
-    via a random sticky-session id — just expressed in DataImpulse's syntax
-    (__cr.eg for country, ;sessid.<id> for stickiness up to ~30min) instead
-    of Webshare's "-eg-<id>" sub-user suffix.
+    v14.34: switched from username-parameter stickiness (__cr.eg;sessid.N on
+    the shared gateway port 823) to DataImpulse's primary documented sticky
+    method: a dedicated port in the 10000-20000 range, each bound to one
+    residential IP for up to ~30 min. Reasoning: the sessid-on-823 approach
+    is a secondary/legacy path on their gateway, and the "CONNECT tunnel
+    failed, response 502" errors seen in the July 9 run are DataImpulse's
+    own tunnel breaking (not Akamai) — a symptom of that shared gateway
+    port, not of the target site. Port-based stickiness is their
+    first-class mechanism and should be more stable.
+    Country targeting (__cr.eg) still goes in the username; the port itself
+    now provides the IP stickiness, so no ;sessid.N suffix is needed.
     """
     if not DATAIMPULSE_CONFIGURED:
         return requests.Session(impersonate="chrome124")
-    eg_session = random.randint(1, 900)
-    proxy_user = f"{DATAIMPULSE_USER}__cr.eg;sessid.{eg_session}"
-    proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
-    print(f"  [LCW] Egyptian proxy session selected: sessid.{eg_session}")
+    sticky_port = random.randint(10000, 20000)
+    proxy_user = f"{DATAIMPULSE_USER}__cr.eg"
+    proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{sticky_port}"
+    print(f"  [LCW] Egyptian proxy session selected: port.{sticky_port}")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
