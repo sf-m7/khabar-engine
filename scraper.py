@@ -523,6 +523,27 @@
 #           confirmed still working direct in that same run and is untouched.
 #         Both session builders fall back to a direct connection (with a
 #         warning, not a crash) if DATAIMPULSE credentials aren't set.
+#  v14.32 LCW's first post-v14.31 run failed almost entirely — nearly every
+#         page after the first hit repeated timeouts / HTTP-2 SETTINGS-frame
+#         errors on curl_cffi. Root cause: scrape_lcw primes one
+#         requests.Session (loads the category page first for a cookie/WAF
+#         token) and reuses it — same cookies, same IP — for the WHOLE run,
+#         so DataImpulse's sticky sessid pinned the entire ~50-page crawl to
+#         ONE specific residential home IP. That run's assigned peer was
+#         evidently a flaky home connection, and because nothing rotated
+#         away from it, one bad peer sank the whole run. (Shopify's sessions
+#         have no sessid — they get a fresh IP roughly every request, so one
+#         bad peer there only ever cost a single request, which is why that
+#         group sailed through unaffected.)
+#         Added lcw_fetch_page_resilient(): if a page still fails after its
+#         normal execute_with_retry attempts on the current session, it
+#         rotates to a fresh sticky sessid (a different residential peer)
+#         and retries that one page once more before giving up on it. Both
+#         call sites in scrape_lcw (the category's first-page fetch and the
+#         per-page loop) now go through this wrapper and thread the
+#         (possibly rotated) session back through the rest of the run —
+#         including the later per-product size-backfill crawl — so a good
+#         IP, once found, is kept rather than discarded after one page.
 # ═══════════════════════════════════════════════════════
 
 import json
@@ -2343,6 +2364,37 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers,
         print(f"  ⚠️ LCW network fault (cat={category_id}, page={page_index}): {e}")
         return None
 
+def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
+                              seen_ids=None, category_params=None):
+    """
+    v14.32: LCW's crawl is necessarily sticky — scrape_lcw primes one
+    requests.Session (loads the category page first to pick up a cookie/WAF
+    token) and reuses it for the whole run, so its DataImpulse sticky sessid
+    pins the crawl to ONE specific residential home IP. If that particular
+    peer is a flaky home connection, the entire run rides on it — which is
+    exactly what happened in the July 8 run: near-every page failed after
+    execute_with_retry's 5 attempts, with HTTP/2 SETTINGS-frame errors
+    typical of a degraded last-mile connection, not a code/config problem.
+
+    Fix: if a page still fails after its normal retries on the CURRENT
+    session, rotate to a fresh sticky sessid (a different residential peer)
+    and retry that one page once more before giving up on it. Returns
+    (data, session) — session may have changed, and the caller should keep
+    using the returned session for subsequent pages so a good IP, once
+    found, is kept rather than being discarded after one lucky page.
+    """
+    data = lcw_fetch_page(session, domain, category_id, page_index, headers,
+                          seen_ids=seen_ids, category_params=category_params)
+    if data is None and DATAIMPULSE_CONFIGURED:
+        print(f"  ⚠️ [LCW] cat={category_id} page={page_index} failed after retries — "
+              f"this sticky IP looks bad. Rotating to a fresh DataImpulse session "
+              f"and retrying this page once.")
+        session = get_lcw_session()
+        time.sleep(random.uniform(2, 4))
+        data = lcw_fetch_page(session, domain, category_id, page_index, headers,
+                              seen_ids=seen_ids, category_params=category_params)
+    return data, session
+
 def _parse_lcw_price(v):
     if not v: return 0.0
     if isinstance(v, (int, float)): return float(v)
@@ -2421,8 +2473,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
         cat_params = cat.get("params", [])
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
         seen_ids   = []
-        first_data = lcw_fetch_page(session, domain, cat_id, 1, headers,
-                                     seen_ids=[], category_params=cat_params)
+        first_data, session = lcw_fetch_page_resilient(session, domain, cat_id, 1, headers,
+                                                        seen_ids=[], category_params=cat_params)
         if not first_data:
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
             continue
@@ -2436,8 +2488,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
             data = first_data if page_idx == 1 else None
             if page_idx > 1:
                 time.sleep(random.uniform(1.2, 2.0))
-                data = lcw_fetch_page(session, domain, cat_id, page_idx, headers,
-                                       seen_ids=seen_ids, category_params=cat_params)
+                data, session = lcw_fetch_page_resilient(session, domain, cat_id, page_idx, headers,
+                                                          seen_ids=seen_ids, category_params=cat_params)
                 if not data:
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
                     continue
@@ -3946,13 +3998,6 @@ def collect_bestseller_ranks(supabase, session):
     For each Shopify brand, fetch the best-selling sort and record
     rank 1–BESTSELLER_CAP. Idempotent: if today's ranks already exist
     for a brand, that brand is skipped.
-
-    v14.31: `session` (the caller's shared, non-proxied session) is now only
-    the fallback for brands that don't need a proxy. Brands in
-    DATAIMPULSE_PROXY_BRANDS get their own get_shopify_session(brand_name)
-    call instead — the earlier version reused one shared direct session for
-    every brand, so this pass would have still 429'd on the same brands the
-    main scrape had to route around.
     """
     today_str = str(date.today())
     shopify_brands = [b for b in BRANDS if b["engine"] == "shopify"]
@@ -3961,7 +4006,6 @@ def collect_bestseller_ranks(supabase, session):
     for brand in shopify_brands:
         brand_name = brand["name"]
         domain     = brand["domain"]
-        brand_session = get_shopify_session(brand_name) if brand_name in DATAIMPULSE_PROXY_BRANDS else session
         try:
             # Check if we already have today's ranks for this brand
             existing = safe_db_execute(
@@ -3977,7 +4021,7 @@ def collect_bestseller_ranks(supabase, session):
             url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit=250"
             try:
                 res = execute_with_retry(
-                    brand_session.get, url, max_retries=2, backoff=3, timeout=30,
+                    session.get, url, max_retries=2, backoff=3, timeout=30,
                     headers={"User-Agent": "Mozilla/5.0"}
                 )
             except Exception as e:
