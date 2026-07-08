@@ -45,8 +45,8 @@ R2_ACCOUNT_ID        = os.environ["R2_ACCOUNT_ID"]
 R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
 R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-ARCHIVE_THRESHOLD_DAYS = int(os.environ.get("ARCHIVE_THRESHOLD_DAYS_OVERRIDE", "21"))
-# Default is 21, matching the hot window described in the architecture
+ARCHIVE_THRESHOLD_DAYS = int(os.environ.get("ARCHIVE_THRESHOLD_DAYS_OVERRIDE", "30"))
+# Default is 30, matching the hot window described in the architecture
 # report and the scraper's own purge logic elsewhere in the codebase.
 # ARCHIVE_THRESHOLD_DAYS_OVERRIDE exists ONLY so a manual workflow_dispatch
 # run can pilot the full export -> upload -> verify pipeline against real
