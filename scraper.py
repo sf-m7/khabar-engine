@@ -2848,7 +2848,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # (to clear a backlog) or lowered (to conserve proxy bandwidth) WITHOUT
     # editing this file. Defaults to 65 if the variable isn't set.
     SIZE_CAP     = env_int("LCW_SIZE_CAP", 65)
-    SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
+    SIZE_TIMEOUT = 3600   # 10 minutes hard ceiling — far less than the 180-min workflow limit. Increased to 1 hour to fill more sizes. and will be reverted back when finishing.
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
 
     try:
