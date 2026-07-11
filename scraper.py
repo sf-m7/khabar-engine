@@ -573,9 +573,17 @@ MIN_ALERT_DISCOUNT_PCT = 10
 # Webshare consumer) AND for the Shopify/WooCommerce brands a WAF is
 # currently blocking by IP/ASN. gw.dataimpulse.com:823 is the standard HTTP
 # gateway.
+#
+# v14.35: DataImpulse support recommended connecting directly to a gateway
+# IP (bypassing DNS resolution of gw.dataimpulse.com) for performance.
+# Made configurable via DATAIMPULSE_HOST rather than hardcoded, since a
+# support-provided IP can be gateway/load-balancer-specific and may need to
+# change or be reverted without another code edit. Defaults to the DNS
+# name if the variable isn't set, so this is a no-op until explicitly
+# switched on in the workflow.
 DATAIMPULSE_USER      = os.environ.get("DATAIMPULSE_PROXY_USERNAME", "")
 DATAIMPULSE_PASS      = os.environ.get("DATAIMPULSE_PROXY_PASSWORD", "")
-DATAIMPULSE_HOST      = "gw.dataimpulse.com"
+DATAIMPULSE_HOST      = os.environ.get("DATAIMPULSE_HOST", "gw.dataimpulse.com")
 DATAIMPULSE_PORT      = 823
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
@@ -2379,7 +2387,7 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers,
         return None
 
 def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
-                              seen_ids=None, category_params=None):
+                              seen_ids=None, category_params=None, rotation_budget=None):
     """
     v14.32: LCW's crawl is necessarily sticky — scrape_lcw primes one
     requests.Session (loads the category page first to pick up a cookie/WAF
@@ -2396,21 +2404,39 @@ def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
     (data, session) — session may have changed, and the caller should keep
     using the returned session for subsequent pages so a good IP, once
     found, is kept rather than being discarded after one lucky page.
+
+    v14.34: v14.33's per-page rotation cap (2 rotations/page) had no
+    RUN-WIDE ceiling — on a genuinely bad DataImpulse pool day (many
+    consecutive bad residential peers, not just one flaky IP), nearly every
+    page could independently burn its full 2 rotations, with nothing to
+    stop that compounding across an entire multi-hundred-page crawl.
+    Confirmed live: a run that normally takes ~22 minutes took 2.5 hours
+    and was "full of retries" — this mechanism, not the LCW_SIZE_CAP pass
+    (bounded to ~65 requests/run regardless of proxy health), is what
+    actually drove that.
+
+    Fix: `rotation_budget` is a single-element list (`[N]`) shared across
+    the ENTIRE catalog crawl (all categories, all pages), passed in by the
+    caller and decremented here on every rotation. Once it hits 0, this
+    function stops rotating sessions entirely and just returns whatever the
+    current (possibly bad) session gets on the normal retry attempts —
+    degrading gracefully (some pages skipped, logged) instead of burning
+    unbounded bandwidth fighting a bad proxy day to a standstill.
     """
-    # v14.33: now that lcw_fetch_page fails fast (12s/2 attempts instead of
-    # 30s/5), a single bad IP costs ~25s to detect instead of ~3 minutes —
-    # so we can afford to try up to 2 rotations (3 sessions total) before
-    # giving up on a page, instead of just 1. This matters because the
-    # DataImpulse Egyptian pool has shown runs of several consecutive bad
-    # peers in a row (not just one flaky IP), likely Akamai treating a chunk
-    # of that pool's IP range as suspect.
     data = lcw_fetch_page(session, domain, category_id, page_index, headers,
                           seen_ids=seen_ids, category_params=category_params)
     attempts = 1
     while data is None and DATAIMPULSE_CONFIGURED and attempts < 3:
+        if rotation_budget is not None and rotation_budget[0] <= 0:
+            print(f"  ⚠️ [LCW] cat={category_id} page={page_index} failed — "
+                  f"run-wide rotation budget exhausted. Skipping page "
+                  f"instead of rotating further.")
+            break
         print(f"  ⚠️ [LCW] cat={category_id} page={page_index} failed — "
               f"sticky IP looks bad (rotation {attempts}/2). Rotating to a "
               f"fresh DataImpulse session.")
+        if rotation_budget is not None:
+            rotation_budget[0] -= 1
         session = get_lcw_session()
         time.sleep(random.uniform(1, 2))
         data = lcw_fetch_page(session, domain, category_id, page_index, headers,
@@ -2491,13 +2517,23 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     lcw_model_records = {}   # db_pid -> [variant _meta records across the whole run]
     lcw_model_info    = {}   # db_pid -> {desc, category, url} for alerts
 
+    # v14.34: run-wide session-rotation budget shared across the ENTIRE
+    # catalog crawl (every category, every page). Prevents a bad-proxy-pool
+    # day from compounding into unbounded rotations/retries — see the full
+    # diagnosis in lcw_fetch_page_resilient's docstring. 8 rotations is
+    # generous for a normal run (which needs ~0) while capping a truly bad
+    # day to roughly 8 extra fresh-session round trips instead of one per
+    # struggling page. Tune via LCW_ROTATION_BUDGET if needed.
+    rotation_budget = [int(os.environ.get("LCW_ROTATION_BUDGET", "8"))]
+
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         cat_params = cat.get("params", [])
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
         seen_ids   = []
         first_data, session = lcw_fetch_page_resilient(session, domain, cat_id, 1, headers,
-                                                        seen_ids=[], category_params=cat_params)
+                                                        seen_ids=[], category_params=cat_params,
+                                                        rotation_budget=rotation_budget)
         if not first_data:
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
             continue
@@ -2512,7 +2548,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
             if page_idx > 1:
                 time.sleep(random.uniform(1.2, 2.0))
                 data, session = lcw_fetch_page_resilient(session, domain, cat_id, page_idx, headers,
-                                                          seen_ids=seen_ids, category_params=cat_params)
+                                                          seen_ids=seen_ids, category_params=cat_params,
+                                                          rotation_budget=rotation_budget)
                 if not data:
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
                     continue
