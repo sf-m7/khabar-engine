@@ -35,8 +35,10 @@ from datetime import datetime, timezone
 sys.stdout.reconfigure(line_buffering=True)
 
 # Import real, tested logic directly from scraper.py — see DESIGN note above.
+from supabase import create_client
 from scraper import (
-    supabase,
+    SUPABASE_URL,
+    SUPABASE_KEY,
     env_int,
     get_lcw_session,
     fetch_lcw_product_page,
@@ -44,6 +46,11 @@ from scraper import (
     safe_db_execute,
     DATAIMPULSE_CONFIGURED,
 )
+
+# scraper.py doesn't expose a module-level `supabase` client (every function
+# there creates its own via create_client(...) when needed) — matching that
+# same pattern here rather than assuming a global that doesn't exist.
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Backfill-specific budget — independent of the daily scraper's caps ────
 # BACKFILL_SIZE_CAP:   how many product URLs to fetch THIS run. Generous
