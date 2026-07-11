@@ -4058,9 +4058,29 @@ def fetch_and_store_fx_rate(supabase, session):
     (the __main__ block calls it before the brand loop). If today's row
     already exists (e.g. from an earlier run), this is a silent no-op.
 
-    Uses frankfurter.app — a free, open-source ECB-based API that covers
-    EGP. No API key needed. Falls back gracefully on any failure so the
-    scraper run continues regardless.
+    Uses api.frankfurter.dev (the CURRENT domain — frankfurter.app is the
+    old/legacy domain and no longer the right one to call) — a free,
+    open-source API that covers EGP as of v2 (confirmed live: a direct
+    check of https://api.frankfurter.dev/v2/rate/USD/EGP returns a real
+    rate; EGP was NOT in Frankfurter's v1/ECB-only currency list, which is
+    what this code was originally written against).
+
+    v14.39 FIX: this function had been silently failing on every run since
+    it was written — HTTP 404 every time — for THREE compounding reasons,
+    all now fixed:
+      1. Wrong domain: was calling frankfurter.APP (legacy), not
+         frankfurter.DEV (current). These are different domains.
+      2. Wrong endpoint shape: was using v1-style query params
+         (/latest?from=USD&to=EGP). The correct v2 endpoint for a single
+         pair is path-based: /v2/rate/{base}/{quote}, i.e. /v2/rate/USD/EGP.
+      3. Wrong response parsing: v1's shape is {"rates": {"EGP": ...}}.
+         v2's actual shape (confirmed live) is flat:
+         {"date":"...", "base":"USD", "quote":"EGP", "rate": 49.648} —
+         there is no "rates" dict in v2's /rate response at all. Even with
+         URL fixes 1 and 2 alone, this parsing line would have kept
+         silently failing.
+    Falls back gracefully on any failure so the scraper run continues
+    regardless — unchanged from before.
     """
     today_str = str(date.today())
     try:
@@ -4075,7 +4095,7 @@ def fetch_and_store_fx_rate(supabase, session):
 
         res = execute_with_retry(
             session.get,
-            f"https://api.frankfurter.app/latest?from=USD&to=EGP",
+            "https://api.frankfurter.dev/v2/rate/USD/EGP",
             max_retries=2, backoff=3, timeout=10,
             headers={"User-Agent": "Khabar-Scraper/1.0"}
         )
@@ -4083,9 +4103,9 @@ def fetch_and_store_fx_rate(supabase, session):
             print(f"  ⚠️ FX rate API returned HTTP {res.status_code}. Skipping.")
             return
         data = res.json()
-        rate = data.get("rates", {}).get("EGP")
+        rate = data.get("rate")  # v2 /rate response is flat — no "rates" dict
         if not rate:
-            print(f"  ⚠️ FX rate API did not return EGP rate. Response: {data}")
+            print(f"  ⚠️ FX rate API did not return a rate. Response: {data}")
             return
         safe_db_execute(
             supabase.table("fx_rate").insert({
