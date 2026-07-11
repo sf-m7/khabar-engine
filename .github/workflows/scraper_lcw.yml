@@ -33,6 +33,23 @@ jobs:
 
       # v14.31: moved off Webshare onto DataImpulse (pricing). Same role as
       # before — Egyptian residential exit IP for LCW's WAF.
+      #
+      # v14.34: LCW_SIZE_CAP was defined in scraper.py (os.environ.get with
+      # a "65" default) but was NEVER actually passed into this job's env
+      # block — so the repository variable could be changed at will and the
+      # scraper would silently keep using the hardcoded default of 65 every
+      # run. Now wired in below via ${{ vars.LCW_SIZE_CAP }}.
+      #
+      # Also added LCW_ROTATION_BUDGET — caps total DataImpulse session
+      # rotations across an entire catalog crawl run (was unbounded before,
+      # which is what turned a normal ~22-minute run into a 2.5-hour run
+      # "full of retries" on a bad-proxy-pool day). Defaults to 8 in code
+      # if this variable isn't set, so it's optional here, but exposing it
+      # lets you tune it without another code change if needed.
+      # v14.35: DATAIMPULSE_HOST lets you point at a specific gateway IP
+      # (e.g. the one DataImpulse support recommends) instead of the DNS
+      # name, without another code change. Leave the repo variable unset
+      # to keep using gw.dataimpulse.com (the default in scraper.py).
       - name: Run LCW scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -40,6 +57,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DATAIMPULSE_HOST: ${{ vars.DATAIMPULSE_HOST }}
           SCRAPE_TARGET: lcw
+          LCW_SIZE_CAP: ${{ vars.LCW_SIZE_CAP }}
+          LCW_ROTATION_BUDGET: ${{ vars.LCW_ROTATION_BUDGET }}
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
