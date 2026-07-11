@@ -587,6 +587,21 @@ DATAIMPULSE_HOST      = os.environ.get("DATAIMPULSE_HOST", "gw.dataimpulse.com")
 DATAIMPULSE_PORT      = 823
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
+
+def env_int(name, default):
+    """
+    v14.36 fix: os.environ.get(name, default) only falls back to `default`
+    when the variable is completely UNSET — a GitHub Actions repository
+    variable that exists but is left BLANK still gets passed through as an
+    empty string "", not omitted. int("") crashes. This happened live:
+    LCW_ROTATION_BUDGET was added as a repo variable but left empty, and
+    int(os.environ.get("LCW_ROTATION_BUDGET", "8")) still tried int("")
+    because the env var WAS set (to ""), so the "8" default never
+    triggered. This helper treats "unset" and "blank" identically.
+    """
+    val = os.environ.get(name, "").strip()
+    return int(val) if val else default
+
 # Brands whose storefronts are currently WAF-blocking the GitHub Actions
 # runner IP. UPDATED from the actual post-deploy run log (not just the
 # v14.30 diagnostic note): dalydress, eagle, just_sbr, mlameh, tomato — plus
@@ -2524,7 +2539,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # generous for a normal run (which needs ~0) while capping a truly bad
     # day to roughly 8 extra fresh-session round trips instead of one per
     # struggling page. Tune via LCW_ROTATION_BUDGET if needed.
-    rotation_budget = [int(os.environ.get("LCW_ROTATION_BUDGET", "8"))]
+    rotation_budget = [env_int("LCW_ROTATION_BUDGET", 8)]
 
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
@@ -2815,7 +2830,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # Controlled by the LCW_SIZE_CAP repository variable so it can be raised
     # (to clear a backlog) or lowered (to conserve proxy bandwidth) WITHOUT
     # editing this file. Defaults to 65 if the variable isn't set.
-    SIZE_CAP     = int(os.environ.get("LCW_SIZE_CAP", "65"))
+    SIZE_CAP     = env_int("LCW_SIZE_CAP", 65)
     SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
 
