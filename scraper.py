@@ -2848,7 +2848,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # (to clear a backlog) or lowered (to conserve proxy bandwidth) WITHOUT
     # editing this file. Defaults to 65 if the variable isn't set.
     SIZE_CAP     = env_int("LCW_SIZE_CAP", 65)
-    SIZE_TIMEOUT = 2400   # 10 minutes hard ceiling — far less than the 180-min workflow limit. Increased to 40 minutes to fill more sizes. and will be reverted back when finishing.
+    SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
 
     try:
@@ -3298,9 +3298,34 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                         sizes = size_map.get(lc, [])
                         if not sizes or not vr.get("variant_db_id"):
                             continue
+                        # v14.38 FIX: same dual-writer bug already found and
+                        # fixed for LCW (see the v14.22 changelog at the top
+                        # of this file). vr["variant_db_id"] here is the
+                        # COLOR-LEVEL parent row (one per defacto_{long_code},
+                        # not per size — see the batch_variants build above).
+                        # Its is_in_stock is the color-wide aggregate and is
+                        # ALREADY set correctly by the catalog pass just above
+                        # (is_avail = stock_qty > 0, the real "is any size of
+                        # this color purchasable" signal). This update used to
+                        # ALSO overwrite that same field with sizes[0]'s stock
+                        # state — one specific size, whichever happened to be
+                        # first in that day's size-fetch response, order not
+                        # guaranteed stable run to run. When that first size
+                        # was OOS while other sizes were still available, this
+                        # flipped the parent to False; the NEXT run's catalog
+                        # pass then saw real stock (True) against that stale
+                        # False baseline and logged a false restock — with no
+                        # real stockout ever recorded. This is confirmed live:
+                        # DeFacto shows 0 stockouts against 55 restocks, the
+                        # exact signature of this bug. FIX: is_in_stock is
+                        # removed from this payload entirely — only `size`
+                        # and `last_updated_at` are written here now. The
+                        # per-size CHILD rows below (sizes[1:]) are UNAFFECTED
+                        # by this fix and keep their own correct per-size
+                        # is_in_stock, same as the LCW fix.
                         safe_db_execute(
                             supabase.table("product_variants")
-                            .update({"size": sizes[0]["size"], "is_in_stock": sizes[0]["is_in_stock"], "last_updated_at": now_iso_sz})
+                            .update({"size": sizes[0]["size"], "last_updated_at": now_iso_sz})
                             .eq("id", vr["variant_db_id"])
                         )
                         for sz in sizes[1:]:
@@ -3428,9 +3453,15 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                     fop        = row.get("first_observed_price") or prev_prices.get(product_id)
                     for i, sz in enumerate(sizes):
                         if i == 0:
+                            # v14.38 FIX: same bug, same fix as the inline
+                            # pass above — row["id"] here is also the
+                            # COLOR-LEVEL parent row. is_in_stock removed
+                            # from this payload; only the catalog pass may
+                            # set it. See the full diagnosis in the inline
+                            # size-population block earlier in this function.
                             safe_db_execute(
                                 supabase.table("product_variants")
-                                .update({"size": sz["size"], "is_in_stock": sz["is_in_stock"], "last_updated_at": now_iso})
+                                .update({"size": sz["size"], "last_updated_at": now_iso})
                                 .eq("id", row["id"])
                             )
                         else:
