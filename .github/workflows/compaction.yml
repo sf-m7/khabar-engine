@@ -24,11 +24,16 @@ jobs:
       - name: Check if this is the first Monday of the month
         id: gate
         run: |
-          DAY=$(date +%d)
-          if [ "$DAY" -le 7 ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run — bypassing the first-Monday date gate."
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            DAY=$(date +%d)
+            if [ "$DAY" -le 7 ]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Set up Python
