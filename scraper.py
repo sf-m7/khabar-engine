@@ -568,6 +568,23 @@ TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # Keeps alerts genuine and naturally caps alert volume.
 MIN_ALERT_DISCOUNT_PCT = 10
 
+def env_str(name, default):
+    """
+    v14.37 fix: same class of bug as env_int below, for string variables.
+    A GitHub Actions repository variable that exists but is left BLANK
+    still comes through as "", not omitted — os.environ.get(name, default)
+    only falls back to `default` when the variable is completely UNSET.
+    Happened live: DATAIMPULSE_HOST was "deleted" via the GitHub UI in a
+    way that actually left it present-but-blank, so the code kept building
+    a proxy URL with an empty host (http://user:pass@:PORT) instead of
+    falling back to gw.dataimpulse.com — producing the exact
+    "No host part in the URL" curl error. Treats "unset" and "blank" the
+    same way env_int does for integers.
+    """
+    val = os.environ.get(name, "").strip()
+    return val if val else default
+
+
 # v14.31: DataImpulse residential proxy — replaces Webshare everywhere
 # (pricing was the reason for the move). Used for LCW (previously the only
 # Webshare consumer) AND for the Shopify/WooCommerce brands a WAF is
@@ -579,11 +596,11 @@ MIN_ALERT_DISCOUNT_PCT = 10
 # Made configurable via DATAIMPULSE_HOST rather than hardcoded, since a
 # support-provided IP can be gateway/load-balancer-specific and may need to
 # change or be reverted without another code edit. Defaults to the DNS
-# name if the variable isn't set, so this is a no-op until explicitly
-# switched on in the workflow.
+# name if the variable isn't set OR left blank (see env_str above) — this
+# is a no-op unless a real, non-empty value is put in the repo variable.
 DATAIMPULSE_USER      = os.environ.get("DATAIMPULSE_PROXY_USERNAME", "")
 DATAIMPULSE_PASS      = os.environ.get("DATAIMPULSE_PROXY_PASSWORD", "")
-DATAIMPULSE_HOST      = os.environ.get("DATAIMPULSE_HOST", "gw.dataimpulse.com")
+DATAIMPULSE_HOST      = env_str("DATAIMPULSE_HOST", "gw.dataimpulse.com")
 DATAIMPULSE_PORT      = 823
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
