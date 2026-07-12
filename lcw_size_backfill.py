@@ -114,8 +114,23 @@ def run_backfill():
           f"capped at {BACKFILL_TIME_LIMIT/60:.0f} minutes wall-clock.")
 
     urls_to_fetch = list(url_to_rows.keys())[:BACKFILL_SIZE_CAP]
-    fetched = populated_rows = 0
+    fetched = populated_rows = consecutive_fails = 0
     start = time.time()
+
+    # v2 fix: this run (2026-07-12) produced ZERO writes across a full
+    # 45-minute window — every single URL failed with a 10s timeout, 0
+    # bytes received (same DataImpulse bad-pool signature already seen and
+    # fixed for scraper.py's main crawl). This script had no retry/rotation
+    # at all, so a bad pool day meant burning the ENTIRE time budget
+    # failing sequentially with nothing to show for it. Two fixes:
+    #   1. One retry per URL on a FRESH session (mirrors the main
+    #      scraper's rotation logic, just simpler — no run-wide budget
+    #      needed here since this is already a bounded, manual job).
+    #   2. Early exit if the pool is clearly having a bad day (20
+    #      consecutive total failures — i.e. failed even after their
+    #      retry) — stops burning bandwidth/time once it's clear
+    #      continuing won't help; re-running later or tomorrow is cheaper.
+    EARLY_EXIT_THRESHOLD = 20
 
     for url in urls_to_fetch:
         if time.time() - start > BACKFILL_TIME_LIMIT:
@@ -124,11 +139,29 @@ def run_backfill():
             break
 
         page_data = fetch_lcw_product_page(session, url)
+        if not page_data:
+            # One retry on a fresh session — cheap insurance against a
+            # single bad residential peer, same idea as the main scraper's
+            # rotation logic, without needing a shared run-wide budget here.
+            session = get_lcw_session()
+            time.sleep(random.uniform(1, 2))
+            page_data = fetch_lcw_product_page(session, url)
+
         fetched += 1
 
         if not page_data or not page_data.get("sizes"):
+            consecutive_fails += 1
+            if consecutive_fails >= EARLY_EXIT_THRESHOLD:
+                print(f"  ⚠️ [Backfill] {EARLY_EXIT_THRESHOLD} consecutive "
+                      f"failures even after per-URL retries — this looks "
+                      f"like a bad DataImpulse pool day, not a code issue. "
+                      f"Stopping early rather than burning the rest of the "
+                      f"time budget. Try again later today or tomorrow.")
+                break
             time.sleep(random.uniform(0.6, 1.4))
             continue
+
+        consecutive_fails = 0  # reset on any success
 
         sizes   = page_data["sizes"]
         now_iso = datetime.now(timezone.utc).isoformat()
