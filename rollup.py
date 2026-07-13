@@ -51,7 +51,7 @@ STATEMENT_TIMEOUT = "90s"  # generous explicit ceiling — if a week ever needs 
                             # than this, that's a real signal worth investigating,
                             # not something to silently wait forever on.
 
-BESTSELLER_HOT_DAYS = 35  # daily bestseller_rank rows older than this are purged,
+BESTSELLER_HOT_DAYS = 21  # daily bestseller_rank rows older than this are purged,
                            # matching the price_snapshots hot window in archive.py.
                            # Unlike price_snapshots, there's no R2 export here —
                            # the weekly summary IS the permanent record; the daily
