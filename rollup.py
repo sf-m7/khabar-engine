@@ -46,7 +46,7 @@ DB_URL       = os.environ["SUPABASE_DB_URL"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-WINDOW_DAYS       = 30   # matches the rolling self-healing window the function uses
+WINDOW_DAYS       = 21   # matches the rolling self-healing window the function uses
 STATEMENT_TIMEOUT = "90s"  # generous explicit ceiling — if a week ever needs longer
                             # than this, that's a real signal worth investigating,
                             # not something to silently wait forever on.
@@ -55,7 +55,7 @@ BESTSELLER_HOT_DAYS = 35  # daily bestseller_rank rows older than this are purge
                            # matching the price_snapshots hot window in archive.py.
                            # Unlike price_snapshots, there's no R2 export here —
                            # the weekly summary IS the permanent record; the daily
-                           # granularity is genuinely disposable once rolled up.
+                           # granularity is genuinely disposable once rolled up.  
 
 
 def pending_weeks():
