@@ -28,6 +28,12 @@
 #                                 days as delisted (state maintenance,
 #                                 moved verbatim from scraper.py, no
 #                                 longer hostage to the LCW workflow)
+#   5. weekly_variant_exception — same, week_start older than 12 weeks.
+#                                 Same shape and growth pattern as
+#                                 weekly_product_summary (Task 3) — one row
+#                                 per variant per week — and was missed when
+#                                 Task 3 was added. Self-contained (already
+#                                 carries size/color/price), no join needed.
 #
 # NOTHING here touches price_snapshots (archive.py owns that), and NOTHING
 # touches products/product_variants rows themselves beyond flipping their
@@ -66,6 +72,7 @@ R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 STOCKOUT_DAYS = int(os.environ.get("HK_STOCKOUT_DAYS_OVERRIDE", "60"))
 PRICE_EVENT_DAYS = int(os.environ.get("HK_PRICE_EVENT_DAYS_OVERRIDE", "30"))
 WEEKLY_SUMMARY_WEEKS = int(os.environ.get("HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE", "12"))
+WEEKLY_VARIANT_EXCEPTION_WEEKS = int(os.environ.get("HK_WEEKLY_VARIANT_EXCEPTION_WEEKS_OVERRIDE", "12"))
 STALE_PRODUCT_DAYS = 14  # matches the scraper's original behaviour exactly
 
 DRY_RUN = os.environ.get("HK_DRY_RUN", "false").lower() == "true"
@@ -435,6 +442,30 @@ def main():
     except Exception as e:
         print(f"  ❌ delisting task crashed: {e}")
         failures.append("delisting")
+
+    # Task 5 — weekly_variant_exception (week_start, date). Rows already
+    # carry variant_id/product_id/size/color/price — self-contained by
+    # design, same as Task 3, so no join needed.
+    try:
+        cutoff_week = (date.today()
+                       - timedelta(weeks=WEEKLY_VARIANT_EXCEPTION_WEEKS)).isoformat()
+        ok = archive_table(
+            label="weekly_variant_exception",
+            table="weekly_variant_exception",
+            columns="id, variant_id, product_id, week_start, iso_week, "
+                    "iso_year, size, color, price, is_in_stock, "
+                    "days_in_stock, stockout_count, restock_count, "
+                    "price_median, price_min, price_max, "
+                    "discount_depth_pct, price_diverged, recorded_at",
+            filter_col="week_start",
+            cutoff_value=cutoff_week,
+            date_field="week_start",
+        )
+        if not ok:
+            failures.append("weekly_variant_exception")
+    except Exception as e:
+        print(f"  ❌ weekly_variant_exception task crashed: {e}")
+        failures.append("weekly_variant_exception")
 
     if failures:
         print(f"\n🏁 Housekeeping finished WITH FAILURES: {', '.join(failures)}. "
