@@ -12,7 +12,7 @@ on:
     # NOTE: the scheduled trigger NEVER sets dry_run or any threshold
     # override — those inputs only exist on the manual workflow_dispatch
     # trigger, so a pilot test can never leak into production behaviour.
-    - cron: "0 5 * * 1"
+    - cron: "40 3 * * 1"
   workflow_dispatch:
     inputs:
       dry_run:
