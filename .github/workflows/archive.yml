@@ -14,7 +14,7 @@ on:
     # those inputs only exist on the manual workflow_dispatch trigger below,
     # specifically so a pilot test can never accidentally become the
     # production schedule's behaviour.
-    - cron: "0 4 * * 1"
+    - cron: "20 3 * * 1"
   workflow_dispatch:
     inputs:
       dry_run:
