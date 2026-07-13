@@ -2562,6 +2562,19 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # struggling page. Tune via LCW_ROTATION_BUDGET if needed.
     rotation_budget = [env_int("LCW_ROTATION_BUDGET", 8)]
 
+    # v14.38: circuit breaker for a pool-wide-bad-hour, not just one bad
+    # peer. Diagnosed from the Jul 13 run: 9 different DataImpulse
+    # residential IPs ALL failed identically (bare timeouts, HTTP/2
+    # handshake errors, even DNS resolution through the proxy timing out)
+    # — not the "one flaky peer" case rotation was built for. Once the
+    # rotation budget hit 0, the run kept grinding for 63 more minutes,
+    # skipping 128 pages one at a time, for near-zero data. If
+    # CIRCUIT_BREAKER_LIMIT pages in a row fail completely, the route is
+    # unwell right now — abort the LCW run cleanly instead of burning the
+    # rest of the job for nothing. Next scheduled run tries again fresh.
+    consecutive_failures  = [0]
+    CIRCUIT_BREAKER_LIMIT = env_int("LCW_CIRCUIT_BREAKER", 6)
+
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         cat_params = cat.get("params", [])
@@ -2571,8 +2584,16 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                                                         seen_ids=[], category_params=cat_params,
                                                         rotation_budget=rotation_budget)
         if not first_data:
+            consecutive_failures[0] += 1
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
+            if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT:
+                print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive page "
+                      f"failures — DataImpulse route looks broadly unhealthy "
+                      f"right now, not one bad peer. Aborting LCW run early; "
+                      f"will retry on the next scheduled run.")
+                return products_seen, price_changes
             continue
+        consecutive_failures[0] = 0
 
         catalog_meta = first_data.get("CatalogList") or {}
         total_items  = catalog_meta.get("ItemCount", 0)
@@ -2587,9 +2608,17 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                                                           seen_ids=seen_ids, category_params=cat_params,
                                                           rotation_budget=rotation_budget)
                 if not data:
+                    consecutive_failures[0] += 1
                     print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
+                    if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT:
+                        print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive page "
+                              f"failures — DataImpulse route looks broadly unhealthy "
+                              f"right now, not one bad peer. Aborting LCW run early; "
+                              f"will retry on the next scheduled run.")
+                        return products_seen, price_changes
                     continue
 
+            consecutive_failures[0] = 0
             items = (data.get("CatalogList") or {}).get("Items") or []
             if not items:
                 print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
