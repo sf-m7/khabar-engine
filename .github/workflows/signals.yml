@@ -1,0 +1,54 @@
+name: Khabar Signal Engine
+
+# Computes every runnable L1/L2 signal against the DuckDB lake and writes the
+# results into Supabase aggregate tables the bot and client reports read from.
+#
+# 05:00 UTC daily — after the last scraper pass of the day has landed, and after
+# the Monday maintenance chain (rollup 03:00 → archive 03:20 → housekeeping
+# 03:40 → compaction 04:00) has finished. Signals must never read a table that
+# archive.py is mid-way through deleting from.
+#
+# Self-healing: a missed run is not a lost signal. The next run recomputes the
+# same window from the same lake and upserts over it. Nothing accumulates, so
+# there is no backlog to catch up on.
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: compute everything and print what it WOULD write, but write nothing to Supabase."
+        type: boolean
+        default: false
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compute signals
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+          # Scheduled runs are ALWAYS production — github.event.inputs is empty
+          # on a schedule trigger, so a past manual dry run can never leak into
+          # the cron's behaviour. Same guard as archive.yml and housekeeping.yml.
+          SIGNALS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: python -u compute_signals.py
