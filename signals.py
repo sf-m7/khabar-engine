@@ -166,9 +166,9 @@ SIGNALS = [
             -- Grouping on (brand, from-price, to-price) recovers the real unit of
             -- action, so downstream L2s count one tier move, not eight phantom events.
             bands AS (
-                SELECT brand, median_price, current_price, count(*) AS band_move_size
+                SELECT brand, current_price, count(*) AS band_move_size
                 FROM flagged
-                GROUP BY brand, median_price, current_price
+                GROUP BY brand, current_price
             )
             SELECT
                 f.product_id,
@@ -193,7 +193,6 @@ SIGNALS = [
             FROM flagged f
             JOIN bands b
               ON b.brand = f.brand
-             AND b.median_price = f.median_price
              AND b.current_price = f.current_price
             ORDER BY deviation_pct DESC
         """,
