@@ -144,30 +144,57 @@ SIGNALS = [
                 FROM snapshots s, latest_day l
                 WHERE s.snapshot_date = l.d
                   AND s.price IS NOT NULL AND s.price > 0
+            ),
+            -- Every product that clears the anomaly test today.
+            flagged AS (
+                SELECT
+                    t.product_id, t.brand, t.product_name,
+                    t.category_normalized, t.gender, t.snapshot_date,
+                    t.price AS current_price,
+                    d.median_price, d.q1, d.q3, d.min_price, d.days_observed
+                FROM today t
+                JOIN dist d ON d.product_id = t.product_id
+                WHERE d.days_observed >= {min_days}          -- the honesty guard
+                  AND (d.q3 - d.q1) > 0                      -- flat history = no signal
+                  AND t.price < d.q1 - 1.5 * (d.q3 - d.q1)   -- the anomaly itself
+            ),
+            -- COORDINATION DETECTION.
+            -- Brands price in TIERS, not per-SKU. Seen live 2026-07-14: eight
+            -- unrelated Dalydress products (t-shirts, a belt, pyjamas) all moved
+            -- 1350 -> 950 the same day. Product-by-product that reads as eight
+            -- independent collapses; it is ONE decision applied to a price band.
+            -- Grouping on (brand, from-price, to-price) recovers the real unit of
+            -- action, so downstream L2s count one tier move, not eight phantom events.
+            bands AS (
+                SELECT brand, median_price, current_price, count(*) AS band_move_size
+                FROM flagged
+                GROUP BY brand, median_price, current_price
             )
             SELECT
-                t.product_id,
-                t.brand,
-                t.product_name,
-                t.category_normalized,
-                t.gender,
-                t.snapshot_date,
-                ROUND(t.price, 2)                                   AS current_price,
-                ROUND(d.median_price, 2)                            AS median_price,
-                ROUND(d.q1, 2)                                      AS q1_price,
-                ROUND(d.q3, 2)                                      AS q3_price,
-                ROUND(d.q3 - d.q1, 2)                               AS iqr,
-                ROUND(d.q1 - 1.5 * (d.q3 - d.q1), 2)                AS lower_fence,
-                ROUND(100.0 * (d.median_price - t.price)
-                      / NULLIF(d.median_price, 0), 2)               AS deviation_pct,
-                (t.price <= d.min_price)                            AS is_lowest_ever,
-                d.days_observed,
-                {window_days}                                       AS window_days
-            FROM today t
-            JOIN dist d ON d.product_id = t.product_id
-            WHERE d.days_observed >= {min_days}          -- the honesty guard
-              AND (d.q3 - d.q1) > 0                      -- flat history = no signal
-              AND t.price < d.q1 - 1.5 * (d.q3 - d.q1)   -- the anomaly itself
+                f.product_id,
+                f.brand,
+                f.product_name,
+                f.category_normalized,
+                f.gender,
+                f.snapshot_date,
+                ROUND(f.current_price, 2)                           AS current_price,
+                ROUND(f.median_price, 2)                            AS median_price,
+                ROUND(f.q1, 2)                                      AS q1_price,
+                ROUND(f.q3, 2)                                      AS q3_price,
+                ROUND(f.q3 - f.q1, 2)                               AS iqr,
+                ROUND(f.q1 - 1.5 * (f.q3 - f.q1), 2)                AS lower_fence,
+                ROUND(100.0 * (f.median_price - f.current_price)
+                      / NULLIF(f.median_price, 0), 2)               AS deviation_pct,
+                (f.current_price <= f.min_price)                    AS is_lowest_ever,
+                f.days_observed,
+                {window_days}                                       AS window_days,
+                b.band_move_size,
+                (b.band_move_size >= 3)                             AS is_band_move
+            FROM flagged f
+            JOIN bands b
+              ON b.brand = f.brand
+             AND b.median_price = f.median_price
+             AND b.current_price = f.current_price
             ORDER BY deviation_pct DESC
         """,
         # Same shape as `sql` but WITHOUT the min_days filter — lets the runner
