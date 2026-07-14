@@ -1,0 +1,38 @@
+name: Khabar Lake Check
+
+# Proves the DuckDB query layer can read BOTH tiers (R2 cold lake + Supabase
+# hot buffer) and that the seam between them is sound — no day double-counted,
+# no unexplained gaps. Run this manually after any change to archive.py, the
+# hot-window thresholds, or the lake layout.
+#
+# Read-only. It cannot modify Supabase or R2.
+on:
+  workflow_dispatch:
+
+jobs:
+  lake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check the lake
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+        run: python -u khabar_lake.py
