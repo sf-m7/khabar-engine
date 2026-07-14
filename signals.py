@@ -387,6 +387,102 @@ ORDER BY total_descent_pct DESC
 """,
         "suppressed_sql": None,
     },
+  # -------------------------------------------------------------------------
+    # L1 · 17 — DISCOUNT DEPTH ESCALATION
+    #
+    # "Is this product's discount getting DEEPER over time, without selling?"
+    #
+    # A product cut once, then cut deeper again — each new low further below its
+    # honest baseline (first_observed_price, MIN across variants). Threshold: 2+
+    # deepenings (chosen over 3 because 30 days of history can't yet show three).
+    # No stockout filter yet — that refinement waits on the seeded_stockout fix;
+    # for now every escalation counts, which slightly over-includes.
+    #
+    # Depth is measured against the honest baseline, NEVER compare_at_price. A
+    # "deepening" is a new running-maximum discount depth — intervening shallow
+    # moves don't break the count, they just don't add to it.
+    # -------------------------------------------------------------------------
+    {
+        "id":       "l1_17",
+        "name":     "Discount Depth Escalation",
+        "level":    "L1",
+        "enabled":  True,
+        "requires": [],
+        "table":    "signal_l1_17_depth_escalation",
+        "window_days": 30,
+        "min_days":    1,
+        "unique_on": ["product_id", "snapshot_date"],
+        "sql": """
+WITH baselines AS (
+    SELECT product_id,
+           MIN(CAST(first_observed_price AS DOUBLE)) AS baseline
+    FROM pg.public.product_variants
+    WHERE first_observed_price IS NOT NULL AND first_observed_price > 0
+    GROUP BY product_id
+),
+ev AS (
+    SELECT
+        pe.product_id, pe.brand, pe.price_after,
+        CAST(pe.recorded_at AS TIMESTAMP) AS recorded_at,
+        b.baseline
+    FROM pg.public.price_events pe
+    JOIN baselines b ON b.product_id = pe.product_id
+    WHERE CAST(pe.recorded_at AS TIMESTAMP) >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+      AND pe.price_after < b.baseline
+),
+-- Depth of each cut, plus the deepest cut seen BEFORE it. A row is a genuine
+-- escalation only when it sets a new running maximum depth.
+depth AS (
+    SELECT
+        product_id, brand, recorded_at,
+        100.0 * (baseline - price_after) / baseline AS depth_pct,
+        max(100.0 * (baseline - price_after) / baseline) OVER (
+            PARTITION BY product_id ORDER BY recorded_at
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS running_max_prev
+    FROM ev
+),
+esc AS (
+    SELECT
+        product_id, brand, recorded_at, depth_pct,
+        CASE WHEN running_max_prev IS NULL OR depth_pct > running_max_prev
+             THEN 1 ELSE 0 END AS is_escalation
+    FROM depth
+),
+agg AS (
+    SELECT
+        product_id, brand,
+        sum(is_escalation)                               AS escalation_count,
+        min(recorded_at) FILTER (WHERE is_escalation=1)  AS first_step_at,
+        max(recorded_at) FILTER (WHERE is_escalation=1)  AS last_step_at,
+        (array_agg(depth_pct ORDER BY recorded_at)
+            FILTER (WHERE is_escalation=1))[1]           AS first_depth_pct,
+        (array_agg(depth_pct ORDER BY recorded_at DESC)
+            FILTER (WHERE is_escalation=1))[1]           AS last_depth_pct
+    FROM esc
+    GROUP BY product_id, brand
+    HAVING sum(is_escalation) >= 2
+)
+SELECT
+    a.product_id,
+    a.brand,
+    p.name                AS product_name,
+    p.category_normalized AS category_normalized,
+    p.gender              AS gender,
+    CURRENT_DATE          AS snapshot_date,
+    a.escalation_count,
+    ROUND(a.first_depth_pct, 2) AS first_depth_pct,
+    ROUND(a.last_depth_pct, 2)  AS last_depth_pct,
+    a.first_step_at,
+    a.last_step_at,
+    CAST(date_diff('day', a.first_step_at, a.last_step_at) AS INTEGER) AS span_days
+FROM agg a
+LEFT JOIN pg.public.products p ON p.id = a.product_id
+WHERE a.last_depth_pct > a.first_depth_pct
+ORDER BY a.last_depth_pct DESC
+""",
+        "suppressed_sql": None,
+    },
     # -------------------------------------------------------------------------
     # DEFERRED — declared here so they are VISIBLE and switch themselves on the
     # moment their blocker clears, rather than living in someone's memory.
