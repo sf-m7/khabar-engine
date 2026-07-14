@@ -335,7 +335,7 @@ WITH ev AS (
             PARTITION BY pe.product_id ORDER BY pe.recorded_at
         ) AS prev_after
     FROM pg.public.price_events pe
-    WHERE pe.recorded_at >= now() - INTERVAL '21 days'
+    WHERE pe.recorded_at >= CURRENT_TIMESTAMP - INTERVAL '21 days'
 ),
 -- Mark each event as a valid staircase step: a DOWN move that is strictly
 -- lower than the previous recorded price. Anything else (an up-move, a flat
