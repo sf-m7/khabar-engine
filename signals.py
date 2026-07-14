@@ -224,7 +224,58 @@ SIGNALS = [
               AND t.price < d.q1 - 1.5 * (d.q3 - d.q1)
         """,
     },
-
+# -------------------------------------------------------------------------
+    # L1 · 01 — GENUINE PRICE DROP
+    #
+    # "Has the price actually fallen from where it started?"
+    #
+    # Baseline is first_observed_price — the price the FIRST time Khabar ever
+    # saw this product. Never compare_at_price: that field is whatever the brand
+    # types in, and a product permanently listed at 499 "was 799" is not on sale,
+    # it is priced at 499. This signal is immune to that by construction.
+    #
+    # MIN_DROP_PCT is the only judgment call here. Below it, a move is noise or
+    # a rounding change, not a markdown decision.
+    # -------------------------------------------------------------------------
+    {
+        "id": "l1_01",
+        "name": "Genuine Price Drop",
+        "level": "L1",
+        "enabled": True,
+        "requires": [],
+        "table": "signal_l1_01_genuine_price_drop",
+        "window_days": 1,
+        "min_days": 1,
+        "unique_on": ["product_id", "snapshot_date"],
+        "sql": """
+WITH latest_day AS (
+    SELECT max(snapshot_date) AS d FROM snapshots
+),
+today AS (
+    SELECT s.*
+    FROM snapshots s, latest_day l
+    WHERE s.snapshot_date = l.d
+      AND s.price IS NOT NULL AND s.price > 0
+      AND s.first_observed_price IS NOT NULL AND s.first_observed_price > 0
+)
+SELECT
+    product_id,
+    brand,
+    product_name,
+    category_normalized,
+    gender,
+    snapshot_date,
+    ROUND(price, 2) AS current_price,
+    ROUND(first_observed_price, 2) AS baseline_price,
+    ROUND(100.0 * (first_observed_price - price)
+          / NULLIF(first_observed_price, 0), 2) AS drop_pct
+FROM today
+WHERE price < first_observed_price
+  AND (first_observed_price - price) / first_observed_price >= 0.10
+ORDER BY drop_pct DESC
+""",
+        "suppressed_sql": None,
+    },
     # -------------------------------------------------------------------------
     # DEFERRED — declared here so they are VISIBLE and switch themselves on the
     # moment their blocker clears, rather than living in someone's memory.
