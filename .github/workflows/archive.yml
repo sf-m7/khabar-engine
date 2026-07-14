@@ -20,7 +20,7 @@ on:
       dry_run:
         description: "Pilot mode: run the full pipeline (export, upload, verify) but skip the actual delete. Use this to test before trusting a real run."
         type: boolean
-        default: true
+        default: false
       threshold_override_days:
         description: "Archive rows older than this many days, for THIS manual run only. Leave at 21 for a realistic test; lower it (e.g. 5) to pilot against young real data."
         type: string
