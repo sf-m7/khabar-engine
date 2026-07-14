@@ -63,7 +63,7 @@ jobs:
           # runs always fall back to production defaults regardless of what
           # any past manual run used — same guard as archive.yml.
           HK_DRY_RUN:                        ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          HK_STOCKOUT_DAYS_OVERRIDE:         ${{ github.event_name == 'workflow_dispatch' && inputs.stockout_days || '60' }}
+          HK_STOCKOUT_DAYS_OVERRIDE:         ${{ github.event_name == 'workflow_dispatch' && inputs.stockout_days || '21' }}
           HK_PRICE_EVENT_DAYS_OVERRIDE:      ${{ github.event_name == 'workflow_dispatch' && inputs.price_event_days || '30' }}
-          HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE:  ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_summary_weeks || '12' }}
+          HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE:  ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_summary_weeks || '2' }}
         run: python -u housekeeping.py
