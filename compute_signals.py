@@ -72,29 +72,47 @@ def log_run(pg, signal, status, **kw):
 
 def replace_rows(pg, table, unique_on, rows, columns):
     """
-    Write a signal's output.
+    Write a signal's output for THIS computed day, replacing that day wholesale.
 
-    Upsert on the signal's declared unique key rather than truncate-and-insert:
-    a signal recomputed for today must not erase yesterday's verdicts, which the
-    bot and reports may already be serving. Re-running the same day is therefore
-    idempotent — it overwrites that day's rows and leaves history alone.
+    Upsert alone is NOT enough. Upsert only touches rows whose key reappears in
+    today's result. A product that qualified yesterday but NOT today has no row
+    in `rows` to overwrite it — so its stale verdict lingers in the table
+    forever, and the bot/reports keep serving a signal that no longer fires.
+    (Proven live 2026-07-14: 16 stale L1·03 rows survived a run that recomputed
+    only 23.)
+
+    Fix: for the day(s) present in this result, DELETE the table's rows for those
+    days first, then INSERT the fresh set — all in ONE transaction, so the day is
+    never momentarily empty and prior days are never touched. History for earlier
+    days is preserved; today is replaced as a unit.
+
+    Requires `snapshot_date` to be one of the signal's columns — every signal
+    here carries it. If a future signal has no per-day grain, it must declare its
+    own replace strategy rather than silently orphaning rows.
     """
     if not rows:
         return 0
 
-    cols     = ", ".join(columns)
-    placeholders = ", ".join(["%s"] * len(columns))
-    conflict = ", ".join(unique_on)
-    updates  = ", ".join(f"{c} = EXCLUDED.{c}"
-                         for c in columns if c not in unique_on)
+    if "snapshot_date" not in columns:
+        raise ValueError(
+            f"{table}: replace_rows needs a 'snapshot_date' column to know which "
+            f"day to replace; got columns {columns}"
+        )
 
-    sql = f"""
-        INSERT INTO {table} ({cols}) VALUES ({placeholders})
-        ON CONFLICT ({conflict}) DO UPDATE SET {updates}
-    """
+    date_idx = columns.index("snapshot_date")
+    days     = sorted({r[date_idx] for r in rows})
+
+    cols         = ", ".join(columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    insert_sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
 
     with pg.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, sql, rows, page_size=500)
+        # Clear the exact day(s) this run computed, then repopulate them. One
+        # transaction: either the whole day flips to the new set or nothing does.
+        cur.execute(
+            f"DELETE FROM {table} WHERE snapshot_date = ANY(%s)", (days,)
+        )
+        psycopg2.extras.execute_batch(cur, insert_sql, rows, page_size=500)
     pg.commit()
     return len(rows)
 
