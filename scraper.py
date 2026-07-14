@@ -2021,6 +2021,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                 "image_url":           safe_image,
                 "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                 "is_active":           True,
+                "delisted_at":         None,
                 # v14.29: brand's real launch date — Shopify's published_at
                 # is the date the product went live on the storefront, often
                 # predating our scraper by months/years. Captured for free
@@ -2110,7 +2111,8 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
 
         if batch_variants:
-            db_payload = [{k: v for k, v in row.items() if not k.startswith("_meta_")} for row in batch_variants]
+            db_payload = [{**{k: v for k, v in row.items() if not k.startswith("_meta_")},
+                           "delisted_at": None} for row in batch_variants]
             variant_upsert_rows = []
             for i in range(0, len(db_payload), 100):
                 res = safe_db_execute(
@@ -2651,6 +2653,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     "sizes_available": [], "url": url,
                     "image_url":   item.get("DefaultOptionImageUrl"),
                     "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True,
+                    "delisted_at": None,
                     # v14.24: LCW's strongest signal for both sleeve length and
                     # fit/cut is the title — confirmed via live coverage check,
                     # so this brand uses build_attributes_extracted's default
@@ -2755,7 +2758,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 })
 
             if batch_variants:
-                db_payload = [{k: v for k, v in r.items() if not k.startswith("_meta_")} for r in batch_variants]
+                db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
+                           "delisted_at": None} for r in batch_variants]
                 variant_upsert_rows = []
                 for i in range(0, len(db_payload), 100):
                     res_v = safe_db_execute(
@@ -2998,6 +3002,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                                 "size":                 size_value,
                                 "is_in_stock":          size_in_stock,
                                 "first_observed_price": fop,
+                                "delisted_at":          None,
                                 "last_updated_at":      now_iso,
                             }, on_conflict="external_sku")
                         )
@@ -3191,6 +3196,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                     "image_url":           item.get("PictureName") or None,
                     "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                     "is_active":           True,
+                "delisted_at":         None,
                     # v14.24: DeFacto's titles are the strongest signal for
                     # both sleeve length and fit/cut (confirmed: 55%/61% live
                     # coverage) — default title-first priority order applies.
@@ -3290,7 +3296,8 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 })
 
             if batch_variants:
-                db_payload = [{k: v for k, v in r.items() if not k.startswith("_meta_")} for r in batch_variants]
+                db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
+                           "delisted_at": None} for r in batch_variants]
                 variant_upsert_rows = []
                 for i in range(0, len(db_payload), 100):
                     res_v = safe_db_execute(
@@ -3371,6 +3378,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                                     "size":                 sz["size"],
                                     "is_in_stock":          sz["is_in_stock"],
                                     "first_observed_price": vr.get("_meta_baseline"),
+                                    "delisted_at":          None,
                                     "last_updated_at":      now_iso_sz,
                                 }, on_conflict="external_sku")
                             )
@@ -3507,6 +3515,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                                     "size":                 sz["size"],
                                     "is_in_stock":          sz["is_in_stock"],
                                     "first_observed_price": fop,
+                                "delisted_at":          None,
                                     "last_updated_at":      now_iso,
                                 }, on_conflict="external_sku")
                             )
@@ -3822,6 +3831,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                     "image_url":           _woo_first_image(p),
                     "last_seen_at":        datetime.now(timezone.utc).isoformat(),
                     "is_active":           True,
+                "delisted_at":         None,
                     # v14.29: WooCommerce Store API exposes date_created.
                     "source_published_at": p.get("date_created"),
                     # v14.24: Mobaco is in SLEEVE_LENGTH_CATEGORY_FIRST_BRANDS
@@ -4001,7 +4011,8 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 continue
 
         if batch_variants:
-            db_payload = [{k: v for k, v in r.items() if not k.startswith("_meta_")} for r in batch_variants]
+            db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
+                           "delisted_at": None} for r in batch_variants]
             variant_upsert_rows = []
             for i in range(0, len(db_payload), 100):
                 res_v = safe_db_execute(
