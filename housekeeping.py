@@ -71,8 +71,8 @@ R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 # scheduled runs always use these defaults.
 STOCKOUT_DAYS = int(os.environ.get("HK_STOCKOUT_DAYS_OVERRIDE", "60"))
 PRICE_EVENT_DAYS = int(os.environ.get("HK_PRICE_EVENT_DAYS_OVERRIDE", "30"))
-WEEKLY_SUMMARY_WEEKS = int(os.environ.get("HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE", "12"))
-WEEKLY_VARIANT_EXCEPTION_WEEKS = int(os.environ.get("HK_WEEKLY_VARIANT_EXCEPTION_WEEKS_OVERRIDE", "12"))
+WEEKLY_SUMMARY_WEEKS = int(os.environ.get("HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE", "2"))
+WEEKLY_VARIANT_EXCEPTION_WEEKS = int(os.environ.get("HK_WEEKLY_VARIANT_EXCEPTION_WEEKS_OVERRIDE", "2"))
 STALE_PRODUCT_DAYS = 14  # matches the scraper's original behaviour exactly
 
 DRY_RUN = os.environ.get("HK_DRY_RUN", "false").lower() == "true"
@@ -467,6 +467,27 @@ def main():
         print(f"  ❌ weekly_variant_exception task crashed: {e}")
         failures.append("weekly_variant_exception")
 
+# Task 6 — weekly_bestseller_summary, same pattern as Task 5.
+    try:
+        cutoff_bs_week = (date.today()
+                          - timedelta(weeks=2)).isoformat()
+        ok = archive_table(
+            label="weekly_bestseller_summary",
+            table="weekly_bestseller_summary",
+            columns="id, product_id, brand, week_start, iso_week, iso_year, "
+                    "rank_best, rank_worst, rank_avg, rank_close, "
+                    "rank_change_vs_prev_week, sample_days, recorded_at",
+            filter_col="week_start",
+            cutoff_value=cutoff_bs_week,
+            date_field="week_start",
+        )
+        if not ok:
+            failures.append("weekly_bestseller_summary")
+    except Exception as e:
+        print(f"  ❌ weekly_bestseller_summary task crashed: {e}")
+        failures.append("weekly_bestseller_summary")
+    
+    
     if failures:
         print(f"\n🏁 Housekeeping finished WITH FAILURES: {', '.join(failures)}. "
               f"Failed tables remain fully intact in Supabase and will be "
