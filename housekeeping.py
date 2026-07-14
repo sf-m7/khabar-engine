@@ -69,7 +69,7 @@ R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
 # Hot-window thresholds. Overridable per manual run (see housekeeping.yml),
 # scheduled runs always use these defaults.
-STOCKOUT_DAYS = int(os.environ.get("HK_STOCKOUT_DAYS_OVERRIDE", "60"))
+STOCKOUT_DAYS = int(os.environ.get("HK_STOCKOUT_DAYS_OVERRIDE", "21"))
 PRICE_EVENT_DAYS = int(os.environ.get("HK_PRICE_EVENT_DAYS_OVERRIDE", "30"))
 WEEKLY_SUMMARY_WEEKS = int(os.environ.get("HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE", "2"))
 WEEKLY_VARIANT_EXCEPTION_WEEKS = int(os.environ.get("HK_WEEKLY_VARIANT_EXCEPTION_WEEKS_OVERRIDE", "2"))
