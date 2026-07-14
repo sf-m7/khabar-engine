@@ -22,7 +22,7 @@ on:
       stockout_days:
         description: "Archive stockout_events older than this many days, for THIS run only."
         type: string
-        default: "60"
+        default: "21"
       price_event_days:
         description: "Archive price_events older than this many days, for THIS run only."
         type: string
@@ -30,7 +30,7 @@ on:
       weekly_summary_weeks:
         description: "Archive weekly_product_summary rows with week_start older than this many weeks, for THIS run only."
         type: string
-        default: "12"
+        default: "2"
 
 jobs:
   housekeeping:
