@@ -290,7 +290,9 @@ if __name__ == "__main__":
     # from real archive files in the bucket — never mixed, easy to bulk-
     # delete later once the pilot has served its purpose.
     prefix = "_pilot_dry_run" if DRY_RUN else "price_snapshots"
-    object_key = f"{prefix}/{cutoff.isoformat()}_to_{rows[-1]['snapshot_date']}.parquet"
+    min_date = min(r['snapshot_date'] for r in rows)
+    max_date = max(r['snapshot_date'] for r in rows)
+    object_key = f"{prefix}/{min_date}_to_{max_date}.parquet" 
     print(f"  Uploading to R2 as: {object_key}")
     try:
         upload_to_r2(parquet_buf, object_key)
