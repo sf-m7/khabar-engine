@@ -46,7 +46,7 @@ DB_URL       = os.environ["SUPABASE_DB_URL"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-WINDOW_DAYS       = 21   # matches the rolling self-healing window the function uses
+WINDOW_DAYS       = 7   # matches the rolling self-healing window the function uses
 STATEMENT_TIMEOUT = "90s"  # generous explicit ceiling — if a week ever needs longer
                             # than this, that's a real signal worth investigating,
                             # not something to silently wait forever on.
