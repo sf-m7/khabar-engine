@@ -364,6 +364,8 @@ agg AS (
     FROM steps
     GROUP BY product_id, brand
     HAVING sum(good_step) >= 3
+       AND max(price_after) FILTER (WHERE good_step = 1)
+         > min(price_after) FILTER (WHERE good_step = 1)
 )
 SELECT
     a.product_id,
