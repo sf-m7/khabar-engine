@@ -124,77 +124,113 @@ SIGNALS = [
 WITH latest_day AS (
     SELECT max(snapshot_date) AS d FROM snapshots
 ),
--- Product-level honest baseline.
--- first_observed_price is VARIANT-level; snapshots are PRODUCT-level.
--- COLLAPSE RULE: MIN across a product's variants. 96.5% of products have a
--- single baseline anyway; where they differ, MIN yields the SMALLEST possible
--- drop_pct. A signal sold as "the honest baseline" must never round in its own
--- favour. Only active, non-delisted variants count.
-baselines AS (
+-- Per-product distribution over the whole window. Collection gaps
+-- shrink days_observed rather than being silently treated as
+-- "no price change" — an absent day is unknown, not stable.
+dist AS (
     SELECT
-        pv.product_id,
-        MIN(CAST(pv.first_observed_price AS DOUBLE)) AS baseline_price,
-        count(*)                                     AS variants_considered
-    FROM pg.public.product_variants pv
-    JOIN pg.public.products p ON p.id = pv.product_id
-    WHERE p.is_active = TRUE
-      AND pv.delisted_at IS NULL
-      AND pv.first_observed_price IS NOT NULL
-      AND pv.first_observed_price > 0
-    GROUP BY pv.product_id
+        product_id,
+        count(DISTINCT snapshot_date) AS days_observed,
+        median(price)                 AS median_price,
+        quantile_cont(price, 0.25)    AS q1,
+        quantile_cont(price, 0.75)    AS q3,
+        min(price)                    AS min_price
+    FROM snapshots
+    WHERE price IS NOT NULL AND price > 0
+    GROUP BY product_id
 ),
 today AS (
     SELECT s.*
     FROM snapshots s, latest_day l
     WHERE s.snapshot_date = l.d
       AND s.price IS NOT NULL AND s.price > 0
+),
+-- Every product that clears the anomaly test today.
+flagged AS (
+    SELECT
+        t.product_id, t.brand, t.product_name,
+        t.category_normalized, t.gender, t.snapshot_date,
+        t.price AS current_price,
+        d.median_price, d.q1, d.q3, d.min_price, d.days_observed
+    FROM today t
+    JOIN dist d ON d.product_id = t.product_id
+    WHERE d.days_observed >= {min_days}                -- the honesty guard
+      AND (d.q3 - d.q1) > 0                            -- flat history = no signal
+      AND t.price < d.q1 - 1.5 * (d.q3 - d.q1)         -- the anomaly itself
+),
+-- COORDINATION DETECTION.
+-- Brands price in TIERS, not per-SKU. Seen live 2026-07-14: eight unrelated
+-- Dalydress products (t-shirts, a belt, pyjamas) all landed on 950 the same
+-- day; Men's Club moved five onto 438. Product-by-product that reads as
+-- thirteen independent collapses; it is TWO decisions applied to price bands.
+--
+-- Grouped on (brand, landing price) ONLY. An earlier version also grouped on
+-- median_price — that was wrong: median is each product's OWN history, so two
+-- products moving together but with different history shapes were split into
+-- singletons and no band was ever detected. The landing price is the shared
+-- artefact of a tier decision; the origin price is not observable per-product
+-- from a median.
+bands AS (
+    SELECT brand, current_price, count(*) AS band_move_size
+    FROM flagged
+    GROUP BY brand, current_price
 )
 SELECT
-    t.product_id,
-    t.brand,
-    t.product_name,
-    t.category_normalized,
-    t.gender,
-    t.snapshot_date,
-    ROUND(t.price, 2)                    AS current_price,
-    ROUND(b.baseline_price, 2)           AS baseline_price,
-    ROUND(100.0 * (b.baseline_price - t.price)
-          / NULLIF(b.baseline_price, 0), 2) AS drop_pct
-FROM today t
-JOIN baselines b ON b.product_id = t.product_id
-WHERE t.price < b.baseline_price
-  AND (b.baseline_price - t.price) / b.baseline_price >= 0.10
-ORDER BY drop_pct DESC
+    f.product_id,
+    f.brand,
+    f.product_name,
+    f.category_normalized,
+    f.gender,
+    f.snapshot_date,
+    ROUND(f.current_price, 2) AS current_price,
+    ROUND(f.median_price, 2)  AS median_price,
+    ROUND(f.q1, 2)            AS q1_price,
+    ROUND(f.q3, 2)            AS q3_price,
+    ROUND(f.q3 - f.q1, 2)     AS iqr,
+    ROUND(f.q1 - 1.5 * (f.q3 - f.q1), 2) AS lower_fence,
+    ROUND(100.0 * (f.median_price - f.current_price)
+          / NULLIF(f.median_price, 0), 2) AS deviation_pct,
+    (f.current_price <= f.min_price) AS is_lowest_ever,
+    f.days_observed,
+    {window_days} AS window_days,
+    b.band_move_size,
+    (b.band_move_size >= 3) AS is_band_move
+FROM flagged f
+JOIN bands b
+  ON b.brand = f.brand
+ AND b.current_price = f.current_price
+ORDER BY deviation_pct DESC
 """,
         # Same shape as `sql` but WITHOUT the min_days filter — lets the runner
         # report how many products were withheld for thin history, instead of
         # them simply vanishing.
         "suppressed_sql": """
-            WITH latest_day AS (
-                SELECT max(snapshot_date) AS d FROM snapshots
-            ),
-            dist AS (
-                SELECT product_id,
-                       count(DISTINCT snapshot_date) AS days_observed,
-                       quantile_cont(price, 0.25)    AS q1,
-                       quantile_cont(price, 0.75)    AS q3
-                FROM snapshots
-                WHERE price IS NOT NULL AND price > 0
-                GROUP BY product_id
-            ),
-            today AS (
-                SELECT s.* FROM snapshots s, latest_day l
-                WHERE s.snapshot_date = l.d AND s.price IS NOT NULL AND s.price > 0
-            )
-            SELECT count(*)
-            FROM today t
-            JOIN dist d ON d.product_id = t.product_id
-            WHERE d.days_observed < {min_days}
-              AND (d.q3 - d.q1) > 0
-              AND t.price < d.q1 - 1.5 * (d.q3 - d.q1)
-        """,
+WITH latest_day AS (
+    SELECT max(snapshot_date) AS d FROM snapshots
+),
+dist AS (
+    SELECT product_id,
+           count(DISTINCT snapshot_date) AS days_observed,
+           quantile_cont(price, 0.25)    AS q1,
+           quantile_cont(price, 0.75)    AS q3
+    FROM snapshots
+    WHERE price IS NOT NULL AND price > 0
+    GROUP BY product_id
+),
+today AS (
+    SELECT s.* FROM snapshots s, latest_day l
+    WHERE s.snapshot_date = l.d AND s.price IS NOT NULL AND s.price > 0
+)
+SELECT count(*)
+FROM today t
+JOIN dist d ON d.product_id = t.product_id
+WHERE d.days_observed < {min_days}
+  AND (d.q3 - d.q1) > 0
+  AND t.price < d.q1 - 1.5 * (d.q3 - d.q1)
+""",
     },
-# -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
     # L1 · 01 — GENUINE PRICE DROP
     #
     # "Has the price actually fallen from where it started?"
@@ -209,16 +245,20 @@ ORDER BY drop_pct DESC
     # where they differ we take the MIN, which yields the SMALLEST possible
     # drop_pct. A signal sold on the honesty of its baseline must never round in
     # its own favour.
+    #
+    # MIN_DROP is the one judgment call. Below it, a move is rounding or noise,
+    # not a markdown decision. Currently 10% — provisional, to be tuned against
+    # real Egyptian mid-range behaviour.
     # -------------------------------------------------------------------------
     {
-        "id": "l1_01",
-        "name": "Genuine Price Drop",
-        "level": "L1",
-        "enabled": True,
+        "id":       "l1_01",
+        "name":     "Genuine Price Drop",
+        "level":    "L1",
+        "enabled":  True,
         "requires": [],
-        "table": "signal_l1_01_genuine_price_drop",
+        "table":    "signal_l1_01_genuine_price_drop",
         "window_days": 1,
-        "min_days": 1,
+        "min_days":    1,
         "unique_on": ["product_id", "snapshot_date"],
         "sql": """
 WITH latest_day AS (
@@ -261,7 +301,7 @@ ORDER BY drop_pct DESC
 """,
         "suppressed_sql": None,
     },
-    },
+
     # -------------------------------------------------------------------------
     # DEFERRED — declared here so they are VISIBLE and switch themselves on the
     # moment their blocker clears, rather than living in someone's memory.
