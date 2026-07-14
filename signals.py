@@ -364,8 +364,6 @@ agg AS (
     FROM steps
     GROUP BY product_id, brand
     HAVING sum(good_step) >= 3
-       AND max(price_after) FILTER (WHERE good_step = 1)
-         > min(price_after) FILTER (WHERE good_step = 1)
 )
 SELECT
     a.product_id,
@@ -384,6 +382,7 @@ SELECT
     CAST(date_diff('day', a.first_step_at, a.last_step_at) AS INTEGER) AS span_days
 FROM agg a
 LEFT JOIN pg.public.products p ON p.id = a.product_id
+WHERE a.last_price < a.first_price
 ORDER BY total_descent_pct DESC
 """,
         "suppressed_sql": None,
