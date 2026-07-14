@@ -18,7 +18,7 @@ on:
       dry_run:
         description: "Pilot mode: run every archive pipeline (export, upload, verify) but skip all deletes and skip delisting flag changes."
         type: boolean
-        default: true
+        default: false
       stockout_days:
         description: "Archive stockout_events older than this many days, for THIS run only."
         type: string
