@@ -199,13 +199,16 @@ ORDER BY drop_pct DESC
     #
     # "Has the price actually fallen from where it started?"
     #
-    # Baseline is first_observed_price — the price the FIRST time Khabar ever
-    # saw this product. Never compare_at_price: that field is whatever the brand
-    # types in, and a product permanently listed at 499 "was 799" is not on sale,
-    # it is priced at 499. This signal is immune to that by construction.
+    # Baseline is first_observed_price — the price Khabar itself first witnessed.
+    # NEVER compare_at_price: that is whatever the brand types in, and a product
+    # permanently listed at 499 "was 799" is not on sale, it is priced at 499.
+    # This signal is immune to that by construction.
     #
-    # MIN_DROP_PCT is the only judgment call here. Below it, a move is noise or
-    # a rounding change, not a markdown decision.
+    # COLLAPSE RULE: first_observed_price is VARIANT-level; snapshots are
+    # PRODUCT-level. 96.5% of products carry one baseline across all variants;
+    # where they differ we take the MIN, which yields the SMALLEST possible
+    # drop_pct. A signal sold on the honesty of its baseline must never round in
+    # its own favour.
     # -------------------------------------------------------------------------
     {
         "id": "l1_01",
@@ -221,30 +224,43 @@ ORDER BY drop_pct DESC
 WITH latest_day AS (
     SELECT max(snapshot_date) AS d FROM snapshots
 ),
+baselines AS (
+    SELECT
+        pv.product_id,
+        MIN(CAST(pv.first_observed_price AS DOUBLE)) AS baseline_price
+    FROM pg.public.product_variants pv
+    JOIN pg.public.products p ON p.id = pv.product_id
+    WHERE p.is_active = TRUE
+      AND pv.delisted_at IS NULL
+      AND pv.first_observed_price IS NOT NULL
+      AND pv.first_observed_price > 0
+    GROUP BY pv.product_id
+),
 today AS (
     SELECT s.*
     FROM snapshots s, latest_day l
     WHERE s.snapshot_date = l.d
       AND s.price IS NOT NULL AND s.price > 0
-      AND s.first_observed_price IS NOT NULL AND s.first_observed_price > 0
 )
 SELECT
-    product_id,
-    brand,
-    product_name,
-    category_normalized,
-    gender,
-    snapshot_date,
-    ROUND(price, 2) AS current_price,
-    ROUND(first_observed_price, 2) AS baseline_price,
-    ROUND(100.0 * (first_observed_price - price)
-          / NULLIF(first_observed_price, 0), 2) AS drop_pct
-FROM today
-WHERE price < first_observed_price
-  AND (first_observed_price - price) / first_observed_price >= 0.10
+    t.product_id,
+    t.brand,
+    t.product_name,
+    t.category_normalized,
+    t.gender,
+    t.snapshot_date,
+    ROUND(t.price, 2)          AS current_price,
+    ROUND(b.baseline_price, 2) AS baseline_price,
+    ROUND(100.0 * (b.baseline_price - t.price)
+          / NULLIF(b.baseline_price, 0), 2) AS drop_pct
+FROM today t
+JOIN baselines b ON b.product_id = t.product_id
+WHERE t.price < b.baseline_price
+  AND (b.baseline_price - t.price) / b.baseline_price >= 0.10
 ORDER BY drop_pct DESC
 """,
         "suppressed_sql": None,
+    },
     },
     # -------------------------------------------------------------------------
     # DEFERRED — declared here so they are VISIBLE and switch themselves on the
