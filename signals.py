@@ -301,7 +301,90 @@ ORDER BY drop_pct DESC
 """,
         "suppressed_sql": None,
     },
-
+# -------------------------------------------------------------------------
+    # L1 · 03 — PRICE STAIRCASE
+    #
+    # "Is this product being walked down in steps, not one announced sale?"
+    #
+    # 3+ CONSECUTIVE down-moves, each price lower than the last, inside 21 days.
+    # A single up-move breaks the chain — the run must be strictly monotonic, so
+    # what we report is a genuine unbroken descent, not "3 drops that happened
+    # near each other". Reads price_events (every change), NOT snapshots (daily),
+    # because the sequence IS the signal and snapshots can't see intra-run steps.
+    #
+    # No step-size or net-depth floor: user chose "every drop lower than the
+    # last" as the whole definition. If tiny-step noise shows up in output, a
+    # per-step or total_descent floor is the tuning knob to add later.
+    # -------------------------------------------------------------------------
+    {
+        "id":       "l1_03",
+        "name":     "Price Staircase",
+        "level":    "L1",
+        "enabled":  True,
+        "requires": [],
+        "table":    "signal_l1_03_price_staircase",
+        "window_days": 21,
+        "min_days":    1,
+        "unique_on": ["product_id", "snapshot_date"],
+        "sql": """
+WITH ev AS (
+    SELECT
+        pe.product_id, pe.brand,
+        pe.price_before, pe.price_after, pe.direction, pe.recorded_at,
+        lag(pe.price_after) OVER (
+            PARTITION BY pe.product_id ORDER BY pe.recorded_at
+        ) AS prev_after
+    FROM pg.public.price_events pe
+    WHERE pe.recorded_at >= now() - INTERVAL '21 days'
+),
+-- Mark each event as a valid staircase step: a DOWN move that is strictly
+-- lower than the previous recorded price. Anything else (an up-move, a flat
+-- move, a down-move that isn't actually lower) scores 0 and breaks the run.
+steps AS (
+    SELECT
+        product_id, brand, price_after, recorded_at,
+        CASE
+            WHEN direction = 'down'
+             AND (prev_after IS NULL OR price_after < prev_after)
+            THEN 1 ELSE 0
+        END AS good_step
+    FROM ev
+),
+agg AS (
+    SELECT
+        product_id, brand,
+        sum(good_step)                                   AS step_count,
+        min(recorded_at) FILTER (WHERE good_step = 1)    AS first_step_at,
+        max(recorded_at) FILTER (WHERE good_step = 1)    AS last_step_at,
+        (array_agg(price_after ORDER BY recorded_at)
+            FILTER (WHERE good_step = 1))[1]             AS first_price,
+        (array_agg(price_after ORDER BY recorded_at DESC)
+            FILTER (WHERE good_step = 1))[1]             AS last_price
+    FROM steps
+    GROUP BY product_id, brand
+    HAVING sum(good_step) >= 3
+)
+SELECT
+    a.product_id,
+    a.brand,
+    p.name                 AS product_name,
+    p.category_normalized  AS category_normalized,
+    p.gender               AS gender,
+    CURRENT_DATE           AS snapshot_date,
+    a.step_count,
+    ROUND(a.first_price, 2) AS first_price,
+    ROUND(a.last_price, 2)  AS last_price,
+    ROUND(100.0 * (a.first_price - a.last_price)
+          / NULLIF(a.first_price, 0), 2) AS total_descent_pct,
+    a.first_step_at,
+    a.last_step_at,
+    CAST(date_diff('day', a.first_step_at, a.last_step_at) AS INTEGER) AS span_days
+FROM agg a
+LEFT JOIN pg.public.products p ON p.id = a.product_id
+ORDER BY total_descent_pct DESC
+""",
+        "suppressed_sql": None,
+    },
     # -------------------------------------------------------------------------
     # DEFERRED — declared here so they are VISIBLE and switch themselves on the
     # moment their blocker clears, rather than living in someone's memory.
