@@ -213,6 +213,28 @@ def upload_to_r2(buf, object_key):
     r2.upload_fileobj(buf, R2_BUCKET_NAME, object_key)
 
 
+def r2_object_exists(object_key):
+    """True if this day's Parquet file is already in the bucket."""
+    try:
+        r2.head_object(Bucket=R2_BUCKET_NAME, Key=object_key)
+        return True
+    except Exception:
+        return False
+
+
+def read_existing_rows(object_key):
+    """
+    Pull back the rows already stored in a day's file, as plain dicts.
+    Used to MERGE rather than overwrite: a day can legitimately be touched
+    by more than one archive run (a partial/failed run, a re-run, or the
+    first daily run after a backlog sweep). Overwriting would silently drop
+    whatever was already archived for that date — merging cannot.
+    """
+    response = r2.get_object(Bucket=R2_BUCKET_NAME, Key=object_key)
+    table = pq.read_table(io.BytesIO(response["Body"].read()))
+    return table.to_pylist()
+
+
 def verify_upload(object_key, expected_row_count):
     """
     Step 5 — THE GATE. Download the file back from R2 (not just trust the
@@ -279,52 +301,107 @@ if __name__ == "__main__":
     print("  Flattening rows (joining in brand, category, gender, size, color)...")
     flattened = flatten_rows(rows, products_map, variants_map)
 
-    print("  Writing Parquet file...")
-    parquet_buf = write_parquet(flattened)
-    parquet_size_kb = len(parquet_buf.getvalue()) / 1024
-    print(f"  Parquet file: {parquet_size_kb:.1f} KB for {len(flattened)} rows.")
-
-    # One object per archive run, dated by the cutoff so files never collide
-    # and can be located later by the period they cover. Dry-run pilots are
-    # written under a separate prefix so they're trivially distinguishable
-    # from real archive files in the bucket — never mixed, easy to bulk-
-    # delete later once the pilot has served its purpose.
+    # ------------------------------------------------------------------
+    # v2: ONE PARQUET FILE PER CALENDAR DAY — price_snapshots/YYYY-MM-DD.parquet
+    #
+    # Previously this wrote a single batch file per run, named by the range
+    # it happened to cover. That made the bucket's layout a function of WHEN
+    # the job ran rather than WHAT the data is, so a missed Monday produced a
+    # 13-day file while a normal week produced a 7-day one — and any query for
+    # "the last 30 days" had to open and scan every file ever written to find
+    # out which ones were relevant.
+    #
+    # Day-partitioning makes the filename the index: DuckDB can skip whole
+    # files by name (price_snapshots/2026-07-*.parquet) instead of reading
+    # them, which is what keeps the L1/L2 queries fast as the lake grows.
+    #
+    # MERGE, NEVER OVERWRITE: a given day can legitimately be touched by more
+    # than one run (a partial failure, a re-run, or the first daily run after
+    # a backlog sweep). If a file already exists for that date, its rows are
+    # read back and merged, de-duplicated on snapshot_id. Blindly overwriting
+    # would silently destroy already-archived rows — the one thing this
+    # pipeline must never do.
+    #
+    # The verify-before-delete gate is now PER DAY: rows are only deleted from
+    # Supabase for days whose file was successfully uploaded AND read back with
+    # a matching row count. A failure on one day leaves that day's rows fully
+    # intact in Supabase for the next run, without blocking the days that did
+    # succeed.
+    # ------------------------------------------------------------------
     prefix = "_pilot_dry_run" if DRY_RUN else "price_snapshots"
-    min_date = min(r['snapshot_date'] for r in rows)
-    max_date = max(r['snapshot_date'] for r in rows)
-    object_key = f"{prefix}/{min_date}_to_{max_date}.parquet" 
-    print(f"  Uploading to R2 as: {object_key}")
-    try:
-        upload_to_r2(parquet_buf, object_key)
-    except Exception as e:
-        print(f"  ❌ Upload to R2 failed: {e}. Nothing will be deleted. Exiting.")
-        sys.exit(1)
 
-    gate_passed = verify_upload(object_key, expected_row_count=len(rows))
-    if not gate_passed:
-        print("  🛑 Stopping here. Rows remain in Supabase, untouched. "
-              "Will retry on the next scheduled run.")
+    by_day = {}
+    for row in flattened:
+        by_day.setdefault(row["snapshot_date"], []).append(row)
+
+    print(f"  Grouped into {len(by_day)} calendar day(s): "
+          f"{min(by_day)} → {max(by_day)}")
+
+    verified_ids = []      # snapshot_ids safe to delete (their day passed the gate)
+    failed_days = []
+
+    for day in sorted(by_day):
+        day_rows = by_day[day]
+        object_key = f"{prefix}/{day}.parquet"
+
+        # --- merge with anything already archived for this date ---
+        rows_to_write = day_rows
+        if r2_object_exists(object_key):
+            try:
+                existing = read_existing_rows(object_key)
+                merged = {r["snapshot_id"]: r for r in existing}
+                merged.update({r["snapshot_id"]: r for r in day_rows})
+                rows_to_write = list(merged.values())
+                print(f"  [{day}] file exists with {len(existing)} row(s) — "
+                      f"merging to {len(rows_to_write)} total.")
+            except Exception as e:
+                print(f"  ❌ [{day}] could not read existing file to merge: {e}. "
+                      f"Skipping this day — its rows stay in Supabase.")
+                failed_days.append(day)
+                continue
+
+        try:
+            buf = write_parquet(rows_to_write)
+            size_kb = len(buf.getvalue()) / 1024
+            upload_to_r2(buf, object_key)
+        except Exception as e:
+            print(f"  ❌ [{day}] upload failed: {e}. Rows stay in Supabase.")
+            failed_days.append(day)
+            continue
+
+        if not verify_upload(object_key, expected_row_count=len(rows_to_write)):
+            print(f"  🛑 [{day}] verification failed. Rows stay in Supabase.")
+            failed_days.append(day)
+            continue
+
+        print(f"  ✅ [{day}] {object_key} — {len(rows_to_write)} rows, {size_kb:.1f} KB.")
+        verified_ids.extend(r["snapshot_id"] for r in day_rows)
+
+    if not verified_ids:
+        print("  🛑 No day passed the verify gate. Nothing deleted. Exiting.")
         sys.exit(1)
 
     if DRY_RUN:
-        print(f"  🧪 DRY RUN — would have deleted {len(rows)} rows from "
-              f"Supabase price_snapshots (verified present in R2 first). "
-              f"Skipping the actual delete. Nothing in Supabase was touched.")
+        print(f"  🧪 DRY RUN — would have deleted {len(verified_ids)} rows across "
+              f"{len(by_day) - len(failed_days)} verified day(s). Nothing touched.")
         deleted_count = 0
     else:
-        snapshot_ids = [r["id"] for r in rows]
-        deleted_count = delete_archived_rows(snapshot_ids)
+        deleted_count = delete_archived_rows(verified_ids)
         print(f"  🗑️  Deleted {deleted_count} rows from Supabase price_snapshots "
-              f"(verified present in R2 first).")
+              f"(each verified present in R2 first).")
+
+    if failed_days:
+        print(f"  ⚠️  {len(failed_days)} day(s) failed and were NOT deleted: "
+              f"{', '.join(failed_days)}. They remain intact in Supabase and "
+              f"will be retried on the next run.")
 
     if DRY_RUN:
-        print(f"\n🏁 Pilot run complete. {len(rows)} rows successfully round-tripped "
-              f"through export → R2 upload → verified readback. "
-              f"0 rows deleted (dry run). Pilot file is in R2 under _pilot_dry_run/ "
-              f"— safe to delete from the bucket once you've confirmed this worked.")
+        print(f"\n🏁 Pilot run complete. {len(verified_ids)} rows round-tripped "
+              f"through export → per-day R2 upload → verified readback. "
+              f"0 rows deleted (dry run).")
     else:
-        print(f"\n🏁 Archive run complete. {len(rows)} rows moved to R2, "
-              f"{deleted_count} removed from the hot tier.")
+        print(f"\n🏁 Archive run complete. {deleted_count} rows moved to R2 across "
+              f"{len(by_day) - len(failed_days)} day-file(s), removed from the hot tier.")
 
     # Explicit, immediate, successful exit — BEFORE Python's normal interpreter
     # shutdown runs. Seen live in a pilot run: pyarrow/Arrow's C++ layer can
