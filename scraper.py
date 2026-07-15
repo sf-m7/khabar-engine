@@ -640,8 +640,8 @@ BRANDS = [
     {"name": "dalydress",  "domain": "dalydress.com",            "engine": "shopify"},
     {"name": "arafa",      "domain": "arafastores.com",          "engine": "shopify"},
     {"name": "eagle",      "domain": "eagle.com.eg",             "engine": "shopify"},
-  #  {"name": "tie_house",  "domain": "tie-house.com/",           "engine": "shopify"},
-  # {"name": "premoda",    "domain": "www.premoda.net/",         "engine": "shopify"},
+    {"name": "tie_house",  "domain": "tie-house.com/",           "engine": "shopify"},
+    {"name": "premoda",    "domain": "www.premoda.net/",         "engine": "shopify"},
     {"name": "just_sbr",   "domain": "www.justsbr.com",          "engine": "shopify"},
     {"name": "activ",      "domain": "activ.eg",                 "engine": "shopify"},
     {"name": "mlameh",     "domain": "mlameh.com",               "engine": "shopify"},
@@ -681,8 +681,8 @@ BRAND_DISPLAY = {
     "defacto":    "DeFacto",
     "arafa":      "Arafa Stores",
     "eagle":      "Eagle",
-  # "tie_house":  "Tie House",
-  # "premoda":    "Premoda",  
+    "tie_house":  "Tie House",
+    "premoda":    "Premoda",  
 }
 
 # v14.22 FIX 2: brands whose ENTIRE catalog is a single gender regardless of
