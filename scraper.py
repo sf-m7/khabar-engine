@@ -1263,7 +1263,7 @@ TITLE_COLOR_WORDS = {
     "navy", "indigo", "purple", "plum", "lilac", "multicolor", "cream",
     "gold", "silver", "copper", "camel", "tan", "taupe", "mauve",
     "lavender", "apricot", "maroon", "mint", "chocolate", "honey",
-    "lemon",
+    "lemon", "rose",
 }
 # NOTE: "denim", "raw denim", and "ice" are intentionally EXCLUDED from this
 # vocabulary. Testing showed these are finish/material names in Cizaro's
@@ -1392,14 +1392,69 @@ def extract_color_activ(name):
     return tail
 
 
+def extract_color_tie_house(name):
+    """
+    Tie House's title pattern (confirmed via 80-title live sample, 15 Jul
+    2026): no dash separator exists anywhere in the catalog — colour is
+    virtually always the trailing 1-2 word(s) of the title, after fit/
+    fabric/style descriptors, e.g.:
+        "Regular Fit Chino Dark Blue"          -> "dark blue"
+        "Casual Belt Black"                    -> "black"
+        "Regular Fit Melton Short Off White"   -> "off white"
+        "Perfume"                              -> None (no colour word)
+        "Tie House Gift Card -1000 EGP"        -> None (no colour word)
+
+    PASS 1: does the (lowercased) title END with a known colour phrase?
+    Longest phrase wins (checked via TITLE_COLOR_WORDS_SORTED, already
+    length-sorted). This mirrors Tree's trailing-segment logic but anchors
+    on end-of-string instead of a dash, since Tie House has none. A
+    boundary check (preceding char must be a space, or match is the whole
+    title) stops partial-word false matches like "...ecream" matching
+    "cream".
+
+    PASS 2 (fallback, same technique as extract_color_cizaro): only reached
+    when Pass 1 finds nothing — e.g. "White Sneakers with Subtle Black
+    Details" ends in "Details", not a colour — so scan the whole title for
+    the longest matching colour phrase anywhere. Same metal-finish guard as
+    Cizaro applies (a gold/silver/copper match next to "buckle" is hardware
+    finish, not garment colour).
+
+    Returns a lowercase colour phrase, or None.
+    """
+    lower = name.strip().lower()
+
+    for phrase in TITLE_COLOR_WORDS_SORTED:
+        if lower.endswith(phrase):
+            start = len(lower) - len(phrase)
+            if start == 0 or lower[start - 1] in (" ", "-"):
+                return phrase
+
+    found = None
+    for phrase in TITLE_COLOR_WORDS_SORTED:
+        if re.search(r'(?<![a-z])' + re.escape(phrase) + r'(?![a-z])', lower):
+            found = phrase
+            break
+
+    if found in METAL_FINISHES and "buckle" in lower:
+        for phrase in TITLE_COLOR_WORDS_SORTED:
+            if phrase in METAL_FINISHES:
+                continue
+            if re.search(r'(?<![a-z])' + re.escape(phrase) + r'(?![a-z])', lower):
+                return phrase
+        return None
+
+    return found
+
+
 # Brand -> extraction function. Membership here is the ONLY thing that
 # routes a brand's products through title-based colour extraction, so
 # enabling another brand later is a one-line addition and no brand outside
 # this dict is ever touched.
 COLOR_FROM_TITLE_BRANDS = {
-    "tree":   extract_color_tree,
-    "cizaro": extract_color_cizaro,
-    "activ":  extract_color_activ,
+    "tree":       extract_color_tree,
+    "cizaro":     extract_color_cizaro,
+    "activ":      extract_color_activ,
+    "tie_house":  extract_color_tie_house,
 }
 
 
