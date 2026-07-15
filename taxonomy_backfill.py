@@ -324,6 +324,27 @@ def pass_colors():
     print("== PASS colors: classifying unclassified color names ==")
     conn = db()
     cur = conn.cursor()
+
+    # v14.22 fix: previously, a brand's raw colour strings only entered
+    # color_map if someone manually inserted them — there was no automatic
+    # path from "new colour appears in product_variants" to "queued for
+    # classification". This silently stranded every new brand's colours
+    # (found live: premoda and tie_house both had classified matches
+    # sitting unused in color_map, plus colour names color_map had never
+    # even seen). This step closes that gap for good: any raw colour
+    # currently on a variant that color_map doesn't know about yet gets
+    # queued as 'unclassified'. Idempotent — ON CONFLICT DO NOTHING means
+    # re-running this is always safe and touches only genuinely new names.
+    cur.execute(
+        """INSERT INTO color_map (color_raw, status, source, created_at, updated_at)
+           SELECT DISTINCT LOWER(TRIM(pv.color)), 'unclassified', 'auto_seed', now(), now()
+           FROM product_variants pv
+           WHERE pv.color IS NOT NULL AND TRIM(pv.color) <> ''
+           ON CONFLICT (color_raw) DO NOTHING"""
+    )
+    print(f"  newly seeded into color_map: {cur.rowcount}")
+    conn.commit()
+
     cur.execute(
         "SELECT color_raw FROM color_map WHERE status = 'unclassified' "
         "ORDER BY color_raw"
