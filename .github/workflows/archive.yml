@@ -24,7 +24,7 @@ on:
       threshold_override_days:
         description: "Archive rows older than this many days, for THIS manual run only. Leave at 21 for a realistic test; lower it (e.g. 5) to pilot against young real data."
         type: string
-        default: "8"
+        default: "7"
 
 jobs:
   archive:
