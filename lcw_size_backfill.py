@@ -45,6 +45,8 @@ from scraper import (
     normalize_lcw_color,
     safe_db_execute,
     DATAIMPULSE_CONFIGURED,
+    LCW_PROXY_COUNTRIES,
+    LCW_FORCE_HTTP1,
 )
 
 # scraper.py doesn't expose a module-level `supabase` client (every function
@@ -90,7 +92,14 @@ def run_backfill():
               "LCW's Akamai-protected pages. Aborting.")
         return
 
-    session = get_lcw_session()
+    # v14.41: get_lcw_session() returns (session, country) as of v14.40.
+    # Unpacking is REQUIRED — assigning the tuple to `session` silently
+    # breaks every fetch_lcw_product_page() call, which looks identical to
+    # a total proxy failure and would waste a whole 45-minute run.
+    session, lcw_country = get_lcw_session()
+    print(f"  [Backfill] Proxy pool: {','.join(LCW_PROXY_COUNTRIES)} "
+          f"(this session: {lcw_country}), "
+          f"HTTP/1.1 forced: {LCW_FORCE_HTTP1}")
 
     print("  [Backfill] Pulling all LCW variants still missing size data...")
     all_missing = fetch_missing_size_variants()
@@ -143,7 +152,10 @@ def run_backfill():
             # One retry on a fresh session — cheap insurance against a
             # single bad residential peer, same idea as the main scraper's
             # rotation logic, without needing a shared run-wide budget here.
-            session = get_lcw_session()
+            # Rotate AWAY from the country that just failed, matching the
+            # main scraper's v14.40 behaviour: if a whole pool is having a
+            # bad hour, retrying inside it is the least useful move.
+            session, lcw_country = get_lcw_session(avoid_country=lcw_country)
             time.sleep(random.uniform(1, 2))
             page_data = fetch_lcw_product_page(session, url)
 
