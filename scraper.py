@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v14  (current: v14.30)
+# KHABAR — Scraper v14  (current: v14.39)
 # Built on v13. Changes:
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
@@ -612,6 +612,61 @@ DATAIMPULSE_HOST      = env_str("DATAIMPULSE_HOST", "gw.dataimpulse.com")
 DATAIMPULSE_PORT      = 823
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
+# ── v14.39: exit-country is now per-engine, not global ───────────────────────
+#
+# WHY THIS EXISTS
+# LCW's daily run kept failing or half-failing. Root cause was never the code
+# and never really DataImpulse: it was the size of Egypt's residential IP pool.
+# Egypt has a few thousand usable residential peers across any provider, so
+# rotation kept handing us degraded home connections — bare timeouts, HTTP/2
+# handshake errors, sometimes DNS failing through the proxy itself.
+#
+# Tested Jul 18 2026 (lcw_geo_test_v4.py), Egypt vs Turkey against category 9:
+#   ItemCount   5472 == 5472
+#   PageCount     55 == 55
+#   prices      identical on all 12 sampled products, CurrencyCode "EGP"
+#   prime time  Turkey 0.9s vs Egypt 2.0s
+# lcwaikiki.eg resolves its storefront region from the DOMAIN, not the exit IP
+# (the API echoes Region:8 / Country:country_8 for both). Germany and the UK,
+# by contrast, are hard-blocked at the edge with a 403, so this is not "any
+# country works" — Turkey specifically is treated as domestic by LCW, which
+# makes sense for a Turkish company. Turkey's pool is orders of magnitude
+# larger and cleaner than Egypt's. Same $1/GB, no cost change.
+#
+# WHAT MUST NOT CHANGE
+# This applies to LC WAIKIKI ONLY. Every Shopify and WooCommerce brand stays
+# on "eg" permanently. Shopify Markets resolves currency and price list from
+# the visitor's IP, so a non-Egyptian exit could silently return a different
+# currency or regional price list. That would be written into
+# first_observed_price — the immutable honest-discount baseline — with no
+# error and no visible breakage, and would only surface weeks later as
+# nonsense discount-depth signals. Losing access is loud; wrong currency is
+# silent. That asymmetry is why the guard below refuses to start rather than
+# warns.
+LCW_PROXY_COUNTRY      = env_str("LCW_PROXY_COUNTRY", "tr")
+SHOPIFY_PROXY_COUNTRY  = "eg"   # hardcoded on purpose — not env-overridable
+
+def _assert_proxy_country_separation():
+    """
+    Fail fast at import time if the LCW/Shopify exit-country separation has
+    been broken by a config edit. Cheap to run, and the failure it prevents
+    (silent currency contamination of first_observed_price) is unrecoverable
+    without re-scraping history that no longer exists.
+    """
+    if SHOPIFY_PROXY_COUNTRY != "eg":
+        raise RuntimeError(
+            "FATAL: SHOPIFY_PROXY_COUNTRY must be 'eg'. Shopify Markets prices "
+            "by exit IP; any other country risks writing non-EGP prices into "
+            "first_observed_price."
+        )
+    lcw_brands = {b["name"] for b in BRANDS if b["engine"] == "lcw_proxy"}
+    overlap = lcw_brands & DATAIMPULSE_PROXY_BRANDS
+    if overlap:
+        raise RuntimeError(
+            f"FATAL: {sorted(overlap)} appear in both the lcw_proxy engine and "
+            f"DATAIMPULSE_PROXY_BRANDS. A brand cannot use both exit countries."
+        )
+
 
 def env_int(name, default):
     """
@@ -667,6 +722,10 @@ BRANDS = [
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
+
+# Runs at import. Defined above with BRANDS/DATAIMPULSE_PROXY_BRANDS, called
+# here because it reads both.
+_assert_proxy_country_separation()
 
 BRAND_DISPLAY = {
     "town_team":  "Town Team",
@@ -851,7 +910,11 @@ def get_dataimpulse_session():
     """
     if not DATAIMPULSE_CONFIGURED:
         return None
-    proxy_user = f"{DATAIMPULSE_USER}__cr.eg"
+    # v14.39: pinned to SHOPIFY_PROXY_COUNTRY ("eg"). Do NOT parameterise this
+    # — see the exit-country note above DATAIMPULSE_PROXY_BRANDS. Shopify
+    # Markets prices by IP; a non-Egyptian exit corrupts first_observed_price
+    # silently.
+    proxy_user = f"{DATAIMPULSE_USER}__cr.{SHOPIFY_PROXY_COUNTRY}"
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
     print(f"  [DataImpulse] Egyptian residential proxy session selected.")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
@@ -889,9 +952,13 @@ def get_lcw_session():
     if not DATAIMPULSE_CONFIGURED:
         return requests.Session(impersonate="chrome124")
     sticky_port = random.randint(10000, 20000)
-    proxy_user = f"{DATAIMPULSE_USER}__cr.eg"
+    # v14.39: LCW_PROXY_COUNTRY defaults to "tr" — see the exit-country note
+    # above DATAIMPULSE_PROXY_BRANDS for the test evidence. Set the
+    # LCW_PROXY_COUNTRY repo variable to "eg" to revert instantly without a
+    # code change if LCW ever starts geo-gating.
+    proxy_user = f"{DATAIMPULSE_USER}__cr.{LCW_PROXY_COUNTRY}"
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{sticky_port}"
-    print(f"  [LCW] Egyptian proxy session selected: port.{sticky_port}")
+    print(f"  [LCW] Proxy session selected: country={LCW_PROXY_COUNTRY} port.{sticky_port}")
     return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
@@ -2473,7 +2540,16 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers,
         # 4x slowdown after moving off Webshare. A live IP answers this
         # endpoint in 1-3s, so 12s/2-attempt is generous for a good peer and
         # cheap to burn through for a bad one.
-        res = execute_with_retry(session.post, url, json=body, timeout=12, headers=headers,
+        # v14.39: default deliberately UNCHANGED at 12s. The short timeout was
+        # a correct response to Egypt's thin pool (burn bad peers fast rather
+        # than wait 3 minutes on a dead one). Turkey's pool is much healthier,
+        # so a longer timeout may now be affordable and could recover slow-but-
+        # alive peers we currently discard — but that is a second variable, and
+        # changing it in the same deploy as the country switch would make any
+        # regression impossible to attribute. Exposed as a repo variable so it
+        # can be tuned later without a code edit.
+        res = execute_with_retry(session.post, url, json=body,
+                                  timeout=env_int("LCW_PAGE_TIMEOUT", 12), headers=headers,
                                   max_retries=2, backoff=2, max_delay=15)
         if res.status_code not in [200, 404]:
             print(f"  ⚠️ LCW API unexpected HTTP {res.status_code} (cat={category_id}, page={page_index})")
