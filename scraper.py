@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v14  (current: v14.39)
+# KHABAR — Scraper v14  (current: v14.41)
 # Built on v13. Changes:
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
@@ -646,6 +646,65 @@ DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 LCW_PROXY_COUNTRY      = env_str("LCW_PROXY_COUNTRY", "tr")
 SHOPIFY_PROXY_COUNTRY  = "eg"   # hardcoded on purpose — not env-overridable
 
+# ── v14.41: force HTTP/1.1 on LCW proxy sessions ─────────────────────────────
+#
+# The Jul 18 Turkey run failed ~50% of pages with two errors, repeatedly:
+#   curl (16) "Remote peer returned unexpected data while we expected SETTINGS
+#             frame. Perhaps, peer does not support HTTP/2 properly."
+#   curl (28) bare timeout, zero bytes ever received
+#
+# A SETTINGS frame is the opening handshake of an HTTP/2 connection. Failing
+# there means the connection broke before any HTTP request was even sent — so
+# this is the proxy gateway, not LC Waikiki. Two facts confirm it: the prime
+# request (a plain page load through the same proxy) succeeded every single
+# time at 1705 KB, and the identical requests through the identical Turkish
+# DataImpulse pool ran flawlessly from a residential connection in Egypt
+# (lcw_geo_test_v4, 0.8s). The only variable that changed is the origin —
+# GitHub Actions' Azure range — which points at gw.dataimpulse.com degrading
+# or de-prioritising datacenter-origin HTTP/2 connections.
+#
+# Forcing HTTP/1.1 sidesteps the h2 handshake entirely.
+#
+# TRADEOFF, stated honestly: impersonate="chrome124" implies HTTP/2 as part of
+# the TLS/ALPN fingerprint, so pinning to 1.1 makes the fingerprint marginally
+# less convincing to Akamai. Assessed as low risk because prime requests never
+# fail — Akamai is not the thing rejecting us. If 403s ever appear, set
+# LCW_FORCE_HTTP1=0 to revert without a code change.
+LCW_FORCE_HTTP1 = env_str("LCW_FORCE_HTTP1", "1").strip().lower() not in ("0", "false", "no", "off")
+
+def _lcw_session_kwargs():
+    """HTTP-version kwargs for curl_cffi, if pinning is enabled and supported."""
+    if not LCW_FORCE_HTTP1:
+        return {}
+    try:
+        from curl_cffi.const import CurlHttpVersion
+        return {"http_version": CurlHttpVersion.V1_1}
+    except Exception as e:
+        # Older curl_cffi without CurlHttpVersion — degrade to default (h2)
+        # rather than crashing the run.
+        print(f"  [LCW] HTTP/1.1 pinning unavailable ({e}); using default.")
+        return {}
+
+# v14.40: LCW_PROXY_COUNTRY accepts a comma-separated LIST ("tr,sa,ae").
+# Each new sticky session picks one at random, so the crawl draws from the
+# combined residential pool of every listed country instead of one. A bad
+# hour in any single pool no longer stalls the run — rotation lands in a
+# different country's pool rather than another peer in the same bad one.
+# Only add a country here after it passes lcw_geo_test_v5.py: identical
+# ItemCount, identical prices, and identical Region/Country/currency echoed
+# back by the API. A country serving a different storefront would silently
+# poison prices, same failure class as the Shopify currency risk above.
+def _parse_country_list(raw):
+    out, seen = [], set()
+    for part in str(raw).split(","):
+        code = part.strip().lower()
+        if code and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out or ["eg"]
+
+LCW_PROXY_COUNTRIES = _parse_country_list(LCW_PROXY_COUNTRY)
+
 def _assert_proxy_country_separation():
     """
     Fail fast at import time if the LCW/Shopify exit-country separation has
@@ -935,7 +994,7 @@ def get_shopify_session(brand_name):
               f"falling back to a direct connection (will likely still 429).")
     return get_resilient_session()
 
-def get_lcw_session():
+def get_lcw_session(avoid_country=None):
     """
     v14.34: switched from username-parameter stickiness (__cr.eg;sessid.N on
     the shared gateway port 823) to DataImpulse's primary documented sticky
@@ -946,20 +1005,26 @@ def get_lcw_session():
     own tunnel breaking (not Akamai) — a symptom of that shared gateway
     port, not of the target site. Port-based stickiness is their
     first-class mechanism and should be more stable.
-    Country targeting (__cr.eg) still goes in the username; the port itself
-    now provides the IP stickiness, so no ;sessid.N suffix is needed.
+
+    v14.40: country is drawn per-session from LCW_PROXY_COUNTRIES. When
+    rotating after a failure, the caller passes the country that just failed
+    as `avoid_country` so the replacement session prefers a DIFFERENT
+    country's pool — if a whole pool is having a bad hour, retrying inside it
+    is the least useful thing we can do. Falls back to the full list when
+    only one country is configured.
     """
     if not DATAIMPULSE_CONFIGURED:
-        return requests.Session(impersonate="chrome124")
+        return requests.Session(impersonate="chrome124"), None
+    choices = [c for c in LCW_PROXY_COUNTRIES if c != avoid_country] or LCW_PROXY_COUNTRIES
+    country = random.choice(choices)
     sticky_port = random.randint(10000, 20000)
-    # v14.39: LCW_PROXY_COUNTRY defaults to "tr" — see the exit-country note
-    # above DATAIMPULSE_PROXY_BRANDS for the test evidence. Set the
-    # LCW_PROXY_COUNTRY repo variable to "eg" to revert instantly without a
-    # code change if LCW ever starts geo-gating.
-    proxy_user = f"{DATAIMPULSE_USER}__cr.{LCW_PROXY_COUNTRY}"
+    proxy_user = f"{DATAIMPULSE_USER}__cr.{country}"
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{sticky_port}"
-    print(f"  [LCW] Proxy session selected: country={LCW_PROXY_COUNTRY} port.{sticky_port}")
-    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    print(f"  [LCW] Proxy session selected: country={country} port.{sticky_port}")
+    session = requests.Session(impersonate="chrome124",
+                               proxies={"https": proxy_url, "http": proxy_url},
+                               **_lcw_session_kwargs())
+    return session, country
 
 def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
     """
@@ -2564,7 +2629,8 @@ def lcw_fetch_page(session, domain, category_id, page_index, headers,
         return None
 
 def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
-                              seen_ids=None, category_params=None, rotation_budget=None):
+                              seen_ids=None, category_params=None, rotation_budget=None,
+                              current_country=None):
     """
     v14.32: LCW's crawl is necessarily sticky — scrape_lcw primes one
     requests.Session (loads the category page first to pick up a cookie/WAF
@@ -2614,18 +2680,138 @@ def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
               f"fresh DataImpulse session.")
         if rotation_budget is not None:
             rotation_budget[0] -= 1
-        session = get_lcw_session()
+        session, current_country = get_lcw_session(avoid_country=current_country)
         time.sleep(random.uniform(1, 2))
         data = lcw_fetch_page(session, domain, category_id, page_index, headers,
                               seen_ids=seen_ids, category_params=category_params)
         attempts += 1
-    return data, session
+    return data, session, current_country
+
+# ── v14.41: LCW category-level checkpointing ─────────────────────────────────
+#
+# PROBLEM THIS SOLVES
+# A single daily run that partially fails loses everything it didn't fetch,
+# and the next attempt is 24 hours away — so a bad proxy hour costs a whole
+# day of LCW data. The Jul 18 run banked 1,246 of ~5,500 men's products and
+# discarded the rest.
+#
+# WHY CATEGORY LEVEL AND NOT PAGE LEVEL
+# v14.9 exists because LCW paginates by OptionId (colour), so one model's
+# colours are spread across pages. Price detection therefore runs ONCE at the
+# end, over the full colour set. If we resumed mid-category, a model with
+# colours on page 14 and page 15 would be detected twice on half its colours
+# each time — manufacturing exactly the phantom up/down round-trips v14.9 was
+# written to eliminate. Checkpointing whole categories keeps that invariant:
+# a category's colour set is always assembled in a single pass or not at all.
+#
+# COST: a category that dies on page 50 of 55 is refetched from page 1.
+# Accepted deliberately — correctness of price history outweighs bandwidth.
+def load_lcw_progress(supabase, today):
+    """Category IDs already fully scraped today. Empty set on any error."""
+    try:
+        res = safe_db_execute(
+            supabase.table("lcw_scrape_progress")
+            .select("category_id")
+            .eq("scrape_date", today.isoformat())
+            .eq("status", "complete")
+        )
+        return {r["category_id"] for r in (res.data or [])} if res else set()
+    except Exception as e:
+        print(f"  [LCW] Could not read checkpoint table ({e}). Treating as fresh.")
+        return set()
+
+
+def mark_lcw_progress(supabase, today, cat_id, cat_name, status,
+                      pages_done=0, pages_total=0, pages_failed=0):
+    """
+    Record a category's outcome. Never raises — a checkpoint write failure
+    must not kill a run that otherwise succeeded. Worst case we redo work.
+    """
+    try:
+        safe_db_execute(
+            supabase.table("lcw_scrape_progress").upsert({
+                "scrape_date":  today.isoformat(),
+                "category_id":  cat_id,
+                "category_name": cat_name,
+                "status":       status,
+                "pages_done":   pages_done,
+                "pages_total":  pages_total,
+                "pages_failed": pages_failed,
+                "updated_at":   datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="scrape_date,category_id")
+        )
+    except Exception as e:
+        print(f"  [LCW] Checkpoint write failed for cat={cat_id} ({e}). Continuing.")
+
 
 def _parse_lcw_price(v):
     if not v: return 0.0
     if isinstance(v, (int, float)): return float(v)
     s = "".join(c for c in str(v) if c.isdigit() or c == ".")
     return float(s) if s else 0.0
+
+# ── v14.41: detection tail extracted so early exits still commit ────────────
+# Previously the circuit breaker did `return products_seen, price_changes`,
+# which skipped snapshot-writing and price detection entirely — so a run that
+# completed 3 of 4 categories before aborting wrote NO price data at all.
+# With checkpointing, completed categories are real work worth keeping, so
+# every exit path now funnels through here.
+def _lcw_finalise(supabase, session, brand_name, domain, today,
+                  lcw_model_records, lcw_model_info, prev_prices,
+                  existing_snapshot_ids, products_seen, price_changes):
+    if not lcw_model_records:
+        print("  [LCW] No complete categories this run — nothing to detect.")
+        return products_seen, price_changes
+    print(f"  [LCW] Detection pass over {len(lcw_model_records)} models "
+          f"from fully-completed categories.")
+    # ── Single detection pass over the FULL colour set per model (v14.9) ──────
+    # Now that every page/category has been crawled, lcw_model_records holds all
+    # colours of each model. We snapshot once and detect once per model using a
+    # stable median, so partial-page views can no longer manufacture phantom
+    # up/down round-trips.
+    snap_rows = build_snapshot_rows(brand_name, lcw_model_records, today, existing_snapshot_ids)
+    if snap_rows:
+        for i in range(0, len(snap_rows), 100):
+            safe_db_execute(supabase.table("price_snapshots").insert(snap_rows[i:i+100]))
+
+    for db_pid, records in lcw_model_records.items():
+        if not records:
+            continue
+        curr_price = product_repr_price(records)
+        v_base     = product_repr_baseline(records)
+        if curr_price is None:
+            continue
+        last_p = prev_prices.get(db_pid)
+        if last_p is None:
+            prev_prices[db_pid] = curr_price
+            continue
+        if abs(last_p - curr_price) <= 0.01:
+            continue
+        direction = "down" if curr_price < last_p else "up"
+        price_changes += 1
+        sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+        if direction == "down" and v_base and curr_price < v_base:
+            info = lcw_model_info.get(db_pid) or {}
+            for sz in set(sizes_in_stock):
+                find_and_alert_users(
+                    supabase, session, brand_name, info.get("category", "uncategorized"),
+                    sz, curr_price, info.get("desc", "LCW Item"),
+                    info.get("url", f"https://{domain}"), v_base
+                )
+        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+        safe_db_execute(supabase.table("price_events").insert({
+            "product_id":       db_pid, "brand": brand_name,
+            "price_before":     last_p, "price_after": curr_price,
+            "compare_at_price": records[0].get("_meta_compare"),
+            "discount_pct":     honest_disc,
+            "direction":        direction,
+            "sizes_in_stock":   sizes_in_stock,
+            "recorded_at":      datetime.now(timezone.utc).isoformat(),
+        }))
+        prev_prices[db_pid] = curr_price
+        sync_snapshot_price(supabase, db_pid, today, curr_price)
+    return products_seen, price_changes
+
 
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
@@ -2703,6 +2889,14 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # struggling page. Tune via LCW_ROTATION_BUDGET if needed.
     rotation_budget = [env_int("LCW_ROTATION_BUDGET", 8)]
 
+    # v14.40: which country pool the current session is drawn from, so a
+    # rotation can prefer a DIFFERENT pool. Set by scrape_brand when the
+    # session was built; None just means "no preference on first rotation".
+    lcw_country = getattr(session, "_khabar_country", None)
+    if len(LCW_PROXY_COUNTRIES) > 1:
+        print(f"  [LCW] Country pool: {','.join(LCW_PROXY_COUNTRIES)} "
+              f"(starting in {lcw_country or 'unknown'})")
+
     # v14.38: circuit breaker for a pool-wide-bad-hour, not just one bad
     # peer. Diagnosed from the Jul 13 run: 9 different DataImpulse
     # residential IPs ALL failed identically (bare timeouts, HTTP/2
@@ -2716,23 +2910,50 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     consecutive_failures  = [0]
     CIRCUIT_BREAKER_LIMIT = env_int("LCW_CIRCUIT_BREAKER", 6)
 
+    # v14.41: skip categories already completed today by an earlier run.
+    LCW_CHECKPOINT = env_str("LCW_CHECKPOINT", "1").strip().lower() not in ("0", "false", "no", "off")
+    done_categories = load_lcw_progress(supabase, today) if LCW_CHECKPOINT else set()
+    if done_categories:
+        print(f"  [LCW] Checkpoint: {len(done_categories)}/{len(LCW_CATEGORIES)} "
+              f"categories already complete today — resuming with the rest.")
+    if LCW_CHECKPOINT and len(done_categories) >= len(LCW_CATEGORIES):
+        print("  [LCW] All categories already scraped today. Nothing to do.")
+        return products_seen, price_changes
+
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
         cat_params = cat.get("params", [])
+        if cat_id in done_categories:
+            print(f"  [{cat_name}] Already complete today — skipping.")
+            continue
+
+        # v14.41: buffer this category's records. They are merged into the
+        # run-wide set ONLY if every page succeeded, so a partial category
+        # never reaches price detection with an incomplete colour set.
+        cat_model_records, cat_model_info = {}, {}
+        cat_pages_done = cat_pages_failed = 0
+        cat_failed_pages = []
+
         print(f"  [{cat_name}] Fetching page 1 to get total page count...")
         seen_ids   = []
-        first_data, session = lcw_fetch_page_resilient(session, domain, cat_id, 1, headers,
-                                                        seen_ids=[], category_params=cat_params,
-                                                        rotation_budget=rotation_budget)
+        first_data, session, lcw_country = lcw_fetch_page_resilient(
+            session, domain, cat_id, 1, headers,
+            seen_ids=[], category_params=cat_params,
+            rotation_budget=rotation_budget, current_country=lcw_country)
         if not first_data:
             consecutive_failures[0] += 1
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
+            if LCW_CHECKPOINT:
+                mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                  pages_done=0, pages_total=0, pages_failed=1)
             if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT:
                 print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive page "
                       f"failures — DataImpulse route looks broadly unhealthy "
                       f"right now, not one bad peer. Aborting LCW run early; "
                       f"will retry on the next scheduled run.")
-                return products_seen, price_changes
+                return _lcw_finalise(supabase, session, brand_name, domain, today,
+                                     lcw_model_records, lcw_model_info, prev_prices,
+                                     existing_snapshot_ids, products_seen, price_changes)
             continue
         consecutive_failures[0] = 0
 
@@ -2741,22 +2962,52 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
         page_count   = catalog_meta.get("PageCount", 1)
         print(f"  [{cat_name}] {total_items} products across {page_count} pages.")
 
-        for page_idx in range(1, page_count + 1):
+        # v14.41: worklist instead of a fixed range. A failed page is pushed
+        # to the BACK of the queue rather than abandoned, so it is retried
+        # later in the run against a different session/peer. Without this,
+        # requiring a clean sweep of a 55-page category was unachievable: at
+        # even a 3% per-page failure rate, P(at least one failure) ≈ 81%, so
+        # categories would essentially never commit and the checkpoint would
+        # be worse than useless. Verified by simulation before shipping.
+        pending        = list(range(1, page_count + 1))
+        page_attempts  = {}
+        MAX_PAGE_ATTEMPTS = env_int("LCW_PAGE_ATTEMPTS", 3)
+
+        while pending:
+            page_idx = pending.pop(0)
             data = first_data if page_idx == 1 else None
             if page_idx > 1:
                 time.sleep(random.uniform(1.2, 2.0))
-                data, session = lcw_fetch_page_resilient(session, domain, cat_id, page_idx, headers,
-                                                          seen_ids=seen_ids, category_params=cat_params,
-                                                          rotation_budget=rotation_budget)
+                data, session, lcw_country = lcw_fetch_page_resilient(
+                    session, domain, cat_id, page_idx, headers,
+                    seen_ids=seen_ids, category_params=cat_params,
+                    rotation_budget=rotation_budget, current_country=lcw_country)
                 if not data:
                     consecutive_failures[0] += 1
-                    print(f"  ⚠️ [{cat_name}] Page {page_idx} failed. Skipping.")
+                    page_attempts[page_idx] = page_attempts.get(page_idx, 0) + 1
+                    if page_attempts[page_idx] < MAX_PAGE_ATTEMPTS:
+                        pending.append(page_idx)   # retry later, fresh peer
+                        print(f"  ↩️ [{cat_name}] Page {page_idx} failed "
+                              f"(attempt {page_attempts[page_idx]}/{MAX_PAGE_ATTEMPTS}) "
+                              f"— re-queued for a later retry.")
+                    else:
+                        cat_pages_failed += 1
+                        cat_failed_pages.append(page_idx)
+                        print(f"  ⚠️ [{cat_name}] Page {page_idx} failed "
+                              f"{MAX_PAGE_ATTEMPTS}x. Giving up on this page.")
                     if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT:
                         print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive page "
                               f"failures — DataImpulse route looks broadly unhealthy "
                               f"right now, not one bad peer. Aborting LCW run early; "
                               f"will retry on the next scheduled run.")
-                        return products_seen, price_changes
+                        # This category is incomplete — discard its buffer so a
+                        # partial colour set never reaches price detection.
+                        if LCW_CHECKPOINT:
+                            mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                              cat_pages_done, page_count, cat_pages_failed)
+                        return _lcw_finalise(supabase, session, brand_name, domain, today,
+                                             lcw_model_records, lcw_model_info, prev_prices,
+                                             existing_snapshot_ids, products_seen, price_changes)
                     continue
 
             consecutive_failures[0] = 0
@@ -2924,65 +3175,47 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                             )
                     # Accumulate this page's colours into the run-level model record
                     # set; price detection happens once, after the full crawl.
-                    lcw_model_records.setdefault(db_pid, []).extend(records)
-                    if db_pid not in lcw_model_info:
+                    cat_model_records.setdefault(db_pid, []).extend(records)
+                    if db_pid not in cat_model_info:
                         it = next((item for item in items
                                    if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
                         if it:
-                            lcw_model_info[db_pid] = {
+                            cat_model_info[db_pid] = {
                                 "desc":     it.get("ProductDescription") or it.get("BrandPropertyDescription") or "LCW Item",
                                 "category": lcw_normalize_category(it.get("BreadCrump") or {}),
                                 "url":      f"https://{domain}{it.get('ModelUrl') or ''}",
                             }
 
+            cat_pages_done += 1
             print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
 
-    # ── Single detection pass over the FULL colour set per model (v14.9) ──────
-    # Now that every page/category has been crawled, lcw_model_records holds all
-    # colours of each model. We snapshot once and detect once per model using a
-    # stable median, so partial-page views can no longer manufacture phantom
-    # up/down round-trips.
-    snap_rows = build_snapshot_rows(brand_name, lcw_model_records, today, existing_snapshot_ids)
-    if snap_rows:
-        for i in range(0, len(snap_rows), 100):
-            safe_db_execute(supabase.table("price_snapshots").insert(snap_rows[i:i+100]))
+        # ── v14.41: commit or discard this category, whole ───────────────────
+        if cat_pages_failed == 0:
+            for db_pid, recs in cat_model_records.items():
+                lcw_model_records.setdefault(db_pid, []).extend(recs)
+            lcw_model_info.update(cat_model_info)
+            if LCW_CHECKPOINT:
+                mark_lcw_progress(supabase, today, cat_id, cat_name, "complete",
+                                  cat_pages_done, page_count, 0)
+            print(f"  ✅ [{cat_name}] Complete — {cat_pages_done}/{page_count} pages, "
+                  f"{len(cat_model_records)} models committed.")
+        else:
+            # Discarded on purpose. Committing a partial colour set would let
+            # price detection see half a model's colours and invent a price
+            # move that never happened (the v14.9 bug). Redone next run.
+            if LCW_CHECKPOINT:
+                mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                  cat_pages_done, page_count, cat_pages_failed)
+            print(f"  ⚠️ [{cat_name}] Incomplete — {cat_pages_failed} page(s) failed. "
+                  f"Discarding {len(cat_model_records)} buffered models; "
+                  f"category will be retried in full on the next run.")
 
-    for db_pid, records in lcw_model_records.items():
-        if not records:
-            continue
-        curr_price = product_repr_price(records)
-        v_base     = product_repr_baseline(records)
-        if curr_price is None:
-            continue
-        last_p = prev_prices.get(db_pid)
-        if last_p is None:
-            prev_prices[db_pid] = curr_price
-            continue
-        if abs(last_p - curr_price) <= 0.01:
-            continue
-        direction = "down" if curr_price < last_p else "up"
-        price_changes += 1
-        sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
-        if direction == "down" and v_base and curr_price < v_base:
-            info = lcw_model_info.get(db_pid) or {}
-            for sz in set(sizes_in_stock):
-                find_and_alert_users(
-                    supabase, session, brand_name, info.get("category", "uncategorized"),
-                    sz, curr_price, info.get("desc", "LCW Item"),
-                    info.get("url", f"https://{domain}"), v_base
-                )
-        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
-        safe_db_execute(supabase.table("price_events").insert({
-            "product_id":       db_pid, "brand": brand_name,
-            "price_before":     last_p, "price_after": curr_price,
-            "compare_at_price": records[0].get("_meta_compare"),
-            "discount_pct":     honest_disc,
-            "direction":        direction,
-            "sizes_in_stock":   sizes_in_stock,
-            "recorded_at":      datetime.now(timezone.utc).isoformat(),
-        }))
-        prev_prices[db_pid] = curr_price
-        sync_snapshot_price(supabase, db_pid, today, curr_price)
+    # v14.41: all exit paths funnel through _lcw_finalise so completed
+    # categories are always committed, even on an early abort.
+    products_seen, price_changes = _lcw_finalise(
+        supabase, session, brand_name, domain, today,
+        lcw_model_records, lcw_model_info, prev_prices,
+        existing_snapshot_ids, products_seen, price_changes)
 
     # ── LCW size enrichment pass (rewritten v14.6) ────────────────────────────
     # Bandwidth math:
@@ -4523,7 +4756,14 @@ def scrape_brand(brand_name, domain):
     try:
         supabase     = create_client(SUPABASE_URL, SUPABASE_KEY)
         brand_config = next(b for b in BRANDS if b["name"] == brand_name)
-        session      = get_lcw_session() if brand_config["engine"] == "lcw_proxy" else get_shopify_session(brand_name)
+        if brand_config["engine"] == "lcw_proxy":
+            # v14.40: get_lcw_session() now returns (session, country). The
+            # country is stashed on the session so scrape_lcw knows which
+            # pool it started in and can rotate AWAY from it on failure.
+            session, _lcw_country = get_lcw_session()
+            session._khabar_country = _lcw_country
+        else:
+            session = get_shopify_session(brand_name)
     except Exception as e:
         print(f"❌ Initialization failed for {brand_name}: {e}")
         return 0, 0
