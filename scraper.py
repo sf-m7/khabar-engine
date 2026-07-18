@@ -548,6 +548,7 @@
 
 import json
 import os
+import psycopg2
 import random
 import re
 import sys
@@ -561,6 +562,13 @@ sys.stdout.reconfigure(line_buffering=True)
 
 SUPABASE_URL       = os.environ["SUPABASE_URL"]
 SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
+
+# v14.37 — EGRESS FIX. Optional direct-Postgres URL, used ONLY for the
+# per-brand variant preload. Deliberately os.environ.get() and NOT
+# os.environ[...]: if the secret is not wired into a workflow, the preload
+# silently falls back to the old PostgREST path and the run behaves exactly
+# as before. Safe to deploy, and revertible by unsetting the secret alone.
+SUPABASE_DB_URL    = os.environ.get("SUPABASE_DB_URL", "").strip() or None
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -632,7 +640,7 @@ def env_int(name, default):
 # Edit this set directly as brands recover or new ones get blocked.
 DATAIMPULSE_PROXY_BRANDS = {
     "dalydress", "eagle", "just_sbr", "mlameh", "khotwh", "tomato",
-    "ravin", "tree", "mobaco",
+    "ravin", "tree", "mobaco", "arafa", "tie_house", "premoda", "activ", "esla", "town_team", "mens_club", "dott_jeans", "carina", "andora", "cizaro"
 }
 
 BRANDS = [
@@ -4336,6 +4344,95 @@ def collect_bestseller_ranks(supabase, session):
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
+def load_prev_state_direct(brand_name):
+    """
+    v14.37 EGRESS FIX — direct-Postgres replacement for the per-brand variant
+    preload.
+
+    WHY THIS EXISTS
+    ---------------
+    The preload in scrape_brand() was ~100% of this project's Supabase egress.
+    Measured live at 454,160 variants: 110 MB of JSON per full catalog pass,
+    run 3x/day for Shopify+DeFacto brands and 1x/day for LCW, so roughly
+    292 MB/day ~= 8.8 GB/month against a 5 GB free-plan quota. Everything
+    else in the stack -- signals, archive, bot, ad-hoc queries -- is rounding
+    error next to it.
+
+    The cost was never the ROWS, it was the TRANSPORT. PostgREST returns JSON,
+    so each of the 454k rows repeats all eight column names as literal text and
+    carries a nested {"products":{"brand":"..."}} object holding a value that
+    is identical on every row (the query is already filtered to one brand).
+    The same rows over the Postgres text protocol measure 20 MB instead of
+    110 MB -- an 82% cut, about 1.6 GB/month.
+
+    WHAT IT RETURNS
+    ---------------
+    Identical contract to the old block: (prev_stock_state, fop_done_ids).
+    Only the three columns actually consumed downstream are selected --
+    first_observed_price, is_in_stock, size -- plus product_id/external_sku
+    for keying. `color` and `last_updated_at` were in the old SELECT but are
+    never read off prev_stock_state anywhere in this file (verified: the only
+    access patterns are .get(sku) followed by ["first_observed_price"],
+    ["is_in_stock"] and .get("size")). Dropping them is pure savings.
+
+    Returns None on any failure so the caller falls back to PostgREST rather
+    than losing a scrape run.
+    """
+    if not SUPABASE_DB_URL:
+        return None
+
+    conn = None
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URL, connect_timeout=30)
+        conn.set_session(readonly=True, autocommit=True)
+
+        # Server-side (named) cursor: streams in itersize batches instead of
+        # materialising the whole result set client-side. Keeps the GitHub
+        # Actions runner's memory flat on LCW's 83k-variant catalog.
+        cur = conn.cursor(name=f"prev_state_{brand_name}")
+        cur.itersize = 5000
+        cur.execute(
+            """
+            SELECT pv.product_id,
+                   pv.external_sku,
+                   pv.is_in_stock,
+                   pv.size,
+                   pv.first_observed_price
+            FROM product_variants pv
+            JOIN products p ON p.id = pv.product_id
+            WHERE p.brand = %s
+            """,
+            (brand_name,),
+        )
+
+        prev_stock_state, fop_done_ids = {}, set()
+        for product_id, external_sku, is_in_stock, size, fop in cur:
+            prev_stock_state[external_sku] = {
+                "product_id":           product_id,
+                "external_sku":         external_sku,
+                "is_in_stock":          is_in_stock,
+                "size":                 size,
+                # psycopg2 maps numeric -> Decimal; the PostgREST path produced
+                # float/str. Every consumer wraps this in float(), but cast here
+                # anyway so the in-memory types match the old path exactly.
+                "first_observed_price": float(fop) if fop is not None else None,
+            }
+            if product_id:
+                fop_done_ids.add(product_id)
+
+        cur.close()
+        return prev_stock_state, fop_done_ids
+
+    except Exception as e:
+        print(f"  \u26a0\ufe0f Direct preload failed for {brand_name} ({e}) "
+              f"\u2014 falling back to PostgREST.")
+        return None
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
 def scrape_brand(brand_name, domain):
     """
     v14.20: now returns (seen, changes) instead of just changes.
@@ -4383,20 +4480,31 @@ def scrape_brand(brand_name, domain):
         # never be overwritten even in an edge case. product_id was added to the
         # SELECT purely to make this derivation possible (one extra small column
         # vs. an entire second catalog read — a clear net egress win).
-        all_variant_rows, offset = [], 0
-        while True:
-            chunk = safe_db_execute(
-                supabase.table("product_variants")
-                .select("product_id, external_sku, is_in_stock, size, color, first_observed_price, last_updated_at, products!inner(brand)")
-                .eq("products.brand", brand_name)
-                .range(offset, offset + 999)
-            )
-            rows = chunk.data if (chunk and chunk.data) else []
-            all_variant_rows.extend(rows)
-            if len(rows) < 1000: break
-            offset += 1000
-        prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
-        fop_done_ids     = {row["product_id"] for row in all_variant_rows if row.get("product_id")}
+        # v14.37 EGRESS FIX: prefer the direct-Postgres loader (20 MB/pass vs
+        # 110 MB/pass over PostgREST -- see load_prev_state_direct docstring).
+        # Falls back to the original PostgREST pagination below if
+        # SUPABASE_DB_URL is unset or the direct connection fails, so a missing
+        # secret or a transient fault degrades to the old behaviour instead of
+        # losing the run.
+        _direct = load_prev_state_direct(brand_name)
+        if _direct is not None:
+            prev_stock_state, fop_done_ids = _direct
+            print(f"  \U0001f4c9 Preloaded {len(prev_stock_state):,} variants via direct connection.")
+        else:
+            all_variant_rows, offset = [], 0
+            while True:
+                chunk = safe_db_execute(
+                    supabase.table("product_variants")
+                    .select("product_id, external_sku, is_in_stock, size, color, first_observed_price, last_updated_at, products!inner(brand)")
+                    .eq("products.brand", brand_name)
+                    .range(offset, offset + 999)
+                )
+                rows = chunk.data if (chunk and chunk.data) else []
+                all_variant_rows.extend(rows)
+                if len(rows) < 1000: break
+                offset += 1000
+            prev_stock_state = {row["external_sku"]: row for row in all_variant_rows}
+            fop_done_ids     = {row["product_id"] for row in all_variant_rows if row.get("product_id")}
 
         if brand_config["engine"] == "shopify":
             seen, changes = scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
