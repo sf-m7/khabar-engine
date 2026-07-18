@@ -1,68 +1,68 @@
-name: Khabar LCW Scraper
+name: LCW Scraper
+
+# v14.41: hourly instead of once daily.
+#
+# Why: a single daily run that hits a bad proxy window loses the whole day,
+# and the next attempt is 24 hours away. With category-level checkpointing in
+# scraper.py, each run skips categories already completed today and only
+# attempts the rest. Most runs will therefore be no-ops that exit in seconds.
+#
+# Cost: GitHub Actions minutes are free on public repos, so the extra runs are
+# free. Proxy bandwidth is only spent on categories that still need fetching,
+# so a completed day costs roughly nothing beyond one cheap DB read.
+#
+# The 06:00-21:00 window covers the day with margin; the previous single run
+# was at 18:00 UTC.
 
 on:
   schedule:
-    # 18:00 UTC = 21:00 Cairo (EEST, UTC+3 in summer).
-    # Deliberately 3 hours before Cairo midnight so that even if GitHub's
-    # scheduler runs late (commonly 15–60 min, occasionally more), the run
-    # still lands on the same calendar day and captures the day's prices.
-    # Runs once daily — LCW is a DataImpulse (residential, pay-per-GB)
-    # consumer, so keeping it to one run/day still matters for cost, same
-    # as it did under Webshare.
-    - cron: "0 18 * * *"
-  workflow_dispatch:
+    - cron: '0 6-21 * * *'
+  workflow_dispatch:        # manual trigger, unchanged
+
+concurrency:
+  # Never let two LCW runs overlap — they would fight over the same
+  # checkpoint rows and double-fetch the same categories.
+  group: lcw-scraper
+  cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    steps:
-      - name: Pull the code
-        uses: actions/checkout@v4
+    timeout-minutes: 45     # circuit breaker should abort long before this
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.11'
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # v14.31: moved off Webshare onto DataImpulse (pricing). Same role as
-      # before — Egyptian residential exit IP for LCW's WAF.
-      #
-      # v14.34: LCW_SIZE_CAP was defined in scraper.py (os.environ.get with
-      # a "65" default) but was NEVER actually passed into this job's env
-      # block — so the repository variable could be changed at will and the
-      # scraper would silently keep using the hardcoded default of 65 every
-      # run. Now wired in below via ${{ vars.LCW_SIZE_CAP }}.
-      #
-      # Also added LCW_ROTATION_BUDGET — caps total DataImpulse session
-      # rotations across an entire catalog crawl run (was unbounded before,
-      # which is what turned a normal ~22-minute run into a 2.5-hour run
-      # "full of retries" on a bad-proxy-pool day). Defaults to 8 in code
-      # if this variable isn't set, so it's optional here, but exposing it
-      # lets you tune it without another code change if needed.
-      # v14.35: DATAIMPULSE_HOST lets you point at a specific gateway IP
-      # (e.g. the one DataImpulse support recommends) instead of the DNS
-      # name, without another code change. Leave the repo variable unset
-      # to keep using gw.dataimpulse.com (the default in scraper.py).
       - name: Run LCW scraper
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # v14.37 egress fix: direct-Postgres URL for the variant preload.
-          # If this is unset the scraper falls back to the PostgREST path.
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
-          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
-          DATAIMPULSE_HOST: ${{ vars.DATAIMPULSE_HOST }}
-          SCRAPE_TARGET: lcw
-          LCW_SIZE_CAP: ${{ vars.LCW_SIZE_CAP }}
-          LCW_ROTATION_BUDGET: ${{ vars.LCW_ROTATION_BUDGET }}
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python -u scraper.py
+        env:
+          SUPABASE_URL:                ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:                ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_DB_URL:             ${{ secrets.SUPABASE_DB_URL }}
+          TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DATAIMPULSE_HOST:            ${{ vars.DATAIMPULSE_HOST }}
+          SCRAPE_TARGET:               lcw
+          LCW_SIZE_CAP:                ${{ vars.LCW_SIZE_CAP }}
+          LCW_ROTATION_BUDGET:         ${{ vars.LCW_ROTATION_BUDGET }}
+          # ── v14.39-41 knobs. All blank-safe: env_str/env_int treat a blank
+          # repo variable exactly as unset, so leaving them undefined keeps
+          # the documented defaults. Wired here so they can be changed from
+          # the GitHub UI without a code edit or redeploy.
+          LCW_PROXY_COUNTRY:           ${{ vars.LCW_PROXY_COUNTRY }}   # default tr; "eg" to roll back; "tr,sa" for a pool
+          LCW_PAGE_TIMEOUT:            ${{ vars.LCW_PAGE_TIMEOUT }}    # default 12 (seconds)
+          LCW_FORCE_HTTP1:             ${{ vars.LCW_FORCE_HTTP1 }}     # default 1; "0" to restore HTTP/2
+          LCW_CHECKPOINT:              ${{ vars.LCW_CHECKPOINT }}      # default 1; "0" disables resume
+          LCW_PAGE_ATTEMPTS:           ${{ vars.LCW_PAGE_ATTEMPTS }}   # default 3
+          LCW_CIRCUIT_BREAKER:         ${{ vars.LCW_CIRCUIT_BREAKER }} # default 6
