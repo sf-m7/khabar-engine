@@ -4384,7 +4384,7 @@ def load_prev_state_direct(brand_name):
     conn = None
     try:
         conn = psycopg2.connect(SUPABASE_DB_URL, connect_timeout=30)
-        conn.set_session(readonly=True, autocommit=True)
+        conn.set_session(readonly=True)
 
         # Server-side (named) cursor: streams in itersize batches instead of
         # materialising the whole result set client-side. Keeps the GitHub
