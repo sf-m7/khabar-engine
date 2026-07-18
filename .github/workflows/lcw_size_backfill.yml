@@ -17,6 +17,16 @@ on:
         type: string
         default: "45"
 
+# v14.41: share the LCW scraper's concurrency group. scraper_lcw.yml now runs
+# HOURLY, and this job can run for 45 minutes — so without this they overlap,
+# competing for the same DataImpulse account and upserting the same
+# product_variants rows (both passes target variants where size IS NULL).
+# Same group + cancel-in-progress:false means GitHub queues one behind the
+# other instead of running both.
+concurrency:
+  group: lcw-scraper
+  cancel-in-progress: false
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
@@ -46,6 +56,14 @@ jobs:
           DATAIMPULSE_HOST: ${{ vars.DATAIMPULSE_HOST }}
           SCRAPE_TARGET: lcw
           BACKFILL_SIZE_CAP: ${{ inputs.size_cap }}
+          # v14.41: the backfill imports get_lcw_session() from scraper.py, so
+          # it inherits the Turkey switch, HTTP/1.1 pinning and country-pool
+          # rotation automatically — but only if these are passed through.
+          # Without them the script silently falls back to the code defaults
+          # and ignores whatever you set in the GitHub UI.
+          LCW_PROXY_COUNTRY: ${{ vars.LCW_PROXY_COUNTRY }}
+          LCW_FORCE_HTTP1: ${{ vars.LCW_FORCE_HTTP1 }}
+          LCW_PAGE_TIMEOUT: ${{ vars.LCW_PAGE_TIMEOUT }}
         run: |
           # time_limit_minutes is entered in minutes for readability in the
           # GitHub UI; the script wants seconds, so convert here.
