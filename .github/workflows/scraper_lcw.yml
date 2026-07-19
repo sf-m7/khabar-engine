@@ -16,7 +16,7 @@ name: LCW Scraper
 
 on:
   schedule:
-    - cron: '0 6-21 * * *'
+    - cron: '0 18 * * *'
   workflow_dispatch:        # manual trigger, unchanged
 
 concurrency:
