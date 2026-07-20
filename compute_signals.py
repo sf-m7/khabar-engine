@@ -245,6 +245,20 @@ if __name__ == "__main__":
         print()
 
     con = khabar_lake.connect()
+
+    # ONE read of Supabase, here, before any signal runs.
+    #
+    # Every signal below calls khabar_lake.snapshots() to set its own window.
+    # That used to re-query Postgres each time — and each signal queries the
+    # resulting view several times over (row count, days_available, its own
+    # CTEs, suppressed_sql), so a single daily run was pulling the hot window
+    # and all 481K product_variants across the wire 75–120 times.
+    #
+    # khabar_lake now materialises the hot tier into local DuckDB memory. The
+    # per-signal snapshots() calls still do exactly what they did — they just
+    # re-point a view at local data instead of re-reading the database.
+    khabar_lake.prefetch(con)
+
     pg  = psycopg2.connect(SUPABASE_DB_URL)
 
     tally = {"ok": 0, "skipped": 0, "failed": 0}
