@@ -1284,9 +1284,23 @@ def product_repr_price(records):
     return prices[len(prices) // 2] if prices else None
 
 def product_repr_baseline(records):
-    """Representative first_observed_price for a product = median of variant baselines."""
-    bases = sorted(r["_meta_baseline"] for r in records if r.get("_meta_baseline"))
-    return bases[len(bases) // 2] if bases else None
+    """
+    Product-level honest baseline = MIN of variant baselines.
+
+    v14.41: was MEDIAN. Changed to MIN so the scraper, the lake
+    (khabar_lake.product_baselines) and the registry (L1-01, L1-17) all
+    compute the same number. They disagreed on 33% of DeFacto products,
+    23% of Town Team and 13% of Khotwh — by an average of 358 EGP on
+    DeFacto — which meant a discount quoted from price_snapshots did not
+    match the same product's discount in a signal.
+
+    MIN, not median or max, because it yields the SMALLEST possible
+    discount. A product sold on the honesty of its baseline must never
+    round in its own favour. Same rule as L1-01's collapse rule, kept
+    identical on purpose.
+    """
+    bases = [r["_meta_baseline"] for r in records if r.get("_meta_baseline")]
+    return min(bases) if bases else None
 
 def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_ids):
     rows = []
