@@ -1298,19 +1298,44 @@ def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_id
         if median_price is None:
             continue
         vd = records[0]
+        # v14.40: discount_pct is now WRITTEN, not left NULL.
+        #
+        # It was never populated by this function — all 455,947 live rows had
+        # discount_pct = NULL, so anything reading the column directly got
+        # nothing back.
+        #
+        # The baseline is product_repr_baseline() (first_observed_price), NOT
+        # compare_at_price. This is the core honest-discount invariant: a
+        # brand can set compare_at to anything it likes, so a product parked
+        # at 499 with compare_at 799 would otherwise read as a permanent 37%
+        # discount that never happened. Measuring against the first price WE
+        # observed makes the number brand-proof. compare_at_price is still
+        # stored alongside — it is evidence of the CLAIMED discount, useful
+        # for the Anchor Inflation signal, but never the baseline.
+        #
+        # NULL is preserved (not zeroed) when there is no baseline or the
+        # price is at/above it: "no discount" and "cannot compute" stay
+        # distinguishable.
+        baseline = product_repr_baseline(records)
+        discount_pct = (
+            round(((baseline - median_price) / baseline) * 100, 2)
+            if (baseline and baseline > 0 and median_price < baseline)
+            else None
+        )
         rows.append({
             "product_id":       db_pid,
             "variant_id":       None,
             "brand":            brand_name,
             "price":            median_price,
             "compare_at_price": vd.get("_meta_compare"),
+            "discount_pct":     discount_pct,
             "snapshot_date":    str(today),
             "recorded_at":      now_iso,
         })
         existing_ids.add(db_pid)
     return rows
 
-def sync_snapshot_price(supabase, db_pid, today, price):
+def sync_snapshot_price(supabase, db_pid, today, price, baseline=None):
     """
     Keep today's snapshot equal to the latest detected price (v14.10).
     Snapshots are written once per product per day (first observation). For
@@ -1323,9 +1348,18 @@ def sync_snapshot_price(supabase, db_pid, today, price):
     This is ALSO what makes "the last run of the day = the day's close": whichever
     run touches a product last writes the price the weekly aggregation rolls up.
     """
+    # v14.40: discount_pct must move WITH the price. Updating price alone left
+    # the snapshot internally inconsistent for the rest of the day -- a new
+    # price against a discount_pct computed from the earlier one. Baseline is
+    # first_observed_price, same invariant as build_snapshot_rows().
+    payload = {"price": price}
+    if baseline and baseline > 0:
+        payload["discount_pct"] = (
+            round(((baseline - price) / baseline) * 100, 2) if price < baseline else None
+        )
     safe_db_execute(
         supabase.table("price_snapshots")
-        .update({"price": price})
+        .update(payload)
         .eq("product_id", db_pid)
         .eq("snapshot_date", str(today))
     )
@@ -2409,7 +2443,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                         "recorded_at":   datetime.now(timezone.utc).isoformat(),
                     }))
                     prev_prices[db_pid] = curr_price
-                    sync_snapshot_price(supabase, db_pid, today, curr_price)
+                    sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
 
         print(f"  Page {page} — {len(batch_products)} products processed.")
         time.sleep(1)
@@ -2847,7 +2881,7 @@ def _lcw_finalise(supabase, session, brand_name, domain, today,
             "recorded_at":      datetime.now(timezone.utc).isoformat(),
         }))
         prev_prices[db_pid] = curr_price
-        sync_snapshot_price(supabase, db_pid, today, curr_price)
+        sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
     return products_seen, price_changes
 
 
@@ -3862,7 +3896,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                             "recorded_at":      datetime.now(timezone.utc).isoformat(),
                         }))
                         prev_prices[db_pid] = curr_price
-                        sync_snapshot_price(supabase, db_pid, today, curr_price)
+                        sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
 
             print(f"  [{cat_name}] Page {page_index} — {len(items)} items processed.")
 
@@ -4497,7 +4531,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                             "recorded_at":      datetime.now(timezone.utc).isoformat(),
                         }))
                         prev_prices[db_pid] = curr_price
-                        sync_snapshot_price(supabase, db_pid, today, curr_price)
+                        sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
                 except Exception as e:
                     print(f"  ⚠️ [WooCommerce] Skipping product db_pid={db_pid} during detection: {e}")
                     traceback.print_exc()
