@@ -51,11 +51,35 @@ BLOCKERS = {
     # WORST for the newest brands (whose entire catalog was seeded on day one).
     # Every inventory signal is poisoned by this until the scraper distinguishes
     # "was in stock, then wasn't" from "never seen in stock".
+    # RESOLVED 2026-07-20. stockout_events now carries a `witnessed` boolean and
+    # a `seed_reason`, applied retroactively to all 84,841 historical rows and
+    # written forward by the scraper. khabar_lake.stockout_events() filters to
+    # witnessed=TRUE by default, so an inventory signal cannot forget to.
+    #
+    # The investigation also corrected the original diagnosis recorded here. The
+    # contamination was real but the mechanism was NOT first-observation
+    # seeding: only 360 of 82,708 first-stockouts occurred within a day of a
+    # product's first sighting. The true breakdown of 44,689 transitions is
+    # 27,670 trustworthy (62%), 14,439 orphan restocks, 1,405 delist-cycle
+    # artefacts, 1,175 duplicates.
+    #
+    # Stockouts were always cleaner than feared (96% survive). RESTOCKS were the
+    # rotten half (29% survive). Since restock velocity — not sellout count — is
+    # the primary input to the Supply Chain Stress Index, the practical impact
+    # on L2-06 is unchanged from the original estimate.
+    #
+    # CAVEAT for any signal that switches on here: LC Waikiki and DeFacto
+    # contribute ZERO witnessed inventory events. Neither publishes per-size
+    # stock, and DeFacto's catalogue never reports out-of-stock at all — it
+    # delists instead. Any inventory signal covers the other 20 brands. State
+    # that coverage explicitly in client-facing output rather than implying a
+    # market-wide view.
     "seeded_stockout": {
-        "resolved": False,
-        "why": "60-64% of stockout_events are SKUs already out of stock on first "
-               "observation, not witnessed sellouts. Inventory signals built on "
-               "this would overstate demand velocity, worst for newest brands.",
+        "resolved": True,
+        "why": "RESOLVED — stockout_events.witnessed separates observed "
+               "transitions from collection artefacts; the lake filters on it "
+               "by default. Note LCW and DeFacto contribute zero inventory "
+               "events: neither publishes per-size stock.",
     },
 
     # price_events fires only on an actual price CHANGE, so intraday movement
