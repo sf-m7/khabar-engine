@@ -1,22 +1,30 @@
 name: LCW Scraper
 
-# v14.41: hourly instead of once daily.
+# v14.42: single daily run at 18:37 UTC.
 #
-# Why: a single daily run that hits a bad proxy window loses the whole day,
-# and the next attempt is 24 hours away. With category-level checkpointing in
-# scraper.py, each run skips categories already completed today and only
-# attempts the rest. Most runs will therefore be no-ops that exit in seconds.
+# The minute is deliberately NOT :00. GitHub queues every top-of-hour cron job
+# across the platform at the same instant, so :00 schedules are the most
+# contended slot there is — they get delayed under load and, when the queue is
+# deep enough, dropped entirely. That is what produced the ~30 minute drift on
+# earlier runs and the missed run on 2026-07-20 that left LCW 35 hours stale.
+# An odd minute sidesteps the crush without changing the cadence.
 #
-# Cost: GitHub Actions minutes are free on public repos, so the extra runs are
-# free. Proxy bandwidth is only spent on categories that still need fetching,
-# so a completed day costs roughly nothing beyond one cheap DB read.
+# NOTE: the previous comment here described an hourly 06:00-21:00 schedule.
+# That change was never applied — the cron underneath stayed '0 18 * * *' the
+# whole time. Once daily is the intended design, so the comment was corrected
+# to match the code rather than the code changed to match the comment.
 #
-# The 06:00-21:00 window covers the day with margin; the previous single run
-# was at 18:00 UTC.
+# TRADEOFF, stated plainly: with one attempt per day, a bad DataImpulse proxy
+# window costs the entire day and the next attempt is 24 hours out. LCW missed
+# 2 of the last 8 days this way. Category-level checkpointing in scraper.py
+# means a MANUAL re-run resumes rather than refetching, so recovery is cheap —
+# but it has to be triggered by hand. If that ever becomes tiresome, adding a
+# second cron at '37 21 * * *' would no-op in seconds on a day that already
+# succeeded. Not enabled: once daily is the current, deliberate choice.
 
 on:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '37 18 * * *'
   workflow_dispatch:        # manual trigger, unchanged
 
 concurrency:
