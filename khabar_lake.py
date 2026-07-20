@@ -143,6 +143,8 @@ def connect():
 # Process-local. Reset per job because the DuckDB connection dies with it.
 _HOT_READY        = False
 _BASELINES_READY  = False
+_PRODBASE_READY   = False
+_EVENTS_READY     = False
 _GLOB_CACHE       = None
 
 
@@ -304,6 +306,10 @@ def snapshots(con, days=30, end_day=None):
     # THE OVERLAP RULE (see module docstring): a day can exist in both tiers.
     # De-duplicate on snapshot_id, hot tier wins. Without this, any day caught
     # mid-archive is counted twice and every median/IQR downstream is wrong.
+    # The honest baseline must be available before the view is defined. Guarded,
+    # so this is one narrow two-column Postgres read per run, not per signal.
+    product_baselines(con)
+
     con.execute(f"""
         CREATE OR REPLACE VIEW snapshots AS
         WITH cold AS ({cold_sql}),
@@ -321,26 +327,155 @@ def snapshots(con, days=30, end_day=None):
                  FROM unioned
              )
         SELECT
-            snapshot_id, product_id, variant_id, brand, product_name,
-            category_normalized, category_raw, gender, size, color,
-            attributes_extracted, price, compare_at_price, discount_pct,
-            CAST(snapshot_date AS DATE) AS snapshot_date,
-            recorded_at,
-            -- Discount as published by the brand. NULL — never 0 — when the
-            -- brand published no RRP, because "no RRP" is not "no discount".
+            d.snapshot_id, d.product_id, d.variant_id, d.brand, d.product_name,
+            d.category_normalized, d.category_raw, d.gender, d.size, d.color,
+            d.attributes_extracted, d.price, d.compare_at_price, d.discount_pct,
+            CAST(d.snapshot_date AS DATE) AS snapshot_date,
+            d.recorded_at,
+
+            -- ================================================================
+            -- honest_discount_pct — measured against first_observed_price.
+            --
+            -- THIS DEFINITION CHANGED 2026-07-20. It previously computed from
+            -- compare_at_price, which is the brand-manipulable "was" price. A
+            -- product parked forever at 499 "was 799" is not on sale; it is
+            -- priced at 499. Reading that as a 37% discount is precisely the
+            -- error Khabar sells immunity to, and the column carried the name
+            -- of the invariant it was breaking.
+            --
+            -- It was defensible when written: price_snapshots.discount_pct was
+            -- NULL on all 455,947 rows, so compare_at_price was the only thing
+            -- available. That column is now populated at write time by the
+            -- scraper and backfilled across live rows.
+            --
+            -- COALESCE order matters. discount_pct is authoritative where it
+            -- exists (hot rows, and cold days archived after the fix). Older
+            -- Parquet files predate the column and hold NULL — those are
+            -- recomputed here from product_baselines, which is why that table
+            -- must be UNFILTERED by is_active/delisted_at.
+            --
+            -- NULL, never 0, when there is no baseline: "we cannot measure"
+            -- and "there is no discount" must stay distinguishable.
+            -- ================================================================
+            COALESCE(
+                d.discount_pct,
+                CASE
+                    WHEN pb.baseline_price IS NOT NULL
+                     AND pb.baseline_price > 0
+                     AND d.price < pb.baseline_price
+                    THEN ROUND(100.0 * (pb.baseline_price - d.price) / pb.baseline_price, 2)
+                    ELSE NULL
+                END
+            ) AS honest_discount_pct,
+
+            pb.baseline_price AS baseline_price,
+
+            -- The discount the brand CLAIMS, from its own RRP. Deliberately
+            -- kept and deliberately renamed: it is not a measure of savings,
+            -- it is evidence of anchoring behaviour, and it is the raw input
+            -- to the Anchor Inflation signal. Never substitute it for the
+            -- honest figure above. NULL — never 0 — when no RRP was published.
             CASE
-                WHEN compare_at_price IS NOT NULL
-                 AND compare_at_price > 0
-                 AND compare_at_price >= price
-                THEN ROUND(100.0 * (compare_at_price - price) / compare_at_price, 2)
+                WHEN d.compare_at_price IS NOT NULL
+                 AND d.compare_at_price > 0
+                 AND d.compare_at_price >= d.price
+                THEN ROUND(100.0 * (d.compare_at_price - d.price) / d.compare_at_price, 2)
                 ELSE NULL
-            END AS honest_discount_pct
-        FROM deduped
-        WHERE rn = 1
+            END AS claimed_discount_pct
+        FROM deduped d
+        LEFT JOIN product_baselines pb ON pb.product_id = d.product_id
+        WHERE d.rn = 1
     """)
 
     n = con.execute("SELECT count(*) FROM snapshots").fetchone()[0]
     return n, len(files), start_day, end_day
+
+
+def product_baselines(con):
+    """
+    Product-level honest baseline: the lowest first_observed_price across a
+    product's variants. Materialised once per run, two columns only.
+
+    WHY THIS EXISTS SEPARATELY FROM variant_baselines():
+    variant_baselines filters to `p.is_active AND pv.delisted_at IS NULL`,
+    which is right for "what can I sell today" but WRONG for a historical
+    baseline. A snapshot from three weeks ago must still be measurable even if
+    the product has since been delisted -- otherwise the honest discount
+    silently disappears from history the moment a product dies, and every
+    trailing median shifts. This pull is deliberately unfiltered.
+
+    COLLAPSE RULE: MIN, not AVG or MAX. first_observed_price is variant-level;
+    snapshots are product-level. 96.5% of products carry one baseline across
+    all variants; where they differ, MIN yields the SMALLEST possible discount.
+    A signal sold on the honesty of its baseline must never round in its own
+    favour. Same rule as L1-01 in the registry -- kept identical on purpose.
+    """
+    global _PRODBASE_READY
+    if _PRODBASE_READY:
+        return con.execute("SELECT count(*) FROM product_baselines").fetchone()[0]
+
+    con.execute("DROP TABLE IF EXISTS product_baselines")
+    con.execute("""
+        CREATE TABLE product_baselines AS
+        SELECT pv.product_id AS product_id,
+               MIN(CAST(pv.first_observed_price AS DOUBLE)) AS baseline_price
+        FROM pg.public.product_variants pv
+        WHERE pv.first_observed_price IS NOT NULL
+        GROUP BY pv.product_id
+    """)
+    _PRODBASE_READY = True
+    return con.execute("SELECT count(*) FROM product_baselines").fetchone()[0]
+
+
+def stockout_events(con, witnessed_only=True):
+    """
+    Inventory transitions, exposed as the table `stock_events`.
+
+    WITNESSED-ONLY BY DEFAULT, AND THAT DEFAULT IS THE WHOLE POINT.
+    Of 44,689 real stock transitions, only 27,670 (62%) are trustworthy. The
+    rest are artefacts of how the data was collected, not of what the market
+    did:
+      orphan_restock       a restock with no sellout ever recorded before it,
+                           so the interval it implies is meaningless. 69% of
+                           all restock volume.
+      delist_cycle         housekeeping wrote "out of stock" when a product
+                           merely left the catalogue; its reappearance then
+                           read as a restock. Fixed at source 2026-07-20, but
+                           historical rows remain.
+      duplicate_transition the same event type twice in a row.
+
+    Counting those as demand overstates sellout velocity, and overstates it
+    WORST for the newest brands. Filtering belongs here, once, rather than in
+    each signal's SQL where one omission silently poisons a client-facing
+    number.
+
+    Set witnessed_only=False ONLY to audit the contamination itself. Never for
+    a signal.
+
+    Note this reads Postgres directly: stockout_events is not archived to R2,
+    so there is no cold tier to stitch. If retention is ever added to that
+    table, this needs the same two-tier treatment as snapshots().
+    """
+    global _EVENTS_READY
+    if _EVENTS_READY:
+        return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
+
+    where = "WHERE se.witnessed = TRUE" if witnessed_only else ""
+    con.execute("DROP TABLE IF EXISTS stock_events")
+    con.execute(f"""
+        CREATE TABLE stock_events AS
+        SELECT se.id, se.variant_id, se.product_id, se.brand,
+               se.size, se.color, se.event_type,
+               CAST(se.price_at_event AS DOUBLE) AS price_at_event,
+               se.was_on_discount,
+               se.witnessed, se.seed_reason,
+               se.recorded_at,
+               CAST(se.recorded_at AS DATE) AS event_date
+        FROM pg.public.stockout_events se
+        {where}
+    """)
+    _EVENTS_READY = True
+    return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
 
 
 def variant_baselines(con):
