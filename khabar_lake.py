@@ -109,18 +109,128 @@ def connect():
     return con
 
 
+# =============================================================================
+# THE ONE-READ RULE — why this module materialises the hot tier.
+#
+# `snapshots()` used to build a DuckDB VIEW over `pg.public.price_snapshots`.
+# A view is not data; it is stored SQL. Every query that touched `snapshots`
+# re-ran that SQL against Supabase from scratch.
+#
+# The signal runner touches it 4–8 times per signal (the row count here, the
+# days_available count, the signal's own SQL — which often references it in two
+# or three CTEs — and the suppressed_sql). Across ~15 runnable signals that is
+# 75–120 full reads of the hot window PER RUN.
+#
+# Worse, the de-duplication below uses ROW_NUMBER() OVER (PARTITION BY ...),
+# which is an opaque barrier: DuckDB cannot push column-pruning or date filters
+# down through it into Postgres. So each of those reads dragged all 16 columns
+# of price_snapshots across the wire AND the entirety of products and
+# product_variants (481K rows) to satisfy the joins.
+#
+# Measured effect: ~300–500 MB/day of Supabase egress from one daily job, and
+# ~3.6 GB on a day it was run 13 times while debugging (2026-07-14).
+#
+# The fix is one line of principle: pull the hot tier ONCE into a local DuckDB
+# table, then let every subsequent query read local memory. Postgres is touched
+# exactly once per process.
+#
+# The COLD tier is deliberately NOT materialised. R2 egress is free and
+# unmetered, so re-scanning Parquet costs nothing, while materialising 90 days
+# of it could exhaust the runner's memory. Trading a free resource for a scarce
+# one would be the wrong direction.
+# =============================================================================
+
+# Process-local. Reset per job because the DuckDB connection dies with it.
+_HOT_READY        = False
+_BASELINES_READY  = False
+_GLOB_CACHE       = None
+
+
+def _lake_files(con):
+    """
+    Every day-file in the lake, listed ONCE per process.
+
+    The glob is an R2 LIST call — cheap, but it was being re-issued for every
+    signal. Cached here because the lake cannot gain files mid-run: archive.py
+    is a separate weekly job.
+    """
+    global _GLOB_CACHE
+    if _GLOB_CACHE is None:
+        _GLOB_CACHE = con.execute(f"""
+            SELECT file FROM glob('s3://{R2_BUCKET_NAME}/{LAKE_PREFIX}/*.parquet')
+        """).fetchall()
+    return _GLOB_CACHE
+
+
+def materialise_hot(con, force=False):
+    """
+    Pull the ENTIRE Supabase hot tier into a local DuckDB table, once.
+
+    No date filter, deliberately. The hot tier is already bounded by the
+    retention window housekeeping enforces (~8 days), so "all of it" is small
+    and predictable — a few hundred thousand rows. Filtering by window here
+    would mean a second Postgres read the moment a signal asked for a wider
+    lookback, which is the exact behaviour this function exists to remove.
+
+    After this returns, `hot_raw` is local data. Nothing downstream touches
+    Postgres again for the life of the process.
+    """
+    global _HOT_READY
+    if _HOT_READY and not force:
+        return con.execute("SELECT count(*) FROM hot_raw").fetchone()[0]
+
+    con.execute("DROP TABLE IF EXISTS hot_raw")
+    con.execute(f"""
+        CREATE TABLE hot_raw AS
+        SELECT
+            ps.id                     AS snapshot_id,
+            ps.product_id             AS product_id,
+            ps.variant_id             AS variant_id,
+            ps.brand                  AS brand,
+            p.name                    AS product_name,
+            p.category_normalized     AS category_normalized,
+            p.category_raw            AS category_raw,
+            p.gender                  AS gender,
+            pv.size                   AS size,
+            pv.color                  AS color,
+            CAST(p.attributes_extracted AS VARCHAR) AS attributes_extracted,
+            CAST(ps.price AS DOUBLE)             AS price,
+            CAST(ps.compare_at_price AS DOUBLE)  AS compare_at_price,
+            CAST(ps.discount_pct AS DOUBLE)      AS discount_pct,
+            CAST(ps.snapshot_date AS VARCHAR)    AS snapshot_date,
+            CAST(ps.recorded_at AS VARCHAR)      AS recorded_at
+        FROM pg.public.price_snapshots ps
+        LEFT JOIN pg.public.products         p  ON p.id  = ps.product_id
+        LEFT JOIN pg.public.product_variants pv ON pv.id = ps.variant_id
+    """)
+    _HOT_READY = True
+    return con.execute("SELECT count(*) FROM hot_raw").fetchone()[0]
+
+
+def prefetch(con):
+    """
+    Call once, immediately after connect(), before computing anything.
+
+    Optional — snapshots() will materialise on demand if this was skipped — but
+    calling it explicitly makes the single Postgres read visible in the log
+    rather than hidden inside the first signal's timing.
+    """
+    n = materialise_hot(con)
+    print(f"  📥 Hot tier materialised once: {n:,} rows. "
+          f"Supabase will not be read again this run.")
+    return n
+
+
 def _day_files(con, start_day, end_day):
     """
     The day-files that actually exist in the lake for [start_day, end_day].
 
-    We list the bucket and filter by NAME rather than handing DuckDB a wildcard.
-    Two reasons: a wildcard over a growing lake gets slower every month, and a
-    missing day (a brand outage, a failed archive) would otherwise raise instead
-    of simply being absent. Absent days are a fact about the data, not an error.
+    We filter by NAME rather than handing DuckDB a wildcard. Two reasons: a
+    wildcard over a growing lake gets slower every month, and a missing day (a
+    brand outage, a failed archive) would otherwise raise instead of simply
+    being absent. Absent days are a fact about the data, not an error.
     """
-    rows = con.execute(f"""
-        SELECT file FROM glob('s3://{R2_BUCKET_NAME}/{LAKE_PREFIX}/*.parquet')
-    """).fetchall()
+    rows = _lake_files(con)
 
     wanted = []
     for (path,) in rows:
@@ -144,6 +254,9 @@ def snapshots(con, days=30, end_day=None):
     """
     end_day   = end_day or date.today()
     start_day = end_day - timedelta(days=days - 1)
+
+    # One Postgres read per process. No-op on every call after the first.
+    materialise_hot(con)
 
     files = _day_files(con, start_day, end_day)
 
@@ -174,31 +287,18 @@ def snapshots(con, days=30, end_day=None):
             WHERE FALSE
         """
 
-    # The hot half, widened to the same shape as the lake so the two can union.
-    # (The lake is pre-flattened; Supabase still has the joins to do.)
+    # The hot half — now read from the LOCAL materialised copy, not Postgres.
+    # The window filter is applied here rather than in the pull, so narrowing
+    # the lookback is free and never costs another round trip to Supabase.
     hot_sql = f"""
         SELECT
-            ps.id                     AS snapshot_id,
-            ps.product_id             AS product_id,
-            ps.variant_id             AS variant_id,
-            ps.brand                  AS brand,
-            p.name                    AS product_name,
-            p.category_normalized     AS category_normalized,
-            p.category_raw            AS category_raw,
-            p.gender                  AS gender,
-            pv.size                   AS size,
-            pv.color                  AS color,
-            CAST(p.attributes_extracted AS VARCHAR) AS attributes_extracted,
-            CAST(ps.price AS DOUBLE)             AS price,
-            CAST(ps.compare_at_price AS DOUBLE)  AS compare_at_price,
-            CAST(ps.discount_pct AS DOUBLE)      AS discount_pct,
-            CAST(ps.snapshot_date AS VARCHAR)    AS snapshot_date,
-            CAST(ps.recorded_at AS VARCHAR)      AS recorded_at
-        FROM pg.public.price_snapshots ps
-        LEFT JOIN pg.public.products         p  ON p.id  = ps.product_id
-        LEFT JOIN pg.public.product_variants pv ON pv.id = ps.variant_id
-        WHERE ps.snapshot_date >= DATE '{start_day}'
-          AND ps.snapshot_date <= DATE '{end_day}'
+            snapshot_id, product_id, variant_id, brand, product_name,
+            category_normalized, category_raw, gender, size, color,
+            attributes_extracted, price, compare_at_price, discount_pct,
+            snapshot_date, recorded_at
+        FROM hot_raw
+        WHERE CAST(snapshot_date AS DATE) >= DATE '{start_day}'
+          AND CAST(snapshot_date AS DATE) <= DATE '{end_day}'
     """
 
     # THE OVERLAP RULE (see module docstring): a day can exist in both tiers.
@@ -255,8 +355,16 @@ def variant_baselines(con):
     their variants; the rest genuinely differ. Any signal that collapses them
     must state its rule explicitly rather than picking one silently.
     """
+    # A TABLE, not a view — for the same reason as hot_raw. product_variants is
+    # ~481K rows; any signal referencing this view more than once would have
+    # pulled all of them from Postgres each time.
+    global _BASELINES_READY
+    if _BASELINES_READY:
+        return con.execute("SELECT count(*) FROM variant_baselines").fetchone()[0]
+
+    con.execute("DROP TABLE IF EXISTS variant_baselines")
     con.execute("""
-        CREATE OR REPLACE VIEW variant_baselines AS
+        CREATE TABLE variant_baselines AS
         SELECT
             pv.id                   AS variant_id,
             pv.product_id           AS product_id,
@@ -271,6 +379,7 @@ def variant_baselines(con):
         WHERE p.is_active = TRUE
           AND pv.delisted_at IS NULL
     """)
+    _BASELINES_READY = True
     return con.execute("SELECT count(*) FROM variant_baselines").fetchone()[0]
 
 
