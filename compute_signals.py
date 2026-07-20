@@ -259,6 +259,21 @@ if __name__ == "__main__":
     # re-point a view at local data instead of re-reading the database.
     khabar_lake.prefetch(con)
 
+    # Inventory transitions, materialised once, witnessed-only by default.
+    #
+    # Separate from prefetch() because it reads a different table entirely
+    # (stockout_events, not price_snapshots) and because the witnessed filter
+    # is applied HERE rather than in each signal's SQL. 57,171 of 85,205 raw
+    # events are collection artefacts -- orphan restocks, delist cycles,
+    # duplicate transitions -- and a signal that forgot the filter would look
+    # like it was working while overstating sellout volume by roughly 3x.
+    #
+    # Cheap and guarded: one read per process regardless of how many signals
+    # use it. Signals that never touch stock_events pay for it once and ignore
+    # it, which is a better trade than each of them re-querying Postgres.
+    n_events = khabar_lake.stockout_events(con)
+    print(f"  📦 Stock events materialised: {n_events:,} witnessed transitions.")
+
     pg  = psycopg2.connect(SUPABASE_DB_URL)
 
     tally = {"ok": 0, "skipped": 0, "failed": 0}
