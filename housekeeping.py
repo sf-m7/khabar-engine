@@ -549,6 +549,32 @@ def main():
     except Exception as e:
         print(f"  ❌ witnessed reclassification crashed: {e}")
         failures.append("reclassify_stockout_events")
+
+# Task 8 — department fallback fill.
+#
+# `department` is stamped by the separate taxonomy job, which pattern-matches
+# the product TITLE against category_map. That matcher is authoritative and is
+# NOT touched here — it reads the full title and can make calls this fallback
+# cannot (sleepwear shorts belong in sleepwear_homewear, not bottoms).
+#
+# But when no pattern matches the title, it leaves department NULL — even when
+# category_normalized is already a perfectly good answer. That gap was 21,162
+# products (30.6% of catalog) as of July 2026, and it silently dropped a third
+# of every cross-brand category comparison, which is the core sellable claim.
+#
+# This fills ONLY those NULLs, from category_normalized, and never overwrites a
+# value the matcher set. 'uncategorized' and 'other' are deliberately absent
+# from category_department_map so they stay NULL — a named gap, not a guess.
+    try:
+        res = safe_db_execute(supabase.rpc("backfill_departments", {}))
+        rows = (res.data or []) if res else []
+        if rows:
+            r = rows[0]
+            print(f"  Departments filled: {r['filled']} "
+                  f"(still NULL: {r['still_null']} — genuinely uncategorized)")
+    except Exception as e:
+        print(f"  ❌ department backfill crashed: {e}")
+        failures.append("backfill_departments")
     
     
     if failures:
