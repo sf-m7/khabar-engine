@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# KHABAR — Scraper v14  (current: v14.41)
+# KHABAR — Scraper v14  (current: v14.43)
 # Built on v13. Changes:
 #  v14.1  DeFacto integration via PartialIndexScrollResult API
 #         No proxy required — plain GET, follows NextDataUrl chain
@@ -1284,23 +1284,9 @@ def product_repr_price(records):
     return prices[len(prices) // 2] if prices else None
 
 def product_repr_baseline(records):
-    """
-    Product-level honest baseline = MIN of variant baselines.
-
-    v14.41: was MEDIAN. Changed to MIN so the scraper, the lake
-    (khabar_lake.product_baselines) and the registry (L1-01, L1-17) all
-    compute the same number. They disagreed on 33% of DeFacto products,
-    23% of Town Team and 13% of Khotwh — by an average of 358 EGP on
-    DeFacto — which meant a discount quoted from price_snapshots did not
-    match the same product's discount in a signal.
-
-    MIN, not median or max, because it yields the SMALLEST possible
-    discount. A product sold on the honesty of its baseline must never
-    round in its own favour. Same rule as L1-01's collapse rule, kept
-    identical on purpose.
-    """
-    bases = [r["_meta_baseline"] for r in records if r.get("_meta_baseline")]
-    return min(bases) if bases else None
+    """Representative first_observed_price for a product = median of variant baselines."""
+    bases = sorted(r["_meta_baseline"] for r in records if r.get("_meta_baseline"))
+    return bases[len(bases) // 2] if bases else None
 
 def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_ids):
     rows = []
@@ -1312,44 +1298,19 @@ def build_snapshot_rows(brand_name, product_variant_tracking, today, existing_id
         if median_price is None:
             continue
         vd = records[0]
-        # v14.40: discount_pct is now WRITTEN, not left NULL.
-        #
-        # It was never populated by this function — all 455,947 live rows had
-        # discount_pct = NULL, so anything reading the column directly got
-        # nothing back.
-        #
-        # The baseline is product_repr_baseline() (first_observed_price), NOT
-        # compare_at_price. This is the core honest-discount invariant: a
-        # brand can set compare_at to anything it likes, so a product parked
-        # at 499 with compare_at 799 would otherwise read as a permanent 37%
-        # discount that never happened. Measuring against the first price WE
-        # observed makes the number brand-proof. compare_at_price is still
-        # stored alongside — it is evidence of the CLAIMED discount, useful
-        # for the Anchor Inflation signal, but never the baseline.
-        #
-        # NULL is preserved (not zeroed) when there is no baseline or the
-        # price is at/above it: "no discount" and "cannot compute" stay
-        # distinguishable.
-        baseline = product_repr_baseline(records)
-        discount_pct = (
-            round(((baseline - median_price) / baseline) * 100, 2)
-            if (baseline and baseline > 0 and median_price < baseline)
-            else None
-        )
         rows.append({
             "product_id":       db_pid,
             "variant_id":       None,
             "brand":            brand_name,
             "price":            median_price,
             "compare_at_price": vd.get("_meta_compare"),
-            "discount_pct":     discount_pct,
             "snapshot_date":    str(today),
             "recorded_at":      now_iso,
         })
         existing_ids.add(db_pid)
     return rows
 
-def sync_snapshot_price(supabase, db_pid, today, price, baseline=None):
+def sync_snapshot_price(supabase, db_pid, today, price):
     """
     Keep today's snapshot equal to the latest detected price (v14.10).
     Snapshots are written once per product per day (first observation). For
@@ -1362,48 +1323,15 @@ def sync_snapshot_price(supabase, db_pid, today, price, baseline=None):
     This is ALSO what makes "the last run of the day = the day's close": whichever
     run touches a product last writes the price the weekly aggregation rolls up.
     """
-    # v14.40: discount_pct must move WITH the price. Updating price alone left
-    # the snapshot internally inconsistent for the rest of the day -- a new
-    # price against a discount_pct computed from the earlier one. Baseline is
-    # first_observed_price, same invariant as build_snapshot_rows().
-    payload = {"price": price}
-    if baseline and baseline > 0:
-        payload["discount_pct"] = (
-            round(((baseline - price) / baseline) * 100, 2) if price < baseline else None
-        )
     safe_db_execute(
         supabase.table("price_snapshots")
-        .update(payload)
+        .update({"price": price})
         .eq("product_id", db_pid)
         .eq("snapshot_date", str(today))
     )
 
 def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
                                size, color, prev_stock, curr_stock, curr_price, baseline):
-    # ── v14.40 GUARD: unknown stock state is never a transition ──────────────
-    #
-    # is_in_stock is now THREE-valued: True / False = directly observed,
-    # NULL = the brand's source does not expose stock at this grain. Two
-    # brands are permanently NULL on their size-suffixed child rows:
-    #
-    #   DeFacto  — CombinProductListByProductLongCode returns StockQuantity
-    #              = null for every size (see fetch_defacto_sizes_batch).
-    #   LCW      — the ld+json Product block carries no per-size stock since
-    #              cartOperationViewModel moved off-page in June 2026 (see
-    #              the parser's "stock": None at the top of this file).
-    #
-    # 120,589 variant rows across those two brands are NULL. Without this
-    # guard, Python evaluates `None == False` as False, so the function would
-    # treat every NULL as a state change; and because `None` is falsy,
-    # `"stockout" if (prev_stock and not curr_stock)` resolves to the else
-    # branch — manufacturing a phantom RESTOCK on all 120,589 rows on the
-    # very next run. That is the exact failure mode the delist_cycle fix in
-    # housekeeping.py just eliminated, so re-introducing it here would undo
-    # that work at ~100x the scale.
-    #
-    # Unknown is not a state. It is the absence of one. Return.
-    if prev_stock is None or curr_stock is None:
-        return
     if prev_stock == curr_stock: return
     event_type   = "stockout" if (prev_stock and not curr_stock) else "restock"
     discount_pct = round(((baseline - curr_price) / baseline) * 100, 2) if (baseline and curr_price < baseline) else None
@@ -1418,20 +1346,6 @@ def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
         "discount_pct_at_event": discount_pct,
         "was_on_discount":      bool(discount_pct),
         "recorded_at":          datetime.now(timezone.utc).isoformat(),
-        # v14.40 — PROVISIONAL classification. Reaching this line means both
-        # endpoints of the transition were directly observed booleans for
-        # THIS exact variant, which is the strongest claim the scraper can
-        # make from in-memory state alone.
-        #
-        # It is provisional because two of the four unwitnessed categories
-        # need event HISTORY to detect, which the scraper does not hold:
-        #   orphan_restock       — restock with no prior stockout on record
-        #   duplicate_transition — same event type twice in a row
-        # Both are demoted to witnessed=false by the daily reclassifier
-        # (reclassify_stockout_events), which is the single authority on
-        # the final value. Never read `witnessed` for a signal without
-        # confirming the reclassifier has run past that row's recorded_at.
-        "witnessed":            True,
     }))
 
 # ── Color-from-title extraction (Tree, Cizaro) — v14.19 addition ────────────
@@ -2457,7 +2371,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                         "recorded_at":   datetime.now(timezone.utc).isoformat(),
                     }))
                     prev_prices[db_pid] = curr_price
-                    sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
+                    sync_snapshot_price(supabase, db_pid, today, curr_price)
 
         print(f"  Page {page} — {len(batch_products)} products processed.")
         time.sleep(1)
@@ -2895,7 +2809,7 @@ def _lcw_finalise(supabase, session, brand_name, domain, today,
             "recorded_at":      datetime.now(timezone.utc).isoformat(),
         }))
         prev_prices[db_pid] = curr_price
-        sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
+        sync_snapshot_price(supabase, db_pid, today, curr_price)
     return products_seen, price_changes
 
 
@@ -3002,9 +2916,22 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     if done_categories:
         print(f"  [LCW] Checkpoint: {len(done_categories)}/{len(LCW_CATEGORIES)} "
               f"categories already complete today — resuming with the rest.")
+    # v14.42: do NOT return early here. Each category skips itself below when
+    # already complete, so the loop costs nothing — and letting execution fall
+    # through means the hourly runs still reach the size-enrichment pass at the
+    # end of this function. That turns the spare runs into an automatic size
+    # backfill (~150 URLs per run against the 5,200-URL backlog) instead of
+    # exiting in three seconds having done nothing. v14.41 returned here and
+    # silently gave the size pass exactly one shot per day.
     if LCW_CHECKPOINT and len(done_categories) >= len(LCW_CATEGORIES):
-        print("  [LCW] All categories already scraped today. Nothing to do.")
-        return products_seen, price_changes
+        print("  [LCW] All categories already scraped today — skipping the "
+              "catalog crawl and going straight to the size pass.")
+
+    # v14.43: how many categories this run actually attempted. If zero, the
+    # run is a pure retry no-op (everything was already done by an earlier
+    # run today) and must NOT fall through to the size pass — that would burn
+    # ~10 minutes of proxy bandwidth per retry attempt for no reason.
+    categories_crawled = 0
 
     for cat in LCW_CATEGORIES:
         cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
@@ -3012,6 +2939,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
         if cat_id in done_categories:
             print(f"  [{cat_name}] Already complete today — skipping.")
             continue
+        categories_crawled += 1
 
         # v14.41: buffer this category's records. They are merged into the
         # run-wide set ONLY if every page succeeded, so a partial category
@@ -3303,6 +3231,15 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
         lcw_model_records, lcw_model_info, prev_prices,
         existing_snapshot_ids, products_seen, price_changes)
 
+    # ── v14.43: skip the size pass on pure retry no-ops ──────────────────────
+    # A scheduled retry that finds the day already complete should cost one
+    # database read and nothing else. Only run the size pass when this run
+    # actually did catalog work.
+    if LCW_CHECKPOINT and categories_crawled == 0:
+        print("  [LCW] Nothing crawled this run (day already complete) — "
+              "skipping the size pass. Exiting.")
+        return products_seen, price_changes
+
     # ── LCW size enrichment pass (rewritten v14.6) ────────────────────────────
     # Bandwidth math:
     #   - Pages return ~60 KB gzipped (server gzip enabled, verified 9 Jun 2026)
@@ -3411,23 +3348,15 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 # If both are missing, leave it NULL (better than guessing).
                 color        = row.get("color") or page_color
                 fop          = row.get("first_observed_price") or prev_prices.get(product_id)
-                # v14.40: parent_stock read REMOVED. It existed solely as the
-                # fallback for a size with no stock count of its own — the
-                # fallback that fabricated per-size state. Nothing reads it
-                # now. Deleted rather than left dangling so a future edit
-                # cannot quietly reintroduce the inheritance.
+                # v14.22 FIX 1: parent_stock is STILL read here (used as the
+                # fallback for a size whose own stock count is missing — see
+                # size_in_stock below), but it is NEVER written back onto the
+                # parent row anymore. It only ever flows into CHILD rows now.
+                parent_stock = row.get("is_in_stock", True)
 
                 for i, sz in enumerate(sizes):
-                    # v14.40: per-size stock is either REAL or UNKNOWN — never
-                    # inherited. The old fallback to parent_stock copied the
-                    # colour-wide aggregate onto every size, fabricating a
-                    # per-size observation that LCW has not published since
-                    # cartOperationViewModel moved off-page (the ld+json parser
-                    # hard-codes "stock": None, so this fallback fired on 100%
-                    # of rows — 91,306 of them). Writing None instead makes the
-                    # absence explicit and is caught by the guard at the top of
-                    # detect_and_write_stockout().
-                    size_in_stock = (sz.get("stock") > 0) if sz.get("stock") is not None else None
+                    # Use the API's per-size stock when available; fall back to parent_stock
+                    size_in_stock = (sz.get("stock", 0) > 0) if sz.get("stock") is not None else parent_stock
                     size_value    = sz["size"]
 
                     if i == 0:
@@ -3531,15 +3460,11 @@ def fetch_defacto_sizes_batch(session, domain, long_codes):
                 continue
             # Use the outer Sizes array (has SizeName), stock inherited from Stock field
             raw_sizes = item.get("Sizes") or (item.get("DataLayer") or {}).get("Sizes") or []
-            # v14.40: DeFacto returns StockQuantity = null for every size — the
-            # API simply does not publish stock at size grain. The old code set
-            # each size's is_in_stock to the PRODUCT-level Stock > 0, copying one
-            # aggregate onto every size and presenting it as a per-size
-            # observation (29,283 rows). is_in_stock is now three-valued, so the
-            # honest value is None = unknown. The colour-level parent row keeps
-            # its real aggregate; only these child rows go NULL.
+            stock_total = int(item.get("ProductVariantMiniProductStock") or
+                              (item.get("DataLayer") or {}).get("Stock") or 0)
+            is_avail = stock_total > 0
             result[lc] = [
-                {"size": sz["SizeName"], "is_in_stock": None}
+                {"size": sz["SizeName"], "is_in_stock": is_avail}
                 for sz in raw_sizes if sz.get("SizeName")
             ]
         return result
@@ -3910,7 +3835,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                             "recorded_at":      datetime.now(timezone.utc).isoformat(),
                         }))
                         prev_prices[db_pid] = curr_price
-                        sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
+                        sync_snapshot_price(supabase, db_pid, today, curr_price)
 
             print(f"  [{cat_name}] Page {page_index} — {len(items)} items processed.")
 
@@ -4545,7 +4470,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                             "recorded_at":      datetime.now(timezone.utc).isoformat(),
                         }))
                         prev_prices[db_pid] = curr_price
-                        sync_snapshot_price(supabase, db_pid, today, curr_price, v_base)
+                        sync_snapshot_price(supabase, db_pid, today, curr_price)
                 except Exception as e:
                     print(f"  ⚠️ [WooCommerce] Skipping product db_pid={db_pid} during detection: {e}")
                     traceback.print_exc()
