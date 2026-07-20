@@ -340,14 +340,43 @@ def delist_stale_products():
             "discount_pct_at_event": None,
             "was_on_discount":       False,
             "recorded_at":           now_iso,
+            # v14.40 — delist is a lifecycle event, not a stock transition.
+            # `witnessed` is deliberately left NULL: forcing these rows into
+            # a witnessed/unwitnessed frame would overclaim. L1-13 (Product
+            # Delisted) filters on event_type instead. seed_reason is stamped
+            # so no row in this table is ever left unclassified.
+            "seed_reason":           "not_a_stock_transition",
         } for v in vrows]
         for i in range(0, len(event_rows), 100):
             safe_db_execute(supabase.table("stockout_events").insert(event_rows[i:i + 100]))
 
         vids = [v["id"] for v in vrows]
+        # v14.40 FIX — `is_in_stock: False` REMOVED from this payload.
+        #
+        # WHY THIS WAS WRONG: delisting means "we stopped seeing this variant
+        # in the catalog", which is NOT an observation that it went out of
+        # stock. Writing False here put an unobserved value into the exact
+        # field that detect_and_write_stockout() reads as its `prev_stock`
+        # baseline on the next run — WITHOUT writing a corresponding
+        # stockout_event. When the variant later reappeared in the catalog,
+        # the scraper compared real stock (True) against that fabricated
+        # False and logged a "restock" for a sellout that never happened.
+        #
+        # Confirmed live: 100% of DeFacto's out-of-stock variants (1,100 of
+        # 1,100) were delisted rows with zero fresh observations, and 100%
+        # of DeFacto's 130 restock events were phantoms produced this way —
+        # against 0 stockouts ever recorded. 1,405 events across all brands
+        # were classified `delist_cycle` by the retroactive witnessed-flag
+        # pass and are permanently excluded from inventory signals.
+        #
+        # SAFE TO REMOVE: nothing depends on this write. The canonical
+        # active-variant filter is `p.is_active = true AND
+        # pv.delisted_at IS NULL`, which already excludes these rows. The
+        # is_in_stock value simply becomes what it should always have been:
+        # the last genuinely observed state, frozen at delist time.
         safe_db_execute(
             supabase.table("product_variants")
-            .update({"delisted_at": now_iso, "is_in_stock": False})
+            .update({"delisted_at": now_iso})
             .in_("id", vids)
         )
         total_variants += len(vids)
@@ -486,6 +515,40 @@ def main():
     except Exception as e:
         print(f"  ❌ weekly_bestseller_summary task crashed: {e}")
         failures.append("weekly_bestseller_summary")
+
+# Task 7 — stockout_events witnessed reclassification.
+#
+# The scraper writes `witnessed = true` provisionally on every new event: at
+# insert time it can prove both endpoints of the transition were directly
+# observed booleans for that variant, but it holds no event HISTORY, so it
+# cannot see the two failure modes that only appear in sequence:
+#
+#   orphan_restock       — a restock with no stockout ever recorded before it.
+#                          The interval it implies is meaningless because we
+#                          never witnessed the sellout it supposedly ends.
+#                          Historically 69% of all restock volume.
+#   duplicate_transition — the same event type twice in a row for one variant.
+#
+# This task re-judges every event in the recent window against that variant's
+# FULL history and demotes the ones that don't hold up. It runs AFTER Task 4
+# so it sees the delist events written this run.
+#
+# Idempotent: re-running over the same window produces identical results, so a
+# missed week is harmless as long as lookback_days covers the gap. Default 3
+# gives two days of slack against the daily schedule.
+    try:
+        res = safe_db_execute(
+            supabase.rpc("reclassify_stockout_events", {"lookback_days": 3})
+        )
+        rows = (res.data or []) if res else []
+        if rows:
+            summary = ", ".join(f"{r['reason']}={r['rows_changed']}" for r in rows)
+            print(f"  Reclassified stockout_events — {summary}")
+        else:
+            print("  Reclassifier ran — no events in window.")
+    except Exception as e:
+        print(f"  ❌ witnessed reclassification crashed: {e}")
+        failures.append("reclassify_stockout_events")
     
     
     if failures:
