@@ -471,7 +471,8 @@ def stockout_events(con, witnessed_only=True):
                se.witnessed, se.seed_reason,
                se.recorded_at,
                CAST(se.recorded_at AS DATE) AS event_date,
-               p.category_normalized, p.department, p.gender, p.product_name
+               p.category_normalized, p.department, p.gender,
+               p.name AS product_name
         FROM pg.public.stockout_events se
         JOIN pg.public.products p ON p.id = se.product_id
         WHERE se.event_type IN ('stockout','restock') {where}
