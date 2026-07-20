@@ -1332,6 +1332,30 @@ def sync_snapshot_price(supabase, db_pid, today, price):
 
 def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
                                size, color, prev_stock, curr_stock, curr_price, baseline):
+    # ── v14.40 GUARD: unknown stock state is never a transition ──────────────
+    #
+    # is_in_stock is now THREE-valued: True / False = directly observed,
+    # NULL = the brand's source does not expose stock at this grain. Two
+    # brands are permanently NULL on their size-suffixed child rows:
+    #
+    #   DeFacto  — CombinProductListByProductLongCode returns StockQuantity
+    #              = null for every size (see fetch_defacto_sizes_batch).
+    #   LCW      — the ld+json Product block carries no per-size stock since
+    #              cartOperationViewModel moved off-page in June 2026 (see
+    #              the parser's "stock": None at the top of this file).
+    #
+    # 120,589 variant rows across those two brands are NULL. Without this
+    # guard, Python evaluates `None == False` as False, so the function would
+    # treat every NULL as a state change; and because `None` is falsy,
+    # `"stockout" if (prev_stock and not curr_stock)` resolves to the else
+    # branch — manufacturing a phantom RESTOCK on all 120,589 rows on the
+    # very next run. That is the exact failure mode the delist_cycle fix in
+    # housekeeping.py just eliminated, so re-introducing it here would undo
+    # that work at ~100x the scale.
+    #
+    # Unknown is not a state. It is the absence of one. Return.
+    if prev_stock is None or curr_stock is None:
+        return
     if prev_stock == curr_stock: return
     event_type   = "stockout" if (prev_stock and not curr_stock) else "restock"
     discount_pct = round(((baseline - curr_price) / baseline) * 100, 2) if (baseline and curr_price < baseline) else None
@@ -1346,6 +1370,20 @@ def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
         "discount_pct_at_event": discount_pct,
         "was_on_discount":      bool(discount_pct),
         "recorded_at":          datetime.now(timezone.utc).isoformat(),
+        # v14.40 — PROVISIONAL classification. Reaching this line means both
+        # endpoints of the transition were directly observed booleans for
+        # THIS exact variant, which is the strongest claim the scraper can
+        # make from in-memory state alone.
+        #
+        # It is provisional because two of the four unwitnessed categories
+        # need event HISTORY to detect, which the scraper does not hold:
+        #   orphan_restock       — restock with no prior stockout on record
+        #   duplicate_transition — same event type twice in a row
+        # Both are demoted to witnessed=false by the daily reclassifier
+        # (reclassify_stockout_events), which is the single authority on
+        # the final value. Never read `witnessed` for a signal without
+        # confirming the reclassifier has run past that row's recorded_at.
+        "witnessed":            True,
     }))
 
 # ── Color-from-title extraction (Tree, Cizaro) — v14.19 addition ────────────
@@ -3325,15 +3363,23 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 # If both are missing, leave it NULL (better than guessing).
                 color        = row.get("color") or page_color
                 fop          = row.get("first_observed_price") or prev_prices.get(product_id)
-                # v14.22 FIX 1: parent_stock is STILL read here (used as the
-                # fallback for a size whose own stock count is missing — see
-                # size_in_stock below), but it is NEVER written back onto the
-                # parent row anymore. It only ever flows into CHILD rows now.
-                parent_stock = row.get("is_in_stock", True)
+                # v14.40: parent_stock read REMOVED. It existed solely as the
+                # fallback for a size with no stock count of its own — the
+                # fallback that fabricated per-size state. Nothing reads it
+                # now. Deleted rather than left dangling so a future edit
+                # cannot quietly reintroduce the inheritance.
 
                 for i, sz in enumerate(sizes):
-                    # Use the API's per-size stock when available; fall back to parent_stock
-                    size_in_stock = (sz.get("stock", 0) > 0) if sz.get("stock") is not None else parent_stock
+                    # v14.40: per-size stock is either REAL or UNKNOWN — never
+                    # inherited. The old fallback to parent_stock copied the
+                    # colour-wide aggregate onto every size, fabricating a
+                    # per-size observation that LCW has not published since
+                    # cartOperationViewModel moved off-page (the ld+json parser
+                    # hard-codes "stock": None, so this fallback fired on 100%
+                    # of rows — 91,306 of them). Writing None instead makes the
+                    # absence explicit and is caught by the guard at the top of
+                    # detect_and_write_stockout().
+                    size_in_stock = (sz.get("stock") > 0) if sz.get("stock") is not None else None
                     size_value    = sz["size"]
 
                     if i == 0:
@@ -3437,11 +3483,15 @@ def fetch_defacto_sizes_batch(session, domain, long_codes):
                 continue
             # Use the outer Sizes array (has SizeName), stock inherited from Stock field
             raw_sizes = item.get("Sizes") or (item.get("DataLayer") or {}).get("Sizes") or []
-            stock_total = int(item.get("ProductVariantMiniProductStock") or
-                              (item.get("DataLayer") or {}).get("Stock") or 0)
-            is_avail = stock_total > 0
+            # v14.40: DeFacto returns StockQuantity = null for every size — the
+            # API simply does not publish stock at size grain. The old code set
+            # each size's is_in_stock to the PRODUCT-level Stock > 0, copying one
+            # aggregate onto every size and presenting it as a per-size
+            # observation (29,283 rows). is_in_stock is now three-valued, so the
+            # honest value is None = unknown. The colour-level parent row keeps
+            # its real aggregate; only these child rows go NULL.
             result[lc] = [
-                {"size": sz["SizeName"], "is_in_stock": is_avail}
+                {"size": sz["SizeName"], "is_in_stock": None}
                 for sz in raw_sizes if sz.get("SizeName")
             ]
         return result
