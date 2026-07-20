@@ -514,15 +514,150 @@ ORDER BY a.last_depth_pct DESC
     # -------------------------------------------------------------------------
     {
         "id": "l1_08", "name": "Variant Stockout", "level": "L1",
-        "enabled": True, "requires": ["seeded_stockout"],
-        "table": None, "window_days": 30, "min_days": 14,
-        "unique_on": [], "sql": None, "suppressed_sql": None,
+        "enabled": True, "requires": [],
+        "table": "signal_l1_08_variant_stockout",
+        "window_days": 30, "min_days": 14,
+        "unique_on": ["snapshot_date", "brand", "category_normalized", "gender"],
+        # WITNESSED ONLY. khabar_lake.stockout_events() already filters to
+        # witnessed=TRUE before this SQL sees a row, so there is no filter here
+        # to forget. 57,171 of 85,205 raw events are collection artefacts, not
+        # market behaviour; counting them would inflate sellout volume most for
+        # the brands with the shortest history.
+        #
+        # COVERAGE IS NOT 22 BRANDS. DeFacto contributes ZERO stockouts (its
+        # catalogue never reports out-of-stock -- items are delisted instead)
+        # and LC Waikiki contributes ~124 (colour-grain only; it publishes no
+        # per-size stock). Any client-facing use of this signal must name the
+        # brands covered rather than implying a market-wide view.
+        "sql": """
+            WITH ev AS (
+                SELECT * FROM stock_events
+                WHERE event_type = 'stockout'
+                  AND event_date > CURRENT_DATE - {window_days}
+            )
+            SELECT
+                CURRENT_DATE                              AS snapshot_date,
+                brand,
+                COALESCE(category_normalized, 'uncategorized') AS category_normalized,
+                COALESCE(gender, 'unknown')               AS gender,
+                COUNT(*)                                  AS stockout_events,
+                COUNT(DISTINCT variant_id)                AS variants_affected,
+                COUNT(DISTINCT product_id)                AS products_affected,
+                COUNT(*) FILTER (WHERE was_on_discount)   AS on_discount_events,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE was_on_discount)
+                      / NULLIF(COUNT(*), 0), 2)           AS on_discount_pct,
+                COUNT(DISTINCT event_date)                AS observed_days,
+                {window_days}                             AS window_days
+            FROM ev
+            GROUP BY brand, COALESCE(category_normalized, 'uncategorized'),
+                     COALESCE(gender, 'unknown')
+            HAVING COUNT(*) >= 3
+            ORDER BY stockout_events DESC
+        """,
+        # Groups withheld for thin volume. Reporting this is the difference
+        # between "this category had no sellouts" and "too few to be meaningful".
+        "suppressed_sql": """
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM stock_events
+                WHERE event_type = 'stockout'
+                  AND event_date > CURRENT_DATE - {window_days}
+                GROUP BY brand, COALESCE(category_normalized, 'uncategorized'),
+                         COALESCE(gender, 'unknown')
+                HAVING COUNT(*) < 3
+            )
+        """,
     },
     {
         "id": "l1_09", "name": "Variant Restock", "level": "L1",
-        "enabled": True, "requires": ["seeded_stockout"],
-        "table": None, "window_days": 30, "min_days": 14,
-        "unique_on": [], "sql": None, "suppressed_sql": None,
+        "enabled": True, "requires": [],
+        "table": "signal_l1_09_variant_restock",
+        "window_days": 30, "min_days": 14,
+        "unique_on": ["snapshot_date", "brand", "category_normalized"],
+        # ====================================================================
+        # THE CENSORING PROBLEM — read before using this signal for anything.
+        #
+        # Only ~30% of witnessed stockouts have restocked yet (6,523 of 21,395
+        # as of 2026-07-20). The other 70% are still out of stock. A variant
+        # that sells out on the 18th and restocks 20 days later is INVISIBLE
+        # in a 22-day window -- so any average computed from closed pairs
+        # alone is biased DOWNWARD, and biased worst for the SLOWEST brands,
+        # because their slow restocks are exactly the ones that fall outside
+        # the window.
+        #
+        # That is the inverse of what a Supply Chain Stress Index is supposed
+        # to say. Publishing median_restock_days on its own would make the
+        # most stressed supply chains look the healthiest.
+        #
+        # The mitigation is structural, not cosmetic: every row carries
+        # closed_pairs, open_stockouts and completion_rate_pct alongside the
+        # median. A brand with a 2-day median and 25% completion is NOT
+        # faster than one with a 5-day median and 90% completion — it is
+        # slower, and the completion rate is what reveals it.
+        #
+        # This resolves properly once the window exceeds typical restock
+        # time. Revisit the interpretation, not the SQL, at ~90 days.
+        # ====================================================================
+        "sql": """
+            WITH seq AS (
+                SELECT variant_id, product_id, brand, category_normalized,
+                       event_type, recorded_at,
+                       LEAD(event_type)  OVER (PARTITION BY variant_id
+                                               ORDER BY recorded_at) AS nxt,
+                       LEAD(recorded_at) OVER (PARTITION BY variant_id
+                                               ORDER BY recorded_at) AS nxt_at
+                FROM stock_events
+            ),
+            stockouts AS (
+                SELECT brand,
+                       COALESCE(category_normalized, 'uncategorized') AS cat,
+                       recorded_at,
+                       CASE WHEN nxt = 'restock'
+                            THEN DATE_DIFF('second', recorded_at, nxt_at) / 86400.0
+                       END AS restock_days
+                FROM seq
+                WHERE event_type = 'stockout'
+                  AND CAST(recorded_at AS DATE) > CURRENT_DATE - {window_days}
+            )
+            SELECT
+                CURRENT_DATE AS snapshot_date,
+                brand,
+                cat AS category_normalized,
+                COUNT(*) FILTER (WHERE restock_days IS NOT NULL) AS closed_pairs,
+                COUNT(*) FILTER (WHERE restock_days IS NULL)     AS open_stockouts,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE restock_days IS NOT NULL)
+                      / NULLIF(COUNT(*), 0), 2)                  AS completion_rate_pct,
+                -- Median, not mean: restock times are right-skewed, and one
+                -- variant restocked after three weeks would drag a mean well
+                -- past anything a buyer would recognise.
+                ROUND(MEDIAN(restock_days), 2)                   AS median_restock_days,
+                ROUND(QUANTILE_CONT(restock_days, 0.25), 2)      AS p25_restock_days,
+                ROUND(QUANTILE_CONT(restock_days, 0.75), 2)      AS p75_restock_days,
+                ROUND(MIN(restock_days), 2)                      AS fastest_restock_days,
+                COUNT(DISTINCT CAST(recorded_at AS DATE))        AS observed_days,
+                {window_days}                                    AS window_days
+            FROM stockouts
+            GROUP BY brand, cat
+            HAVING COUNT(*) FILTER (WHERE restock_days IS NOT NULL) >= 5
+            ORDER BY closed_pairs DESC
+        """,
+        # Groups with fewer than 5 completed pairs are withheld: a median over
+        # 2 or 3 observations is not a median, it is an anecdote.
+        "suppressed_sql": """
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM (
+                    SELECT variant_id, brand, category_normalized, event_type,
+                           recorded_at,
+                           LEAD(event_type) OVER (PARTITION BY variant_id
+                                                  ORDER BY recorded_at) AS nxt
+                    FROM stock_events
+                ) s
+                WHERE s.event_type = 'stockout'
+                  AND CAST(s.recorded_at AS DATE) > CURRENT_DATE - {window_days}
+                GROUP BY s.brand, COALESCE(s.category_normalized, 'uncategorized')
+                HAVING COUNT(*) FILTER (WHERE s.nxt = 'restock') < 5
+            )
+        """,
     },
     {
         "id": "l1_02", "name": "Intraday Flash Sale", "level": "L1",
