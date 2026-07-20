@@ -534,11 +534,13 @@ def main():
 # so it sees the delist events written this run.
 #
 # Idempotent: re-running over the same window produces identical results, so a
-# missed week is harmless as long as lookback_days covers the gap. Default 3
-# gives two days of slack against the daily schedule.
+# missed week is harmless as long as lookback_days covers the gap. Set to 9,
+# not 3: housekeeping runs WEEKLY (Mon 03:40), so a 3-day window would leave
+# four days of every week unclassified. 9 covers the full week plus two days
+# of slack for a skipped run.
     try:
         res = safe_db_execute(
-            supabase.rpc("reclassify_stockout_events", {"lookback_days": 3})
+            supabase.rpc("reclassify_stockout_events", {"lookback_days": 9})
         )
         rows = (res.data or []) if res else []
         if rows:
