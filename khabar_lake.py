@@ -460,7 +460,7 @@ def stockout_events(con, witnessed_only=True):
     if _EVENTS_READY:
         return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
 
-    where = "WHERE se.witnessed = TRUE" if witnessed_only else ""
+    where = "AND se.witnessed = TRUE" if witnessed_only else ""
     con.execute("DROP TABLE IF EXISTS stock_events")
     con.execute(f"""
         CREATE TABLE stock_events AS
@@ -470,9 +470,11 @@ def stockout_events(con, witnessed_only=True):
                se.was_on_discount,
                se.witnessed, se.seed_reason,
                se.recorded_at,
-               CAST(se.recorded_at AS DATE) AS event_date
+               CAST(se.recorded_at AS DATE) AS event_date,
+               p.category_normalized, p.department, p.gender, p.product_name
         FROM pg.public.stockout_events se
-        {where}
+        JOIN pg.public.products p ON p.id = se.product_id
+        WHERE se.event_type IN ('stockout','restock') {where}
     """)
     _EVENTS_READY = True
     return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
