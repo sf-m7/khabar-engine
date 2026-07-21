@@ -550,6 +550,28 @@ def materialise_events(con, force=False):
     return n1, n2
 
 
+def stockout_events(con):
+    """
+    RESTORED 2026-07-21 — compute_signals.py calls this directly, once, right
+    after prefetch(), and prints its return value as "witnessed transitions"
+    in the run log. It is a separate entry point from prefetch() on purpose:
+    it reads a different source table (stockout_events, not price_snapshots),
+    and the witnessed filter belongs here rather than in every signal's SQL —
+    a signal that forgot the filter would look like it was working while
+    overstating sellout volume roughly 3x (57,171 of 85,205 raw rows are
+    collection artefacts: orphan restocks, delist-cycle noise, duplicates).
+
+    Idempotent and cheap on the common path: prefetch() already calls
+    materialise_events() internally, so by the time this runs, stockouts_raw,
+    products_dim, and stock_events already exist and this just counts a local
+    table — no second Postgres read. Calling materialise_events() again here
+    is what makes that true regardless of whether prefetch() ran first; the
+    _EVENTS_READY guard inside it no-ops if it already has.
+    """
+    materialise_events(con)
+    return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
+
+
 # ---------------------------------------------------------------------------
 # Smoke test — run this file directly to prove the seam is sound.
 # It checks the things that would silently corrupt every downstream signal:
