@@ -143,7 +143,7 @@ def connect():
 # Process-local. Reset per job because the DuckDB connection dies with it.
 _HOT_READY        = False
 _BASELINES_READY  = False
-_PRODBASE_READY   = False
+_PRODUCTS_READY   = False
 _EVENTS_READY     = False
 _GLOB_CACHE       = None
 
@@ -213,14 +213,18 @@ def prefetch(con):
     """
     Call once, immediately after connect(), before computing anything.
 
-    Optional — snapshots() will materialise on demand if this was skipped — but
-    calling it explicitly makes the single Postgres read visible in the log
-    rather than hidden inside the first signal's timing.
+    Optional — snapshots()/variant_baselines() etc. will materialise on demand
+    if this was skipped — but calling it explicitly makes the fixed number of
+    Postgres reads visible in the log rather than hidden inside the first
+    signal's timing.
     """
-    n = materialise_hot(con)
-    print(f"  📥 Hot tier materialised once: {n:,} rows. "
-          f"Supabase will not be read again this run.")
-    return n
+    n_snap = materialise_hot(con)
+    n_prod = materialise_products(con)
+    n_stock, n_price = materialise_events(con)
+    print(f"  📥 Materialised once — hot snapshots: {n_snap:,}, "
+          f"products: {n_prod:,}, stockout events: {n_stock:,}, "
+          f"price events: {n_price:,}. Supabase will not be read again this run.")
+    return n_snap, n_prod, n_stock, n_price
 
 
 def _day_files(con, start_day, end_day):
@@ -306,10 +310,6 @@ def snapshots(con, days=30, end_day=None):
     # THE OVERLAP RULE (see module docstring): a day can exist in both tiers.
     # De-duplicate on snapshot_id, hot tier wins. Without this, any day caught
     # mid-archive is counted twice and every median/IQR downstream is wrong.
-    # The honest baseline must be available before the view is defined. Guarded,
-    # so this is one narrow two-column Postgres read per run, not per signal.
-    product_baselines(con)
-
     con.execute(f"""
         CREATE OR REPLACE VIEW snapshots AS
         WITH cold AS ({cold_sql}),
@@ -327,158 +327,26 @@ def snapshots(con, days=30, end_day=None):
                  FROM unioned
              )
         SELECT
-            d.snapshot_id, d.product_id, d.variant_id, d.brand, d.product_name,
-            d.category_normalized, d.category_raw, d.gender, d.size, d.color,
-            d.attributes_extracted, d.price, d.compare_at_price, d.discount_pct,
-            CAST(d.snapshot_date AS DATE) AS snapshot_date,
-            d.recorded_at,
-
-            -- ================================================================
-            -- honest_discount_pct — measured against first_observed_price.
-            --
-            -- THIS DEFINITION CHANGED 2026-07-20. It previously computed from
-            -- compare_at_price, which is the brand-manipulable "was" price. A
-            -- product parked forever at 499 "was 799" is not on sale; it is
-            -- priced at 499. Reading that as a 37% discount is precisely the
-            -- error Khabar sells immunity to, and the column carried the name
-            -- of the invariant it was breaking.
-            --
-            -- It was defensible when written: price_snapshots.discount_pct was
-            -- NULL on all 455,947 rows, so compare_at_price was the only thing
-            -- available. That column is now populated at write time by the
-            -- scraper and backfilled across live rows.
-            --
-            -- COALESCE order matters. discount_pct is authoritative where it
-            -- exists (hot rows, and cold days archived after the fix). Older
-            -- Parquet files predate the column and hold NULL — those are
-            -- recomputed here from product_baselines, which is why that table
-            -- must be UNFILTERED by is_active/delisted_at.
-            --
-            -- NULL, never 0, when there is no baseline: "we cannot measure"
-            -- and "there is no discount" must stay distinguishable.
-            -- ================================================================
-            COALESCE(
-                d.discount_pct,
-                CASE
-                    WHEN pb.baseline_price IS NOT NULL
-                     AND pb.baseline_price > 0
-                     AND d.price < pb.baseline_price
-                    THEN ROUND(100.0 * (pb.baseline_price - d.price) / pb.baseline_price, 2)
-                    ELSE NULL
-                END
-            ) AS honest_discount_pct,
-
-            pb.baseline_price AS baseline_price,
-
-            -- The discount the brand CLAIMS, from its own RRP. Deliberately
-            -- kept and deliberately renamed: it is not a measure of savings,
-            -- it is evidence of anchoring behaviour, and it is the raw input
-            -- to the Anchor Inflation signal. Never substitute it for the
-            -- honest figure above. NULL — never 0 — when no RRP was published.
+            snapshot_id, product_id, variant_id, brand, product_name,
+            category_normalized, category_raw, gender, size, color,
+            attributes_extracted, price, compare_at_price, discount_pct,
+            CAST(snapshot_date AS DATE) AS snapshot_date,
+            recorded_at,
+            -- Discount as published by the brand. NULL — never 0 — when the
+            -- brand published no RRP, because "no RRP" is not "no discount".
             CASE
-                WHEN d.compare_at_price IS NOT NULL
-                 AND d.compare_at_price > 0
-                 AND d.compare_at_price >= d.price
-                THEN ROUND(100.0 * (d.compare_at_price - d.price) / d.compare_at_price, 2)
+                WHEN compare_at_price IS NOT NULL
+                 AND compare_at_price > 0
+                 AND compare_at_price >= price
+                THEN ROUND(100.0 * (compare_at_price - price) / compare_at_price, 2)
                 ELSE NULL
-            END AS claimed_discount_pct
-        FROM deduped d
-        LEFT JOIN product_baselines pb ON pb.product_id = d.product_id
-        WHERE d.rn = 1
+            END AS honest_discount_pct
+        FROM deduped
+        WHERE rn = 1
     """)
 
     n = con.execute("SELECT count(*) FROM snapshots").fetchone()[0]
     return n, len(files), start_day, end_day
-
-
-def product_baselines(con):
-    """
-    Product-level honest baseline: the lowest first_observed_price across a
-    product's variants. Materialised once per run, two columns only.
-
-    WHY THIS EXISTS SEPARATELY FROM variant_baselines():
-    variant_baselines filters to `p.is_active AND pv.delisted_at IS NULL`,
-    which is right for "what can I sell today" but WRONG for a historical
-    baseline. A snapshot from three weeks ago must still be measurable even if
-    the product has since been delisted -- otherwise the honest discount
-    silently disappears from history the moment a product dies, and every
-    trailing median shifts. This pull is deliberately unfiltered.
-
-    COLLAPSE RULE: MIN, not AVG or MAX. first_observed_price is variant-level;
-    snapshots are product-level. 96.5% of products carry one baseline across
-    all variants; where they differ, MIN yields the SMALLEST possible discount.
-    A signal sold on the honesty of its baseline must never round in its own
-    favour. Same rule as L1-01 in the registry -- kept identical on purpose.
-    """
-    global _PRODBASE_READY
-    if _PRODBASE_READY:
-        return con.execute("SELECT count(*) FROM product_baselines").fetchone()[0]
-
-    con.execute("DROP TABLE IF EXISTS product_baselines")
-    con.execute("""
-        CREATE TABLE product_baselines AS
-        SELECT pv.product_id AS product_id,
-               MIN(CAST(pv.first_observed_price AS DOUBLE)) AS baseline_price
-        FROM pg.public.product_variants pv
-        WHERE pv.first_observed_price IS NOT NULL
-        GROUP BY pv.product_id
-    """)
-    _PRODBASE_READY = True
-    return con.execute("SELECT count(*) FROM product_baselines").fetchone()[0]
-
-
-def stockout_events(con, witnessed_only=True):
-    """
-    Inventory transitions, exposed as the table `stock_events`.
-
-    WITNESSED-ONLY BY DEFAULT, AND THAT DEFAULT IS THE WHOLE POINT.
-    Of 44,689 real stock transitions, only 27,670 (62%) are trustworthy. The
-    rest are artefacts of how the data was collected, not of what the market
-    did:
-      orphan_restock       a restock with no sellout ever recorded before it,
-                           so the interval it implies is meaningless. 69% of
-                           all restock volume.
-      delist_cycle         housekeeping wrote "out of stock" when a product
-                           merely left the catalogue; its reappearance then
-                           read as a restock. Fixed at source 2026-07-20, but
-                           historical rows remain.
-      duplicate_transition the same event type twice in a row.
-
-    Counting those as demand overstates sellout velocity, and overstates it
-    WORST for the newest brands. Filtering belongs here, once, rather than in
-    each signal's SQL where one omission silently poisons a client-facing
-    number.
-
-    Set witnessed_only=False ONLY to audit the contamination itself. Never for
-    a signal.
-
-    Note this reads Postgres directly: stockout_events is not archived to R2,
-    so there is no cold tier to stitch. If retention is ever added to that
-    table, this needs the same two-tier treatment as snapshots().
-    """
-    global _EVENTS_READY
-    if _EVENTS_READY:
-        return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
-
-    where = "AND se.witnessed = TRUE" if witnessed_only else ""
-    con.execute("DROP TABLE IF EXISTS stock_events")
-    con.execute(f"""
-        CREATE TABLE stock_events AS
-        SELECT se.id, se.variant_id, se.product_id, se.brand,
-               se.size, se.color, se.event_type,
-               CAST(se.price_at_event AS DOUBLE) AS price_at_event,
-               se.was_on_discount,
-               se.witnessed, se.seed_reason,
-               se.recorded_at,
-               CAST(se.recorded_at AS DATE) AS event_date,
-               p.category_normalized, p.department, p.gender,
-               p.name AS product_name
-        FROM pg.public.stockout_events se
-        JOIN pg.public.products p ON p.id = se.product_id
-        WHERE se.event_type IN ('stockout','restock') {where}
-    """)
-    _EVENTS_READY = True
-    return con.execute("SELECT count(*) FROM stock_events").fetchone()[0]
 
 
 def variant_baselines(con):
@@ -519,6 +387,126 @@ def variant_baselines(con):
     """)
     _BASELINES_READY = True
     return con.execute("SELECT count(*) FROM variant_baselines").fetchone()[0]
+
+
+# =============================================================================
+# PRODUCTS DIM, STOCKOUT EVENTS, PRICE EVENTS — added when nine new L1 signals
+# needed them and would otherwise have queried pg.public directly, once per
+# signal, exactly the mistake THE ONE-READ RULE above exists to prevent. These
+# tables are two orders of magnitude smaller than price_snapshots (products:
+# ~70K rows, stockout_events: ~85K, price_events: ~12K) so the cost of getting
+# this wrong is smaller — but it is the same wrong, and it compounds the same
+# way as more signals are added. Fixed once, here, rather than per-signal.
+#
+# Neither price_events nor stockout_events is purged on a schedule the way
+# price_snapshots is (per project convention, both stay fully in Postgres —
+# the scraper's own last-price lookup and the bot's live-deals screen read
+# price_events directly and would break if it were windowed). So unlike
+# hot_raw, there is no hot/cold seam to reconcile here: one pull is the whole
+# table, always.
+# =============================================================================
+
+def materialise_products(con, force=False):
+    """
+    Every product, unfiltered — deliberately NOT scoped to is_active like
+    variant_baselines is. Product Delisted needs to see inactive products;
+    New SKU Launch and lifecycle signals need first_seen_at/last_seen_at
+    regardless of current state. Filtering here would silently hide the exact
+    rows several of these signals exist to find.
+    """
+    global _PRODUCTS_READY
+    if _PRODUCTS_READY and not force:
+        return con.execute("SELECT count(*) FROM products_dim").fetchone()[0]
+
+    con.execute("DROP TABLE IF EXISTS products_dim")
+    con.execute("""
+        CREATE TABLE products_dim AS
+        SELECT
+            id                                  AS product_id,
+            brand                                AS brand,
+            name                                 AS name,
+            department                           AS department,
+            category_raw                         AS category_raw,
+            category_normalized                  AS category_normalized,
+            subcategory                          AS subcategory,
+            gender                               AS gender,
+            CAST(first_observed_price AS DOUBLE) AS first_observed_price,
+            CAST(first_seen_at AS VARCHAR)       AS first_seen_at,
+            CAST(last_seen_at AS VARCHAR)        AS last_seen_at,
+            is_active                            AS is_active,
+            CAST(delisted_at AS VARCHAR)         AS delisted_at
+        FROM pg.public.products
+    """)
+    _PRODUCTS_READY = True
+    return con.execute("SELECT count(*) FROM products_dim").fetchone()[0]
+
+
+def materialise_events(con, force=False):
+    """
+    stockout_events and price_events, pulled once each.
+
+    THE WITNESSED FILTER IS APPLIED HERE, NOT PER-SIGNAL. Checked live
+    (2026-07-21): stockouts are 78% witnessed=true (cleaner than previously
+    documented), but RESTOCKS are only 21% witnessed=true — 79% carry a
+    seed_reason (mass_event_artifact, orphan_restock, duplicate_transition,
+    delist_cycle) meaning they were never a real observed transition. Any
+    signal built on restock timing without this filter inherits that
+    contamination silently. Delisted-type rows have witnessed=NULL by design
+    (delisting isn't a stock transition) and are kept regardless.
+
+    Filtering centrally here means every current and future signal gets the
+    clean version automatically — nobody has to remember to add the WHERE
+    clause themselves.
+    """
+    global _EVENTS_READY
+    if _EVENTS_READY and not force:
+        n1 = con.execute("SELECT count(*) FROM stockouts_raw").fetchone()[0]
+        n2 = con.execute("SELECT count(*) FROM price_events_raw").fetchone()[0]
+        return n1, n2
+
+    con.execute("DROP TABLE IF EXISTS stockouts_raw")
+    con.execute("""
+        CREATE TABLE stockouts_raw AS
+        SELECT
+            id                        AS event_id,
+            variant_id                AS variant_id,
+            product_id                AS product_id,
+            brand                     AS brand,
+            size                      AS size,
+            color                     AS color,
+            event_type                AS event_type,
+            CAST(price_at_event AS DOUBLE)          AS price_at_event,
+            CAST(discount_pct_at_event AS DOUBLE)   AS discount_pct_at_event,
+            was_on_discount           AS was_on_discount,
+            CAST(recorded_at AS VARCHAR) AS recorded_at,
+            witnessed                 AS witnessed,
+            seed_reason               AS seed_reason
+        FROM pg.public.stockout_events
+        WHERE witnessed = TRUE OR witnessed IS NULL
+    """)
+
+    con.execute("DROP TABLE IF EXISTS price_events_raw")
+    con.execute("""
+        CREATE TABLE price_events_raw AS
+        SELECT
+            id                        AS event_id,
+            product_id                AS product_id,
+            brand                     AS brand,
+            CAST(price_before AS DOUBLE)       AS price_before,
+            CAST(price_after AS DOUBLE)        AS price_after,
+            CAST(compare_at_price AS DOUBLE)   AS compare_at_price,
+            CAST(discount_pct AS DOUBLE)       AS discount_pct,
+            direction                 AS direction,
+            CAST(sizes_in_stock AS VARCHAR)    AS sizes_in_stock,
+            CAST(recorded_at AS VARCHAR)       AS recorded_at,
+            is_statistical_deal       AS is_statistical_deal,
+            is_flash_sale             AS is_flash_sale
+        FROM pg.public.price_events
+    """)
+    _EVENTS_READY = True
+    n1 = con.execute("SELECT count(*) FROM stockouts_raw").fetchone()[0]
+    n2 = con.execute("SELECT count(*) FROM price_events_raw").fetchone()[0]
+    return n1, n2
 
 
 # ---------------------------------------------------------------------------
