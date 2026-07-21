@@ -268,6 +268,10 @@ def snapshots(con, days=30, end_day=None):
 
     # One Postgres read per process. No-op on every call after the first.
     materialise_hot(con)
+    # The view below joins products_dim for first_observed_price (the honest
+    # discount baseline). Ensure it exists regardless of call order; no-ops if
+    # prefetch() already built it.
+    materialise_products(con)
 
     files = _day_files(con, start_day, end_day)
 
@@ -332,22 +336,55 @@ def snapshots(con, days=30, end_day=None):
                  FROM unioned
              )
         SELECT
-            snapshot_id, product_id, variant_id, brand, product_name,
-            category_normalized, category_raw, gender, size, color,
-            attributes_extracted, price, compare_at_price, discount_pct,
-            CAST(snapshot_date AS DATE) AS snapshot_date,
-            recorded_at,
-            -- Discount as published by the brand. NULL — never 0 — when the
+            d.snapshot_id, d.product_id, d.variant_id, d.brand, d.product_name,
+            d.category_normalized, d.category_raw, d.gender, d.size, d.color,
+            d.attributes_extracted, d.price, d.compare_at_price, d.discount_pct,
+            CAST(d.snapshot_date AS DATE) AS snapshot_date,
+            d.recorded_at,
+            -- THE HONEST BASELINE. Rewritten 2026-07-21.
+            --
+            -- This column previously derived from compare_at_price, which is
+            -- the brand's own published RRP -- exactly the field the project's
+            -- core invariant forbids measuring discounts against, because a
+            -- brand can inflate it at will to manufacture a discount. It was
+            -- named "honest" while measuring the opposite of honest.
+            --
+            -- Two consequences, both live and both bad:
+            --   1. Every signal filtering on it (l1_10 Dead Stock) was ranking
+            --      brands by their own marketing claims.
+            --   2. Brands that publish no RRP at all were structurally
+            --      INVISIBLE to those signals -- confirmed live: lc_waikiki
+            --      (1,298 price events), just_sbr, mobaco and mlameh have
+            --      compare_at_price on 0% of rows. LCW, one of the largest
+            --      brands tracked, could never appear in Dead Stock.
+            --
+            -- Now derived from first_observed_price: the price Khabar itself
+            -- first witnessed. A brand cannot retroactively edit our own
+            -- observation, and every brand has one regardless of whether they
+            -- publish an RRP.
+            CASE
+                WHEN pf.first_observed_price IS NOT NULL
+                 AND pf.first_observed_price > 0
+                 AND pf.first_observed_price >= d.price
+                THEN ROUND(100.0 * (pf.first_observed_price - d.price)
+                           / pf.first_observed_price, 2)
+                ELSE NULL
+            END AS honest_discount_pct,
+            -- The brand's OWN claim, kept but named for what it is. Useful for
+            -- anchor-inflation work (comparing claim against reality); never
+            -- to be used as a discount measure. NULL -- never 0 -- when the
             -- brand published no RRP, because "no RRP" is not "no discount".
             CASE
-                WHEN compare_at_price IS NOT NULL
-                 AND compare_at_price > 0
-                 AND compare_at_price >= price
-                THEN ROUND(100.0 * (compare_at_price - price) / compare_at_price, 2)
+                WHEN d.compare_at_price IS NOT NULL
+                 AND d.compare_at_price > 0
+                 AND d.compare_at_price >= d.price
+                THEN ROUND(100.0 * (d.compare_at_price - d.price)
+                           / d.compare_at_price, 2)
                 ELSE NULL
-            END AS honest_discount_pct
-        FROM deduped
-        WHERE rn = 1
+            END AS brand_claimed_discount_pct
+        FROM deduped d
+        LEFT JOIN products_dim pf ON pf.product_id = d.product_id
+        WHERE d.rn = 1
     """)
 
     n = con.execute("SELECT count(*) FROM snapshots").fetchone()[0]
