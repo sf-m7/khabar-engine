@@ -292,8 +292,8 @@ baselines AS (
     SELECT
         pv.product_id,
         MIN(CAST(pv.first_observed_price AS DOUBLE)) AS baseline_price
-    FROM pg.public.product_variants pv
-    JOIN pg.public.products p ON p.id = pv.product_id
+    FROM variants_raw pv
+    JOIN products_dim p ON p.product_id = pv.product_id
     WHERE p.is_active = TRUE
       AND pv.delisted_at IS NULL
       AND pv.first_observed_price IS NOT NULL
@@ -359,7 +359,7 @@ WITH ev AS (
         lag(pe.price_after) OVER (
             PARTITION BY pe.product_id ORDER BY pe.recorded_at
         ) AS prev_after
-    FROM pg.public.price_events pe
+    FROM price_events_raw pe
     WHERE CAST(pe.recorded_at AS TIMESTAMP) >= CURRENT_TIMESTAMP - INTERVAL '21 days'
 ),
 -- Mark each event as a valid staircase step: a DOWN move that is strictly
@@ -405,7 +405,7 @@ SELECT
     a.last_step_at,
     CAST(date_diff('day', a.first_step_at, a.last_step_at) AS INTEGER) AS span_days
 FROM agg a
-LEFT JOIN pg.public.products p ON p.id = a.product_id
+LEFT JOIN products_dim p ON p.product_id = a.product_id
 WHERE a.last_price < a.first_price
 ORDER BY total_descent_pct DESC
 """,
@@ -440,7 +440,7 @@ ORDER BY total_descent_pct DESC
 WITH baselines AS (
     SELECT product_id,
            MIN(CAST(first_observed_price AS DOUBLE)) AS baseline
-    FROM pg.public.product_variants
+    FROM variants_raw
     WHERE first_observed_price IS NOT NULL AND first_observed_price > 0
     GROUP BY product_id
 ),
@@ -449,7 +449,7 @@ ev AS (
         pe.product_id, pe.brand, pe.price_after,
         CAST(pe.recorded_at AS TIMESTAMP) AS recorded_at,
         b.baseline
-    FROM pg.public.price_events pe
+    FROM price_events_raw pe
     JOIN baselines b ON b.product_id = pe.product_id
     WHERE CAST(pe.recorded_at AS TIMESTAMP) >= CURRENT_TIMESTAMP - INTERVAL '30 days'
       AND pe.price_after < b.baseline
@@ -501,7 +501,7 @@ SELECT
     a.last_step_at,
     CAST(date_diff('day', a.first_step_at, a.last_step_at) AS INTEGER) AS span_days
 FROM agg a
-LEFT JOIN pg.public.products p ON p.id = a.product_id
+LEFT JOIN products_dim p ON p.product_id = a.product_id
 WHERE a.last_depth_pct > a.first_depth_pct
 ORDER BY a.last_depth_pct DESC
 """,
