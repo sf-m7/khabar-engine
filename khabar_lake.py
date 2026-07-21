@@ -213,18 +213,23 @@ def prefetch(con):
     """
     Call once, immediately after connect(), before computing anything.
 
-    Optional — snapshots()/variant_baselines() etc. will materialise on demand
-    if this was skipped — but calling it explicitly makes the fixed number of
-    Postgres reads visible in the log rather than hidden inside the first
-    signal's timing.
+    Every materialise/dimension function used by any signal's SQL must be
+    called here. There is no on-demand fallback — a signal's SQL is a plain
+    string; it cannot call a Python function to build a table it finds
+    missing. (Corrected 2026-07-21: this docstring previously claimed
+    variant_baselines() would materialise on demand if skipped here. It
+    would not, and didn't — l1_10 and l1_11 failed in the field on exactly
+    this, because the call below was missing. It no longer is.)
     """
     n_snap = materialise_hot(con)
     n_prod = materialise_products(con)
+    n_base = variant_baselines(con)
     n_stock, n_price = materialise_events(con)
     print(f"  📥 Materialised once — hot snapshots: {n_snap:,}, "
-          f"products: {n_prod:,}, stockout events: {n_stock:,}, "
-          f"price events: {n_price:,}. Supabase will not be read again this run.")
-    return n_snap, n_prod, n_stock, n_price
+          f"products: {n_prod:,}, variant baselines: {n_base:,}, "
+          f"stockout events: {n_stock:,}, price events: {n_price:,}. "
+          f"Supabase will not be read again this run.")
+    return n_snap, n_prod, n_base, n_stock, n_price
 
 
 def _day_files(con, start_day, end_day):
@@ -482,7 +487,7 @@ def materialise_events(con, force=False):
             CAST(price_at_event AS DOUBLE)          AS price_at_event,
             CAST(discount_pct_at_event AS DOUBLE)   AS discount_pct_at_event,
             was_on_discount           AS was_on_discount,
-            CAST(recorded_at AS VARCHAR) AS recorded_at,
+            CAST(recorded_at AS TIMESTAMP) AS recorded_at,
             witnessed                 AS witnessed,
             seed_reason               AS seed_reason
         FROM pg.public.stockout_events
@@ -502,7 +507,7 @@ def materialise_events(con, force=False):
             CAST(discount_pct AS DOUBLE)       AS discount_pct,
             direction                 AS direction,
             CAST(sizes_in_stock AS VARCHAR)    AS sizes_in_stock,
-            CAST(recorded_at AS VARCHAR)       AS recorded_at,
+            CAST(recorded_at AS TIMESTAMP)     AS recorded_at,
             is_statistical_deal       AS is_statistical_deal,
             is_flash_sale             AS is_flash_sale
         FROM pg.public.price_events
