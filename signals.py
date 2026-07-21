@@ -671,6 +671,482 @@ ORDER BY a.last_depth_pct DESC
         "table": None, "window_days": 60, "min_days": 56,
         "unique_on": [], "sql": None, "suppressed_sql": None,
     },
+
+
+    # -------------------------------------------------------------------
+    # #12 — New SKU Launch. Marked "Done" in planning; simply never wired
+    # into the new Signal Engine.
+    #
+    # EXCLUDES EACH BRAND'S ONBOARDING DAY. Confirmed live: every large
+    # first_seen_at spike (Town Team 2,869 on May 28; LC Waikiki 7,151 on
+    # Jun 6; DeFacto 5,062 on Jun 9; Andora 4,371 on Jun 11 — 25,000+ rows
+    # total) is the day that brand was first added to the scraper, not a
+    # real product launch. Without this filter the signal was mostly
+    # reporting catalog backfill as new arrivals. Each brand's own MIN
+    # (first_seen_at) day is excluded — everything after is a genuine
+    # first-sighting.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_12",
+        "name": "New SKU Launch",
+        "level": "L1",
+        "table": "signal_l1_12_new_sku_launch",
+        "unique_on": ["product_id", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH onboarding_day AS (
+                SELECT brand, min(CAST(first_seen_at AS DATE)) AS brand_onboarded_on
+                FROM products_dim
+                GROUP BY brand
+            )
+            SELECT
+                pd.product_id,
+                pd.brand,
+                pd.name                        AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                pd.first_observed_price        AS launch_price,
+                CAST(pd.first_seen_at AS DATE) AS launch_date,
+                CAST(pd.first_seen_at AS DATE) AS snapshot_date
+            FROM products_dim pd
+            JOIN onboarding_day ob ON ob.brand = pd.brand
+            WHERE CAST(pd.first_seen_at AS DATE) > ob.brand_onboarded_on
+              AND CAST(pd.first_seen_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #13 — Product Delisted. Also marked "Done", also never wired in.
+    # Deliberately reads products_dim.is_active/last_seen_at — NOT
+    # product_variants.delisted_at, which has a known bug (set by
+    # housekeeping's stale-check, never cleared by the scraper on restock;
+    # confirmed live: 1,010 variants flagged delisted with is_in_stock=true).
+    # Using the product-level field sidesteps that bug entirely.
+    #
+    # EXCLUDES MASS-DELIST ANOMALY DAYS. Investigated 2026-07-21: Dalydress
+    # showed 3,737 products (68% of its catalogue) "delisting" on 2026-06-18,
+    # exactly one day after the brand was onboarded on 06-17. Evidence it is
+    # a collection failure, not brand behaviour:
+    #   • 68.3% died within 3 days of onboarding; next-worst brand is DeFacto
+    #     at 1.6% — a 43x outlier.
+    #   • Esla was onboarded the SAME DAY and shows 0.0% early death, so it
+    #     was not a platform-wide event.
+    #   • The dead cohort averages 2.36 products per distinct product name vs
+    #     1.22 for the surviving cohort — the duplication signature of an
+    #     over-collecting pagination walk (see the known Shopify page-echo
+    #     bug: the API repeats the last real page past catalogue end).
+    #   • is_active itself is NOT stale: 1,626/1,635 active products appear in
+    #     the current hot window, 0/3,852 inactive ones do. The products
+    #     genuinely never returned — they were never real.
+    #
+    # Rule is deliberately GENERAL, not a Dalydress special case: any single
+    # day where >20% of a brand's whole catalogue delists is a collection
+    # anomaly. Real lifecycle delisting is a trickle; a two-thirds cliff in
+    # 24 hours is a bug by definition. Across all history this currently
+    # catches exactly one event (Dalydress 06-18). Tree 06-18 at 19.7% and
+    # Mobaco 06-17 at 10.8% fall below the line and are retained — Tree sits
+    # close enough, and shares the date, that it may be a milder instance of
+    # the same fault. Left in pending review rather than silently swept up by
+    # a threshold tuned to hide it.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_13",
+        "name": "Product Delisted",
+        "level": "L1",
+        "table": "signal_l1_13_product_delisted",
+        "unique_on": ["product_id", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH brand_catalogue AS (
+                SELECT brand, count(*) AS catalogue_size
+                FROM products_dim
+                GROUP BY brand
+            ),
+            delist_by_day AS (
+                SELECT brand, CAST(last_seen_at AS DATE) AS delist_day,
+                       count(*) AS n_delisted
+                FROM products_dim
+                WHERE is_active = FALSE
+                GROUP BY brand, CAST(last_seen_at AS DATE)
+            ),
+            anomaly_days AS (
+                -- Brand-days to suppress entirely. See header comment.
+                SELECT d.brand, d.delist_day
+                FROM delist_by_day d
+                JOIN brand_catalogue c ON c.brand = d.brand
+                WHERE 100.0 * d.n_delisted / c.catalogue_size > 20
+            ),
+            last_price AS (
+                SELECT product_id, price, honest_discount_pct,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY product_id ORDER BY snapshot_date DESC
+                       ) AS rn
+                FROM snapshots
+            )
+            SELECT
+                pd.product_id,
+                pd.brand,
+                pd.name                        AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                pd.first_observed_price,
+                lp.price                       AS final_price,
+                lp.honest_discount_pct         AS final_discount_pct,
+                CAST(pd.last_seen_at AS DATE)  AS delisted_date,
+                CAST(pd.last_seen_at AS DATE)  AS snapshot_date
+            FROM products_dim pd
+            LEFT JOIN last_price lp ON lp.product_id = pd.product_id AND lp.rn = 1
+            LEFT JOIN anomaly_days ad
+                   ON ad.brand = pd.brand
+                  AND ad.delist_day = CAST(pd.last_seen_at AS DATE)
+            WHERE pd.is_active = FALSE
+              AND ad.brand IS NULL   -- drop mass-delist anomaly days entirely
+              AND CAST(pd.last_seen_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #10 — Velocity Decay (Dead Stock). Pure state check: all variants
+    # still in stock while deeply discounted. No stockout/restock timing
+    # involved, so it's unaffected by the witnessed-data issue — the
+    # cleanest of the nine.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_10",
+        "name": "Dead Stock",
+        "level": "L1",
+        "table": "signal_l1_10_dead_stock",
+        "unique_on": ["product_id", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 7,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH today AS (
+                SELECT product_id, brand, honest_discount_pct, snapshot_date,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY product_id ORDER BY snapshot_date DESC
+                       ) AS rn
+                FROM snapshots
+                WHERE honest_discount_pct >= 40
+            ),
+            stock_check AS (
+                SELECT product_id, count(*) AS variant_count,
+                       count(*) FILTER (WHERE is_in_stock) AS in_stock_count
+                FROM variant_baselines
+                GROUP BY product_id
+            )
+            SELECT
+                t.product_id,
+                t.brand,
+                pd.name                AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                t.honest_discount_pct,
+                sc.variant_count,
+                sc.in_stock_count,
+                t.snapshot_date
+            FROM today t
+            JOIN products_dim pd ON pd.product_id = t.product_id
+            JOIN stock_check sc ON sc.product_id = t.product_id
+            WHERE t.rn = 1
+              AND sc.variant_count > 0
+              AND sc.in_stock_count = sc.variant_count   -- ALL variants still in stock
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #4 — Anchor Inflation. compare_at_price rises while actual price is
+    # unchanged. Coverage verified live: solid for 15/19 brands, zero for
+    # LC Waikiki/Mobaco/Just SBR (their engines don't capture compare_at_
+    # price at all — output correctly shows nothing for them, not a bug),
+    # thin for dott_jeans/esla/khotwh (33-66% populated).
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_04",
+        "name": "Anchor Inflation",
+        "level": "L1",
+        "table": "signal_l1_04_anchor_inflation",
+        "unique_on": ["product_id", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH ordered AS (
+                SELECT
+                    product_id, brand, recorded_at, price_after, compare_at_price,
+                    LAG(compare_at_price) OVER (
+                        PARTITION BY product_id ORDER BY recorded_at
+                    ) AS prev_compare_at,
+                    LAG(price_after) OVER (
+                        PARTITION BY product_id ORDER BY recorded_at
+                    ) AS prev_price
+                FROM price_events_raw
+                WHERE compare_at_price IS NOT NULL
+                  AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            )
+            SELECT
+                o.product_id,
+                o.brand,
+                pd.name              AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                o.prev_compare_at,
+                o.compare_at_price   AS new_compare_at,
+                o.price_after        AS actual_price,
+                ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
+                      / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
+                CAST(o.recorded_at AS DATE) AS snapshot_date
+            FROM ordered o
+            JOIN products_dim pd ON pd.product_id = o.product_id
+            WHERE o.prev_compare_at IS NOT NULL
+              AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
+              AND o.price_after = o.prev_price             -- actual price UNCHANGED
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #22 — Discount Velocity Anomaly. SKU discount bursts within a 6-hour
+    # window. Only fully resolvable for Shopify brands (3 scrapes/day,
+    # ~8hr spacing); LC Waikiki's 1x/day cadence can't see sub-day bursts —
+    # its rows will simply be sparse, not wrong.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_22",
+        "name": "Discount Velocity Anomaly",
+        "level": "L1",
+        "table": "signal_l1_22_discount_velocity",
+        "unique_on": ["brand", "category_normalized", "window_start"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH drops AS (
+                SELECT
+                    pe.product_id, pe.brand, pd.department,
+                    pd.category_normalized, pd.subcategory,
+                    pe.recorded_at,
+                    date_trunc('hour', CAST(pe.recorded_at AS TIMESTAMP))
+                        - INTERVAL (EXTRACT(hour FROM CAST(pe.recorded_at AS TIMESTAMP))::INT % 6) HOUR
+                        AS window_start
+                FROM price_events_raw pe
+                JOIN products_dim pd ON pd.product_id = pe.product_id
+                WHERE pe.direction = 'down'
+                  AND CAST(pe.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            )
+            SELECT
+                brand,
+                department,
+                category_normalized,
+                subcategory,
+                window_start,
+                count(DISTINCT product_id) AS skus_dropped,
+                CAST(window_start AS DATE) AS snapshot_date
+            FROM drops
+            GROUP BY brand, department, category_normalized, subcategory, window_start
+            HAVING count(DISTINCT product_id) >= 15   -- burst threshold; tune after first real output
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #24 — Restock Density. Variants restocked simultaneously in a window.
+    # Reads stockouts_raw, which already excludes the 79% of restocks that
+    # aren't witnessed — without that filter this signal would have been
+    # counting mostly artifacts. Broken down by category, not just brand —
+    # a brand-level-only number can't answer "which category is recovering
+    # fastest", which is the actual question this signal exists to answer.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_24",
+        "name": "Restock Density",
+        "level": "L1",
+        "table": "signal_l1_24_restock_density",
+        "unique_on": ["brand", "category_normalized", "color", "restock_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            SELECT
+                so.brand,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                so.color,
+                CAST(so.recorded_at AS DATE) AS restock_date,
+                count(*)                     AS variants_restocked,
+                count(DISTINCT so.product_id) AS products_affected,
+                CAST(so.recorded_at AS DATE) AS snapshot_date
+            FROM stockouts_raw so
+            JOIN products_dim pd ON pd.product_id = so.product_id
+            WHERE so.event_type = 'restock'
+              AND so.witnessed = TRUE
+              AND CAST(so.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            GROUP BY so.brand, pd.department, pd.category_normalized, pd.subcategory,
+                     so.color, CAST(so.recorded_at AS DATE)
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #11 — Size Asymmetry Stockout. Specific sizes sell out while others
+    # don't, during a discount. Uses the witnessed-filtered stockout table.
+    # No per-size data for LC Waikiki (lost June 2026, color-level only) —
+    # LCW rows simply won't appear here, not an error.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_11",
+        "name": "Size Asymmetry Stockout",
+        "level": "L1",
+        "table": "signal_l1_11_size_asymmetry",
+        "unique_on": ["product_id", "size", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH so AS (
+                SELECT product_id, brand, size, color, was_on_discount,
+                       CAST(recorded_at AS DATE) AS event_date
+                FROM stockouts_raw
+                WHERE event_type = 'stockout'
+                  AND witnessed = TRUE
+                  AND was_on_discount = TRUE
+                  AND size IS NOT NULL
+                  AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            ),
+            still_stocked AS (
+                SELECT product_id, array_agg(DISTINCT size) AS sizes_still_in_stock
+                FROM variant_baselines
+                WHERE is_in_stock = TRUE AND size IS NOT NULL
+                GROUP BY product_id
+            )
+            SELECT
+                so.product_id,
+                so.brand,
+                pd.name              AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                so.size              AS stocked_out_size,
+                so.color             AS stocked_out_color,
+                ss.sizes_still_in_stock,
+                so.event_date,
+                so.event_date        AS snapshot_date
+            FROM so
+            JOIN products_dim pd ON pd.product_id = so.product_id
+            LEFT JOIN still_stocked ss ON ss.product_id = so.product_id
+            WHERE ss.sizes_still_in_stock IS NOT NULL
+              AND len(ss.sizes_still_in_stock) > 0   -- other sizes genuinely remain
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #6 — Discount Recovery Pattern. Price drops then returns to a level
+    # ABOVE the drop but BELOW first_observed_price. Output will be thin —
+    # few products have completed a full markdown-and-recovery cycle in
+    # 54 days. Included anyway so it starts accumulating.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_06",
+        "name": "Discount Recovery Pattern",
+        "level": "L1",
+        "table": "signal_l1_06_discount_recovery",
+        "unique_on": ["product_id", "recovery_date"],
+        "window_days": 90,
+        "min_days": 7,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH seq AS (
+                SELECT
+                    pe.product_id, pe.brand, pe.price_after, pe.direction,
+                    CAST(pe.recorded_at AS DATE) AS event_date,
+                    LAG(pe.price_after) OVER (
+                        PARTITION BY pe.product_id ORDER BY pe.recorded_at
+                    ) AS prev_price,
+                    LAG(pe.direction) OVER (
+                        PARTITION BY pe.product_id ORDER BY pe.recorded_at
+                    ) AS prev_direction
+                FROM price_events_raw pe
+                WHERE CAST(pe.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            )
+            SELECT
+                s.product_id,
+                s.brand,
+                pd.name                    AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                pd.first_observed_price,
+                s.prev_price                AS low_price,
+                s.price_after                AS recovered_price,
+                ROUND(100.0 * (pd.first_observed_price - s.price_after)
+                      / NULLIF(pd.first_observed_price, 0), 2)
+                                              AS structural_reprice_pct,
+                s.event_date                 AS recovery_date,
+                s.event_date                 AS snapshot_date
+            FROM seq s
+            JOIN products_dim pd ON pd.product_id = s.product_id
+            WHERE s.direction = 'up'
+              AND s.prev_direction = 'down'
+              AND s.price_after > s.prev_price                        -- recovered from the low
+              AND s.price_after < pd.first_observed_price              -- but NOT back to full price
+        """,
+    },
+
+    # -------------------------------------------------------------------
+    # #14 — Launch-to-First-Discount Duration. Only the SHORT half of the
+    # distribution is currently observable — zero products have reached
+    # the 120+ day "held at full price" case yet (max history is 54 days).
+    # Values will skew short until more time passes; that's expected, not
+    # a bug in the signal.
+    # -------------------------------------------------------------------
+    {
+        "id": "l1_14",
+        "name": "Launch-to-First-Discount Duration",
+        "level": "L1",
+        "table": "signal_l1_14_launch_to_discount",
+        "unique_on": ["product_id"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH first_discount AS (
+                SELECT product_id, min(CAST(recorded_at AS DATE)) AS first_discount_date
+                FROM price_events_raw
+                WHERE direction = 'down'
+                GROUP BY product_id
+            )
+            SELECT
+                pd.product_id,
+                pd.brand,
+                pd.name                     AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                CAST(pd.first_seen_at AS DATE) AS launch_date,
+                fd.first_discount_date,
+                (fd.first_discount_date - CAST(pd.first_seen_at AS DATE)) AS days_to_first_discount,
+                fd.first_discount_date       AS snapshot_date
+            FROM products_dim pd
+            JOIN first_discount fd ON fd.product_id = pd.product_id
+            WHERE fd.first_discount_date >= CAST(pd.first_seen_at AS DATE)
+              AND CAST(pd.first_seen_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+        """,
+    },
 ]
 
 
