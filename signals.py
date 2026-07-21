@@ -962,23 +962,28 @@ ORDER BY a.last_depth_pct DESC
                 WHERE pe.direction = 'down'
                   AND CAST(pe.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
             )
-            -- FIXED 2026-07-21: subcategory was grouped on but not part of the
-            -- table's primary key (brand, category_normalized, window_start) --
-            -- one category spanning two subcategories in the same burst window
-            -- produced two rows sharing one key. Confirmed live: crashed the
-            -- production run on its first real write. The key is now widened
-            -- to include subcategory (migration applied), and it can no longer
-            -- be NULL there, hence the coalesce below.
+            -- FIXED 2026-07-21 (round 1): subcategory was grouped on but not
+            -- part of the table's primary key -- crashed the production run
+            -- on its first real write. Key widened to include subcategory.
+            --
+            -- FIXED 2026-07-21 (round 2): department has the IDENTICAL problem
+            -- and was still latent here -- 'uncategorized' category pools
+            -- products that failed real categorisation, so it can legitimately
+            -- span several different departments. This didn't fail this run
+            -- only because the categories it happened to touch didn't collide;
+            -- l1_24 hit exactly this same shape of bug on 'uncategorized' minutes
+            -- earlier. Fix: department is no longer a GROUP BY key, only a
+            -- representative value (MIN, so NULL never wins over a real one).
             SELECT
                 brand,
-                department,
+                MIN(department) AS department,
                 category_normalized,
                 COALESCE(subcategory, '(none)') AS subcategory,
                 window_start,
                 count(DISTINCT product_id) AS skus_dropped,
                 CAST(window_start AS DATE) AS snapshot_date
             FROM drops
-            GROUP BY brand, department, category_normalized, COALESCE(subcategory, '(none)'), window_start
+            GROUP BY brand, category_normalized, COALESCE(subcategory, '(none)'), window_start
             HAVING count(DISTINCT product_id) >= 15   -- burst threshold; tune after first real output
         """,
     },
@@ -1002,12 +1007,18 @@ ORDER BY a.last_depth_pct DESC
         "enabled": True,
         "requires": [],
         "sql": """
-            -- FIXED 2026-07-21: same bug class as l1_22 -- subcategory (and
-            -- color) grouped on but not in the original key. Same fix: key
-            -- widened (migration applied), coalesce so NULLs don't violate it.
+            -- FIXED 2026-07-21 (round 1): subcategory/color grouped on but not
+            -- in the original key -- crashed on first real write. Key widened.
+            --
+            -- FIXED 2026-07-21 (round 2): department has the same problem,
+            -- confirmed live -- (dalydress, uncategorized, (none), Brown,
+            -- 2026-07-19) collided because 'uncategorized' spans real
+            -- departments. department is now a representative value (MIN),
+            -- not a grouping key. (Also dropped a redundant bare so.color
+            -- left in GROUP BY alongside its own COALESCE version.)
             SELECT
                 so.brand,
-                pd.department,
+                MIN(pd.department) AS department,
                 pd.category_normalized,
                 COALESCE(pd.subcategory, '(none)') AS subcategory,
                 COALESCE(so.color, '(none)') AS color,
@@ -1020,9 +1031,9 @@ ORDER BY a.last_depth_pct DESC
             WHERE so.event_type = 'restock'
               AND so.witnessed = TRUE
               AND CAST(so.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
-            GROUP BY so.brand, pd.department, pd.category_normalized,
+            GROUP BY so.brand, pd.category_normalized,
                      COALESCE(pd.subcategory, '(none)'), COALESCE(so.color, '(none)'),
-                     so.color, CAST(so.recorded_at AS DATE)
+                     CAST(so.recorded_at AS DATE)
         """,
     },
 
