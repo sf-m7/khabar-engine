@@ -830,13 +830,30 @@ ORDER BY a.last_depth_pct DESC
         "enabled": True,
         "requires": [],
         "sql": """
-            WITH today AS (
-                SELECT product_id, brand, honest_discount_pct, snapshot_date,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY product_id ORDER BY snapshot_date DESC
-                       ) AS rn
-                FROM snapshots
-                WHERE honest_discount_pct >= 40
+            -- FIXED 2026-07-21. Two problems, both now closed:
+            --
+            -- 1. DATING. This previously dated each row by the last day that
+            --    product was seen deeply discounted -- while the stock check
+            --    (all variants still in stock) always reflects RIGHT NOW. So a
+            --    row dated 2026-06-13 paired June's discount with July's stock
+            --    levels, and claimed to be a June observation. Confirmed live:
+            --    163 rows carried stale historical dates. Rows are now dated
+            --    by the day we OBSERVED them, which is what makes them true,
+            --    and each run cleanly replaces the previous day rather than
+            --    accumulating undeletable stale rows.
+            --
+            -- 2. BASELINE. honest_discount_pct now derives from
+            --    first_observed_price rather than the brand's own RRP (see
+            --    khabar_lake.py). Brands publishing no RRP -- lc_waikiki above
+            --    all -- were previously unable to appear here at all.
+            WITH latest_day AS (
+                SELECT max(snapshot_date) AS d FROM snapshots
+            ),
+            discounted_today AS (
+                SELECT s.product_id, s.brand, s.honest_discount_pct, s.snapshot_date
+                FROM snapshots s, latest_day l
+                WHERE s.snapshot_date = l.d
+                  AND s.honest_discount_pct >= 40
             ),
             stock_check AS (
                 SELECT product_id, count(*) AS variant_count,
@@ -855,11 +872,10 @@ ORDER BY a.last_depth_pct DESC
                 sc.variant_count,
                 sc.in_stock_count,
                 t.snapshot_date
-            FROM today t
+            FROM discounted_today t
             JOIN products_dim pd ON pd.product_id = t.product_id
             JOIN stock_check sc ON sc.product_id = t.product_id
-            WHERE t.rn = 1
-              AND sc.variant_count > 0
+            WHERE sc.variant_count > 0
               AND sc.in_stock_count = sc.variant_count   -- ALL variants still in stock
         """,
     },
@@ -1054,6 +1070,23 @@ ORDER BY a.last_depth_pct DESC
         "enabled": True,
         "requires": [],
         "sql": """
+            -- FIXED 2026-07-21. Same dating problem as l1_10, and a sharper
+            -- version of it: this pairs a HISTORICAL stockout event with
+            -- CURRENT stock levels for the other sizes. A stockout from three
+            -- weeks ago said nothing reliable about which sizes were in stock
+            -- back then -- only about which are in stock now -- yet the row
+            -- was dated to the old event, presenting today's stock as history.
+            --
+            -- Properly reconstructing stock-state-as-of-date would need a
+            -- per-day stock history we do not keep, and deriving it from the
+            -- event log is unsafe while restock events are only ~21-29%
+            -- witnessed. So instead: restrict to a SHORT recent window, where
+            -- "other sizes in stock now" is a fair proxy for their state at the
+            -- event, and date the row by observation day. Confirmed live: 120
+            -- qualifying events in the last 2 days -- comparable per-day volume
+            -- to the old 21-day backfill (~45/day), so the signal keeps its
+            -- strength while becoming honestly dated. History accrues forward
+            -- from here rather than being fabricated backwards.
             WITH so AS (
                 SELECT product_id, brand, size, color, was_on_discount,
                        CAST(recorded_at AS DATE) AS event_date
@@ -1062,7 +1095,7 @@ ORDER BY a.last_depth_pct DESC
                   AND witnessed = TRUE
                   AND was_on_discount = TRUE
                   AND size IS NOT NULL
-                  AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+                  AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '2 days'
             ),
             still_stocked AS (
                 SELECT product_id, array_agg(DISTINCT size) AS sizes_still_in_stock
@@ -1071,11 +1104,6 @@ ORDER BY a.last_depth_pct DESC
                 GROUP BY product_id
             ),
             ranked AS (
-                -- FIXED 2026-07-21: the same product+size can stock out more than
-                -- once on the same calendar day (confirmed live: 595 product-size-
-                -- days). PK is (product_id, size, snapshot_date) -- one row per
-                -- day required. Keep one deterministically; colour is incidental
-                -- to which specific event, not to the pattern being reported.
                 SELECT
                     so.product_id,
                     so.brand,
@@ -1087,10 +1115,10 @@ ORDER BY a.last_depth_pct DESC
                     so.color             AS stocked_out_color,
                     ss.sizes_still_in_stock,
                     so.event_date,
-                    so.event_date        AS snapshot_date,
+                    CURRENT_DATE         AS snapshot_date,
                     ROW_NUMBER() OVER (
-                        PARTITION BY so.product_id, so.size, so.event_date
-                        ORDER BY so.color NULLS LAST
+                        PARTITION BY so.product_id, so.size
+                        ORDER BY so.event_date DESC, so.color NULLS LAST
                     ) AS rn
                 FROM so
                 JOIN products_dim pd ON pd.product_id = so.product_id
