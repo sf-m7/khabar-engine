@@ -217,9 +217,23 @@ PRODUCTS = [
             ),
             latest_stockout AS (SELECT max(snapshot_date) AS d FROM signal_l1_08_variant_stockout),
             category_stockout_context AS (
-                SELECT brand, category_normalized, stockout_events, on_discount_pct
+                -- FIXED 2026-07-21: this was a bare SELECT from l1_08, which is
+                -- natively brand+category+GENDER grain. Joined below at
+                -- brand+category only, it fanned out one row per gender per
+                -- match -- confirmed live: town_team/shirts/4XL produced three
+                -- rows (855/33/12) sharing one key, which would have collided
+                -- on write exactly like l1_22/l1_24 did. Aggregated to
+                -- brand+category here. The percentage is recomputed from
+                -- summed counts, not averaged -- averaging two differently-
+                -- sized groups' percentages directly would be a weighting
+                -- error even after the fan-out is fixed.
+                SELECT brand, category_normalized,
+                       sum(stockout_events)   AS stockout_events,
+                       round(100.0 * sum(on_discount_events) / NULLIF(sum(stockout_events), 0), 2)
+                                               AS on_discount_pct
                 FROM signal_l1_08_variant_stockout, latest_stockout
                 WHERE snapshot_date = latest_stockout.d
+                GROUP BY brand, category_normalized
             ),
             anomalies AS (
                 SELECT brand, category_normalized, count(*) AS statistical_anomalies
@@ -279,9 +293,15 @@ PRODUCTS = [
             ),
             latest_stockout AS (SELECT max(snapshot_date) AS d FROM signal_l1_08_variant_stockout),
             momentum AS (
-                SELECT brand, category_normalized, on_discount_pct
+                -- FIXED 2026-07-21: same bug as l2_09's category_stockout_context
+                -- — bare pass-through of a brand+category+gender table fanned
+                -- out at the brand+category join below. Same fix.
+                SELECT brand, category_normalized,
+                       round(100.0 * sum(on_discount_events) / NULLIF(sum(stockout_events), 0), 2)
+                                     AS on_discount_pct
                 FROM signal_l1_08_variant_stockout, latest_stockout
                 WHERE snapshot_date = latest_stockout.d
+                GROUP BY brand, category_normalized
             )
             SELECT
                 d.brand,
