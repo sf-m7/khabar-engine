@@ -268,10 +268,10 @@ def snapshots(con, days=30, end_day=None):
 
     # One Postgres read per process. No-op on every call after the first.
     materialise_hot(con)
-    # The view below joins products_dim for first_observed_price (the honest
-    # discount baseline). Ensure it exists regardless of call order; no-ops if
-    # prefetch() already built it.
-    materialise_products(con)
+    # The view below joins variant_baselines for the honest discount baseline
+    # (MIN first_observed_price per product). Ensure it exists regardless of
+    # call order; no-ops if prefetch() already built it.
+    variant_baselines(con)
 
     files = _day_files(con, start_day, end_day)
 
@@ -362,12 +362,23 @@ def snapshots(con, days=30, end_day=None):
             -- first witnessed. A brand cannot retroactively edit our own
             -- observation, and every brand has one regardless of whether they
             -- publish an RRP.
+            --
+            -- COLLAPSE RULE: MIN of the VARIANT-level first_observed_price,
+            -- matching l1_01 and l1_17 exactly (same filters: active product,
+            -- non-delisted variant, positive price). products.first_observed_
+            -- price is NOT used here even though it is product-level and would
+            -- be simpler -- checked live, the two disagree on 11.8% of products
+            -- (6,770 where the product-level value is higher, 1,501 lower). Had
+            -- this view used the product-level column, l1_10/l1_13 would have
+            -- reported a different discount depth than l1_01/l1_17 for the same
+            -- product on the same day, and a client dashboard would show two
+            -- contradictory numbers side by side.
             CASE
-                WHEN pf.first_observed_price IS NOT NULL
-                 AND pf.first_observed_price > 0
-                 AND pf.first_observed_price >= d.price
-                THEN ROUND(100.0 * (pf.first_observed_price - d.price)
-                           / pf.first_observed_price, 2)
+                WHEN pf.baseline_price IS NOT NULL
+                 AND pf.baseline_price > 0
+                 AND pf.baseline_price >= d.price
+                THEN ROUND(100.0 * (pf.baseline_price - d.price)
+                           / pf.baseline_price, 2)
                 ELSE NULL
             END AS honest_discount_pct,
             -- The brand's OWN claim, kept but named for what it is. Useful for
@@ -383,7 +394,12 @@ def snapshots(con, days=30, end_day=None):
                 ELSE NULL
             END AS brand_claimed_discount_pct
         FROM deduped d
-        LEFT JOIN products_dim pf ON pf.product_id = d.product_id
+        LEFT JOIN (
+            SELECT product_id, MIN(first_observed_price) AS baseline_price
+            FROM variant_baselines
+            WHERE first_observed_price IS NOT NULL AND first_observed_price > 0
+            GROUP BY product_id
+        ) pf ON pf.product_id = d.product_id
         WHERE d.rn = 1
     """)
 
