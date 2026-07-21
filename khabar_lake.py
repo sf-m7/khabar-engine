@@ -142,6 +142,7 @@ def connect():
 
 # Process-local. Reset per job because the DuckDB connection dies with it.
 _HOT_READY        = False
+_VARIANTS_READY   = False
 _BASELINES_READY  = False
 _PRODUCTS_READY   = False
 _EVENTS_READY     = False
@@ -164,6 +165,41 @@ def _lake_files(con):
     return _GLOB_CACHE
 
 
+def materialise_variants(con, force=False):
+    """
+    product_variants, pulled ONCE. Added 2026-07-21 after measuring that this
+    table was crossing the wire FOUR times per run: twice inside khabar_lake
+    (the hot_raw join and variant_baselines) and twice more from signal SQL
+    that queried pg.public.product_variants directly (l1_01, l1_17). At 452K
+    rows it is the single most expensive table in the pipeline, so paying for
+    it four times was the largest avoidable cost in the whole system.
+
+    Unfiltered on purpose: hot_raw joins snapshots against ALL variants, while
+    variant_baselines wants only active/non-delisted ones. Pulling the superset
+    once and filtering locally is strictly cheaper than two filtered pulls.
+    """
+    global _VARIANTS_READY
+    if _VARIANTS_READY and not force:
+        return con.execute("SELECT count(*) FROM variants_raw").fetchone()[0]
+
+    con.execute("DROP TABLE IF EXISTS variants_raw")
+    con.execute("""
+        CREATE TABLE variants_raw AS
+        SELECT
+            id                                      AS variant_id,
+            product_id                              AS product_id,
+            external_sku                            AS external_sku,
+            size                                    AS size,
+            color                                   AS color,
+            CAST(first_observed_price AS DOUBLE)    AS first_observed_price,
+            is_in_stock                             AS is_in_stock,
+            delisted_at                             AS delisted_at
+        FROM pg.public.product_variants
+    """)
+    _VARIANTS_READY = True
+    return con.execute("SELECT count(*) FROM variants_raw").fetchone()[0]
+
+
 def materialise_hot(con, force=False):
     """
     Pull the ENTIRE Supabase hot tier into a local DuckDB table, once.
@@ -181,6 +217,13 @@ def materialise_hot(con, force=False):
     if _HOT_READY and not force:
         return con.execute("SELECT count(*) FROM hot_raw").fetchone()[0]
 
+    # Dimensions first, so the join below reads LOCAL tables. This previously
+    # joined pg.public.products and pg.public.product_variants directly, which
+    # dragged both across the wire again on top of the copies prefetch() was
+    # already pulling. Both calls no-op if already materialised.
+    materialise_products(con)
+    materialise_variants(con)
+
     con.execute("DROP TABLE IF EXISTS hot_raw")
     con.execute(f"""
         CREATE TABLE hot_raw AS
@@ -195,15 +238,15 @@ def materialise_hot(con, force=False):
             p.gender                  AS gender,
             pv.size                   AS size,
             pv.color                  AS color,
-            CAST(p.attributes_extracted AS VARCHAR) AS attributes_extracted,
+            p.attributes_extracted    AS attributes_extracted,
             CAST(ps.price AS DOUBLE)             AS price,
             CAST(ps.compare_at_price AS DOUBLE)  AS compare_at_price,
             CAST(ps.discount_pct AS DOUBLE)      AS discount_pct,
             CAST(ps.snapshot_date AS VARCHAR)    AS snapshot_date,
             CAST(ps.recorded_at AS VARCHAR)      AS recorded_at
         FROM pg.public.price_snapshots ps
-        LEFT JOIN pg.public.products         p  ON p.id  = ps.product_id
-        LEFT JOIN pg.public.product_variants pv ON pv.id = ps.variant_id
+        LEFT JOIN products_dim p  ON p.product_id  = ps.product_id
+        LEFT JOIN variants_raw pv ON pv.variant_id = ps.variant_id
     """)
     _HOT_READY = True
     return con.execute("SELECT count(*) FROM hot_raw").fetchone()[0]
@@ -221,14 +264,15 @@ def prefetch(con):
     would not, and didn't — l1_10 and l1_11 failed in the field on exactly
     this, because the call below was missing. It no longer is.)
     """
-    n_snap = materialise_hot(con)
     n_prod = materialise_products(con)
+    n_var  = materialise_variants(con)
+    n_snap = materialise_hot(con)
     n_base = variant_baselines(con)
     n_stock, n_price = materialise_events(con)
-    print(f"  📥 Materialised once — hot snapshots: {n_snap:,}, "
-          f"products: {n_prod:,}, variant baselines: {n_base:,}, "
+    print(f"  📥 Materialised once each — snapshots: {n_snap:,}, products: "
+          f"{n_prod:,}, variants: {n_var:,}, baselines: {n_base:,}, "
           f"stockout events: {n_stock:,}, price events: {n_price:,}. "
-          f"Supabase will not be read again this run.")
+          f"Exactly 5 Postgres reads this run.")
     return n_snap, n_prod, n_base, n_stock, n_price
 
 
@@ -426,20 +470,24 @@ def variant_baselines(con):
     if _BASELINES_READY:
         return con.execute("SELECT count(*) FROM variant_baselines").fetchone()[0]
 
+    # Derived from the LOCAL variants_raw / products_dim copies rather than
+    # re-querying pg.public. Same filter, same result, zero extra egress.
+    materialise_products(con)
+    materialise_variants(con)
     con.execute("DROP TABLE IF EXISTS variant_baselines")
     con.execute("""
         CREATE TABLE variant_baselines AS
         SELECT
-            pv.id                   AS variant_id,
+            pv.variant_id           AS variant_id,
             pv.product_id           AS product_id,
             pv.external_sku         AS external_sku,
             pv.size                 AS size,
             pv.color                AS color,
-            CAST(pv.first_observed_price AS DOUBLE) AS first_observed_price,
+            pv.first_observed_price AS first_observed_price,
             pv.is_in_stock          AS is_in_stock,
             pv.delisted_at          AS delisted_at
-        FROM pg.public.product_variants pv
-        JOIN pg.public.products p ON p.id = pv.product_id
+        FROM variants_raw pv
+        JOIN products_dim p ON p.product_id = pv.product_id
         WHERE p.is_active = TRUE
           AND pv.delisted_at IS NULL
     """)
@@ -488,6 +536,7 @@ def materialise_products(con, force=False):
             category_normalized                  AS category_normalized,
             subcategory                          AS subcategory,
             gender                               AS gender,
+            CAST(attributes_extracted AS VARCHAR) AS attributes_extracted,
             CAST(first_observed_price AS DOUBLE) AS first_observed_price,
             CAST(first_seen_at AS VARCHAR)       AS first_seen_at,
             CAST(last_seen_at AS VARCHAR)        AS last_seen_at,
