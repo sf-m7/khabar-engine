@@ -894,25 +894,41 @@ ORDER BY a.last_depth_pct DESC
                 FROM price_events_raw
                 WHERE compare_at_price IS NOT NULL
                   AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            ),
+            ranked AS (
+                -- FIXED 2026-07-21: a product can have more than one qualifying
+                -- inflation event on the same calendar day (confirmed live: 46
+                -- product-days). snapshot_date is a day, not an instant, so the
+                -- PK (product_id, snapshot_date) needs exactly one row per day.
+                -- Keep the largest inflation of the day; drop the rest.
+                SELECT
+                    o.product_id,
+                    o.brand,
+                    pd.name              AS product_name,
+                    pd.department,
+                    pd.category_normalized,
+                    pd.subcategory,
+                    o.prev_compare_at,
+                    o.compare_at_price   AS new_compare_at,
+                    o.price_after        AS actual_price,
+                    ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
+                          / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
+                    CAST(o.recorded_at AS DATE) AS snapshot_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY o.product_id, CAST(o.recorded_at AS DATE)
+                        ORDER BY (o.compare_at_price - o.prev_compare_at) DESC
+                    ) AS rn
+                FROM ordered o
+                JOIN products_dim pd ON pd.product_id = o.product_id
+                WHERE o.prev_compare_at IS NOT NULL
+                  AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
+                  AND o.price_after = o.prev_price             -- actual price UNCHANGED
             )
-            SELECT
-                o.product_id,
-                o.brand,
-                pd.name              AS product_name,
-                pd.department,
-                pd.category_normalized,
-                pd.subcategory,
-                o.prev_compare_at,
-                o.compare_at_price   AS new_compare_at,
-                o.price_after        AS actual_price,
-                ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
-                      / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
-                CAST(o.recorded_at AS DATE) AS snapshot_date
-            FROM ordered o
-            JOIN products_dim pd ON pd.product_id = o.product_id
-            WHERE o.prev_compare_at IS NOT NULL
-              AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
-              AND o.price_after = o.prev_price             -- actual price UNCHANGED
+            SELECT product_id, brand, product_name, department, category_normalized,
+                   subcategory, prev_compare_at, new_compare_at, actual_price,
+                   anchor_inflation_pct, snapshot_date
+            FROM ranked
+            WHERE rn = 1
         """,
     },
 
@@ -927,7 +943,7 @@ ORDER BY a.last_depth_pct DESC
         "name": "Discount Velocity Anomaly",
         "level": "L1",
         "table": "signal_l1_22_discount_velocity",
-        "unique_on": ["brand", "category_normalized", "window_start"],
+        "unique_on": ["brand", "category_normalized", "subcategory", "window_start"],
         "window_days": 90,
         "min_days": 1,
         "enabled": True,
@@ -946,16 +962,23 @@ ORDER BY a.last_depth_pct DESC
                 WHERE pe.direction = 'down'
                   AND CAST(pe.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
             )
+            -- FIXED 2026-07-21: subcategory was grouped on but not part of the
+            -- table's primary key (brand, category_normalized, window_start) --
+            -- one category spanning two subcategories in the same burst window
+            -- produced two rows sharing one key. Confirmed live: crashed the
+            -- production run on its first real write. The key is now widened
+            -- to include subcategory (migration applied), and it can no longer
+            -- be NULL there, hence the coalesce below.
             SELECT
                 brand,
                 department,
                 category_normalized,
-                subcategory,
+                COALESCE(subcategory, '(none)') AS subcategory,
                 window_start,
                 count(DISTINCT product_id) AS skus_dropped,
                 CAST(window_start AS DATE) AS snapshot_date
             FROM drops
-            GROUP BY brand, department, category_normalized, subcategory, window_start
+            GROUP BY brand, department, category_normalized, COALESCE(subcategory, '(none)'), window_start
             HAVING count(DISTINCT product_id) >= 15   -- burst threshold; tune after first real output
         """,
     },
@@ -973,18 +996,21 @@ ORDER BY a.last_depth_pct DESC
         "name": "Restock Density",
         "level": "L1",
         "table": "signal_l1_24_restock_density",
-        "unique_on": ["brand", "category_normalized", "color", "restock_date"],
+        "unique_on": ["brand", "category_normalized", "subcategory", "color", "restock_date"],
         "window_days": 90,
         "min_days": 1,
         "enabled": True,
         "requires": [],
         "sql": """
+            -- FIXED 2026-07-21: same bug class as l1_22 -- subcategory (and
+            -- color) grouped on but not in the original key. Same fix: key
+            -- widened (migration applied), coalesce so NULLs don't violate it.
             SELECT
                 so.brand,
                 pd.department,
                 pd.category_normalized,
-                pd.subcategory,
-                so.color,
+                COALESCE(pd.subcategory, '(none)') AS subcategory,
+                COALESCE(so.color, '(none)') AS color,
                 CAST(so.recorded_at AS DATE) AS restock_date,
                 count(*)                     AS variants_restocked,
                 count(DISTINCT so.product_id) AS products_affected,
@@ -994,7 +1020,8 @@ ORDER BY a.last_depth_pct DESC
             WHERE so.event_type = 'restock'
               AND so.witnessed = TRUE
               AND CAST(so.recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
-            GROUP BY so.brand, pd.department, pd.category_normalized, pd.subcategory,
+            GROUP BY so.brand, pd.department, pd.category_normalized,
+                     COALESCE(pd.subcategory, '(none)'), COALESCE(so.color, '(none)'),
                      so.color, CAST(so.recorded_at AS DATE)
         """,
     },
@@ -1031,24 +1058,40 @@ ORDER BY a.last_depth_pct DESC
                 FROM variant_baselines
                 WHERE is_in_stock = TRUE AND size IS NOT NULL
                 GROUP BY product_id
+            ),
+            ranked AS (
+                -- FIXED 2026-07-21: the same product+size can stock out more than
+                -- once on the same calendar day (confirmed live: 595 product-size-
+                -- days). PK is (product_id, size, snapshot_date) -- one row per
+                -- day required. Keep one deterministically; colour is incidental
+                -- to which specific event, not to the pattern being reported.
+                SELECT
+                    so.product_id,
+                    so.brand,
+                    pd.name              AS product_name,
+                    pd.department,
+                    pd.category_normalized,
+                    pd.subcategory,
+                    so.size              AS stocked_out_size,
+                    so.color             AS stocked_out_color,
+                    ss.sizes_still_in_stock,
+                    so.event_date,
+                    so.event_date        AS snapshot_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY so.product_id, so.size, so.event_date
+                        ORDER BY so.color NULLS LAST
+                    ) AS rn
+                FROM so
+                JOIN products_dim pd ON pd.product_id = so.product_id
+                LEFT JOIN still_stocked ss ON ss.product_id = so.product_id
+                WHERE ss.sizes_still_in_stock IS NOT NULL
+                  AND len(ss.sizes_still_in_stock) > 0   -- other sizes genuinely remain
             )
-            SELECT
-                so.product_id,
-                so.brand,
-                pd.name              AS product_name,
-                pd.department,
-                pd.category_normalized,
-                pd.subcategory,
-                so.size              AS stocked_out_size,
-                so.color             AS stocked_out_color,
-                ss.sizes_still_in_stock,
-                so.event_date,
-                so.event_date        AS snapshot_date
-            FROM so
-            JOIN products_dim pd ON pd.product_id = so.product_id
-            LEFT JOIN still_stocked ss ON ss.product_id = so.product_id
-            WHERE ss.sizes_still_in_stock IS NOT NULL
-              AND len(ss.sizes_still_in_stock) > 0   -- other sizes genuinely remain
+            SELECT product_id, brand, product_name, department, category_normalized,
+                   subcategory, stocked_out_size, stocked_out_color,
+                   sizes_still_in_stock, event_date, snapshot_date
+            FROM ranked
+            WHERE rn = 1
         """,
     },
 
