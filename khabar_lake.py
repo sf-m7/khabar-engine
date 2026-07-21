@@ -464,6 +464,10 @@ def materialise_events(con, force=False):
         n2 = con.execute("SELECT count(*) FROM price_events_raw").fetchone()[0]
         return n1, n2
 
+    materialise_products(con)   # stock_events below joins products_dim; ensure it exists
+                                 # regardless of call order — no extra Postgres read if
+                                 # already materialised, materialise_products() no-ops.
+
     con.execute("DROP TABLE IF EXISTS stockouts_raw")
     con.execute("""
         CREATE TABLE stockouts_raw AS
@@ -506,6 +510,43 @@ def materialise_events(con, force=False):
     _EVENTS_READY = True
     n1 = con.execute("SELECT count(*) FROM stockouts_raw").fetchone()[0]
     n2 = con.execute("SELECT count(*) FROM price_events_raw").fetchone()[0]
+
+    # =========================================================================
+    # stock_events — REBUILT 2026-07-21. This view already existed in
+    # production before today's changes; l1_08 (Variant Stockout) and l1_09
+    # (Variant Restock) depend on it directly by name and were broken by the
+    # rewrite of this file until this was restored. Rebuilt from stockouts_raw
+    # (already witnessed-filtered) joined to products_dim for the columns
+    # those two signals expect on every row: category_normalized, gender,
+    # event_date. No additional Postgres read — both source tables are
+    # already local by this point in prefetch().
+    #
+    # Filtered to witnessed = TRUE strictly (not "OR NULL" like stockouts_raw
+    # itself) — l1_08/l1_09 only ever touch event_type IN ('stockout',
+    # 'restock'), and delisted-type rows (which carry witnessed = NULL by
+    # design) have no place in an inventory-movement view. Matches the
+    # contract documented in signals.py's BLOCKERS["seeded_stockout"].
+    # =========================================================================
+    con.execute("DROP VIEW IF EXISTS stock_events")
+    con.execute("""
+        CREATE VIEW stock_events AS
+        SELECT
+            so.event_id,
+            so.variant_id,
+            so.product_id,
+            so.brand,
+            pd.category_normalized,
+            pd.gender,
+            so.event_type,
+            so.was_on_discount,
+            so.recorded_at,
+            CAST(so.recorded_at AS DATE) AS event_date
+        FROM stockouts_raw so
+        JOIN products_dim pd ON pd.product_id = so.product_id
+        WHERE so.witnessed = TRUE
+          AND so.event_type IN ('stockout', 'restock')
+    """)
+
     return n1, n2
 
 
