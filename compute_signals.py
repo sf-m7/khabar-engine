@@ -222,7 +222,18 @@ def run_signal(con, pg, signal):
 
     except Exception as e:
         # A broken signal must not take down the other 37.
-        print(f"     ❌ FAILED: {e}")
+        #
+        # FIXED 2026-07-21 -- this promise was false. A failed query leaves the
+        # connection in an aborted-transaction state; Postgres refuses every
+        # command on it, including log_run()'s own INSERT, until something
+        # calls rollback(). Without it, one signal's failure raised a SECOND,
+        # uncaught exception trying to log the first -- which propagated out of
+        # run_signal entirely and killed the whole run. Confirmed live: l1_22
+        # failed on a duplicate key, and l1_24/l1_11/l1_06/l1_14 never even
+        # started as a result, despite every one of them being independent of
+        # l1_22's failure.
+        print(f"     FAILED: {e}")
+        pg.rollback()
         log_run(pg, signal, "failed", error_message=str(e)[:2000],
                 duration_seconds=round(time.time() - started, 2))
         return "failed"
