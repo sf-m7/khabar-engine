@@ -1,0 +1,38 @@
+name: Khabar L2 Products
+
+# Manual-trigger only for now, same posture as the L1 signal engine had on
+# day one — run it by hand until a few real cycles are trusted, then add a
+# schedule. When that happens, this MUST run after Signal Engine finishes,
+# not in parallel or before: L2 reads the signal_l1_* tables L1 just wrote.
+# If you give this a cron schedule, put it comfortably after Signal Engine's
+# own schedule, not at the same time — check that workflow's cron before
+# picking one here.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (compute + log, write nothing)"
+        type: boolean
+        default: true
+
+jobs:
+  compute_products:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Only dependency is psycopg2 — this engine reads the small signal_l1_*
+      # tables directly over Postgres. No DuckDB, no khabar_lake, no R2
+      # credentials needed, unlike Signal Engine's workflow.
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Run L2 product engine
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PRODUCTS_DRY_RUN: ${{ inputs.dry_run }}
+        run: python -u compute_products.py
