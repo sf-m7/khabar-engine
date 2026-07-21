@@ -1,0 +1,32 @@
+name: Khabar — Verify FOP Immutability (one-off)
+
+# Manual only. This is a diagnostic, not a pipeline stage — it doesn't need
+# a schedule and shouldn't get one. Delete this workflow file once the check
+# has been run and the result is confirmed; no reason to keep it around.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify_fop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Same dependencies as Signal Engine, because this script imports
+      # khabar_lake.py and calls connect()/snapshots() exactly like
+      # compute_signals.py does — it needs the same R2 + Postgres access.
+      - name: Install dependencies
+        run: pip install duckdb psycopg2-binary
+
+      - name: Run FOP immutability check
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+        run: python -u verify_fop_immutability.py
