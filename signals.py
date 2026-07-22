@@ -1229,6 +1229,173 @@ ORDER BY a.last_depth_pct DESC
               AND CAST(pd.first_seen_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
         """,
     },
+
+    # =====================================================================
+    # PRICING-BEHAVIOUR SIGNALS — added 2026-07-22.
+    #
+    # These were NOT in the original L0->L4 spec. They emerged from looking
+    # at real accumulated price_events data and noticing that each brand has
+    # a stable, measurable discounting personality that the theory never
+    # named. All three read price_events_raw (already materialised in the
+    # lake), compute at brand or brand+category grain, and are dated by
+    # observation day so history accrues forward.
+    # =====================================================================
+
+    # ---------------------------------------------------------------------
+    # PRICING DISCIPLINE INDEX. Each brand+category has a typical discount
+    # depth AND a consistency (stddev). A tight brand is disciplined; a wide
+    # one is reactive. Robust today -- built purely on witnessed price
+    # events, needs no more history to be meaningful.
+    # ---------------------------------------------------------------------
+    {
+        "id": "l2_pricing_discipline",
+        "name": "Pricing Discipline Index",
+        "level": "L2",
+        "table": "signal_l2_pricing_discipline",
+        "unique_on": ["brand", "category_normalized", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH events AS (
+                SELECT pe.brand, pd.category_normalized, pe.discount_pct
+                FROM price_events_raw pe
+                JOIN products_dim pd ON pd.product_id = pe.product_id
+                WHERE pe.direction = 'down'
+                  AND pe.discount_pct > 0
+                  AND pd.category_normalized <> 'uncategorized'
+            )
+            SELECT
+                brand,
+                category_normalized,
+                count(*)                                    AS discount_events,
+                ROUND(avg(discount_pct)::numeric, 1)         AS avg_depth_pct,
+                ROUND(median(discount_pct)::numeric, 1)      AS median_depth_pct,
+                ROUND(stddev(discount_pct)::numeric, 1)      AS depth_stddev,
+                CASE
+                    WHEN stddev(discount_pct) <= 7  THEN 'disciplined — consistent, predictable depth'
+                    WHEN stddev(discount_pct) <= 13 THEN 'moderate'
+                    ELSE 'reactive — inconsistent depth, likely chasing the market'
+                END                                          AS discipline_read,
+                CURRENT_DATE                                 AS snapshot_date
+            FROM events
+            GROUP BY brand, category_normalized
+            HAVING count(*) >= 10   -- need a real sample to call it a pattern
+        """,
+    },
+
+    # ---------------------------------------------------------------------
+    # FIRST-MOVER MAP. Within a category, who cuts FIRST and who follows.
+    # Populates now (shirts: 15 brands/31 days) and sharpens as more discount
+    # cycles accrue. The single most strategically wanted answer: am I
+    # leading the market down or reacting to someone else.
+    # ---------------------------------------------------------------------
+    {
+        "id": "l2_first_mover",
+        "name": "First-Mover Map",
+        "level": "L2",
+        "table": "signal_l2_first_mover",
+        "unique_on": ["category_normalized", "brand", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 7,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH cat_events AS (
+                SELECT pe.brand, pd.category_normalized,
+                       CAST(pe.recorded_at AS DATE) AS event_date
+                FROM price_events_raw pe
+                JOIN products_dim pd ON pd.product_id = pe.product_id
+                WHERE pe.direction = 'down'
+                  AND pd.category_normalized <> 'uncategorized'
+            ),
+            category_first AS (
+                SELECT category_normalized, min(event_date) AS category_first_date
+                FROM cat_events GROUP BY category_normalized
+            ),
+            brand_cat AS (
+                SELECT category_normalized, brand,
+                       count(DISTINCT event_date) AS discount_days,
+                       min(event_date)            AS first_discount_date
+                FROM cat_events GROUP BY category_normalized, brand
+            )
+            SELECT
+                bc.category_normalized,
+                bc.brand,
+                bc.discount_days,
+                bc.first_discount_date,
+                (bc.first_discount_date - cf.category_first_date)::numeric
+                                                    AS avg_days_after_category_first,
+                CASE
+                    WHEN bc.first_discount_date = cf.category_first_date THEN 'first mover — sets the category pace'
+                    WHEN bc.first_discount_date - cf.category_first_date <= 3 THEN 'fast follower'
+                    ELSE 'late follower — reacts well after the category moves'
+                END                                 AS mover_read,
+                CURRENT_DATE                        AS snapshot_date
+            FROM brand_cat bc
+            JOIN category_first cf ON cf.category_normalized = bc.category_normalized
+            WHERE bc.discount_days >= 2   -- ignore one-off noise
+        """,
+    },
+
+    # ---------------------------------------------------------------------
+    # TRAINED-CUSTOMER RISK INDEX. A brand that discounts often + deeply +
+    # predictably is teaching customers never to pay full price. Frequency x
+    # depth x regularity, per brand. Emergent -- only visible once you can
+    # see a brand's rhythm across weeks. Populates now, sharpens with time.
+    # ---------------------------------------------------------------------
+    {
+        "id": "l2_trained_customer",
+        "name": "Trained-Customer Risk Index",
+        "level": "L2",
+        "table": "signal_l2_trained_customer",
+        "unique_on": ["brand", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 7,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH b AS (
+                SELECT
+                    brand,
+                    count(*)                              AS discount_events,
+                    count(DISTINCT CAST(recorded_at AS DATE)) AS active_days,
+                    (max(CAST(recorded_at AS DATE))
+                     - min(CAST(recorded_at AS DATE)) + 1) AS span_days,
+                    avg(discount_pct)                     AS avg_depth,
+                    stddev(discount_pct)                  AS depth_consistency
+                FROM price_events_raw
+                WHERE direction = 'down' AND discount_pct > 0
+                GROUP BY brand
+                HAVING count(*) >= 50
+            )
+            SELECT
+                brand,
+                discount_events,
+                active_days,
+                span_days,
+                ROUND(100.0 * active_days / NULLIF(span_days, 0), 1) AS pct_days_discounting,
+                ROUND(avg_depth::numeric, 1)                         AS avg_depth_pct,
+                ROUND(depth_consistency::numeric, 1)                 AS depth_consistency,
+                -- High risk = discounts on a large share of days AND at real
+                -- depth. Predictability (low stddev) makes it worse, not better,
+                -- because customers can time it -- so a tight, frequent, deep
+                -- discounter is the textbook "trained customer" case.
+                CASE
+                    WHEN 100.0 * active_days / NULLIF(span_days,0) >= 50
+                     AND avg_depth >= 20
+                        THEN 'high — frequent and deep, training customers to wait'
+                    WHEN 100.0 * active_days / NULLIF(span_days,0) >= 50
+                        THEN 'elevated — very frequent discounting'
+                    WHEN avg_depth >= 30
+                        THEN 'watch — infrequent but very deep'
+                    ELSE 'healthy — full price holds most of the time'
+                END                                                  AS risk_read,
+                CURRENT_DATE                                         AS snapshot_date
+            FROM b
+        """,
+    },
 ]
 
 
