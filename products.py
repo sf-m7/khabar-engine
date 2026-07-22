@@ -109,7 +109,15 @@ PRODUCTS = [
         "name": "Brand Health Dashboard",
         "table": "product_l2_08_brand_health",
         "unique_on": ["brand", "category_normalized", "report_date"],
-        "requires": ["l1_01", "l1_04", "l1_10", "l1_09", "l1_17"],
+        # NOTE: l1_04 (Anchor Inflation) is intentionally NOT in "requires".
+        # It legitimately returns 0 rows — verified 2026-07-21 that no anchor
+        # manipulation exists in the data (when brands raise RRP they raise the
+        # real price too). Requiring it would block this whole product forever
+        # on a dependency that is correctly empty. The SQL below LEFT JOINs it
+        # and COALESCEs anchor_inflation_events to 0, so its absence changes
+        # nothing except that one (honestly zero) column. If anchor events ever
+        # start appearing, they flow in automatically with no code change.
+        "requires": ["l1_01", "l1_10", "l1_09", "l1_17"],
         "sql": """
             WITH latest_drop AS (SELECT max(snapshot_date) AS d FROM signal_l1_01_genuine_price_drop),
             drops AS (
