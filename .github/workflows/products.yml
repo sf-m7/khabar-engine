@@ -7,7 +7,19 @@ name: Khabar L2 Products
 # If you give this a cron schedule, put it comfortably after Signal Engine's
 # own schedule, not at the same time — check that workflow's cron before
 # picking one here.
+# Runs daily at 09:03 UTC (11:03 AM Egypt) — 30 minutes after Signal Engine's
+# 08:33 UTC start, which takes ~3 min, so L1 has always finished writing before
+# L2 reads it. If you ever change Signal Engine's time, move this in the same
+# commit to stay 30 min behind it — L2 computing on a half-written L1 run would
+# produce quietly wrong numbers.
+#
+# Egress note: unlike Signal Engine, L2 never touches the lake or the large
+# tables. It reads only the small signal_l1_* result tables (kilobytes each)
+# directly over Postgres, so this schedule adds negligible egress — nothing to
+# optimise here.
 on:
+  schedule:
+    - cron: "3 9 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -34,5 +46,10 @@ jobs:
       - name: Run L2 product engine
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          PRODUCTS_DRY_RUN: ${{ inputs.dry_run }}
+          # Scheduled (cron) runs are ALWAYS production: github.event_name is
+          # 'schedule', so this evaluates to 'false' and writes for real. Only
+          # a manual workflow_dispatch can request a dry run, via its checkbox.
+          # Same guard as Signal Engine — without it, inputs.dry_run is empty on
+          # a schedule trigger and the daily run could silently write nothing.
+          PRODUCTS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: python -u compute_products.py
