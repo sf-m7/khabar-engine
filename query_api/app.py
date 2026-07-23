@@ -16,12 +16,18 @@ filter) lives in khabar_lake.py and is inherited as-is. This file only adds:
 
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime
 
 from flask import Flask, request, jsonify
 
+# khabar_lake.py lives at the repo root (it's compute_signals.py's file too —
+# this app must import that exact copy, not a duplicate, so the two never
+# drift apart). This file is at <repo_root>/query_api/app.py, so its
+# grandparent directory is the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import khabar_lake
 
 app = Flask(__name__)
