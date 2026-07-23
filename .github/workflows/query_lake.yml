@@ -1,0 +1,45 @@
+name: Ad-hoc lake query
+
+# Manual trigger only. This is a question-answering tool, not part of the
+# pipeline — it must never run on a schedule or on push.
+on:
+  workflow_dispatch:
+    inputs:
+      sql:
+        description: "SQL to run against the lake (SELECT / WITH only)"
+        required: true
+        type: string
+        default: "SELECT brand, count(*) AS rows FROM snapshots GROUP BY brand ORDER BY rows DESC"
+      window_days:
+        description: "How many days of history to load (bigger = slower)"
+        required: false
+        type: string
+        default: "90"
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install duckdb
+
+      - name: Run query
+        env:
+          # Same secrets the scraper and signal engine already use — no new
+          # credentials introduced by this workflow.
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          QUERY_SQL: ${{ inputs.sql }}
+          WINDOW_DAYS: ${{ inputs.window_days }}
+        run: python query_lake.py
