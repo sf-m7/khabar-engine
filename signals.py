@@ -285,8 +285,22 @@ WHERE d.days_observed < {min_days}
         "min_days":    1,
         "unique_on": ["product_id", "snapshot_date"],
         "sql": """
-WITH latest_day AS (
-    SELECT max(snapshot_date) AS d FROM snapshots
+WITH brand_latest AS (
+    -- PER-BRAND, not global (fixed 2026-07-23). This was max(snapshot_date)
+    -- across ALL brands. LC Waikiki scrapes once daily at 18:00 UTC while the
+    -- Shopify brands scrape three times a day, so LCW is routinely one day
+    -- behind the global maximum — and a global max silently excluded it from
+    -- this signal ENTIRELY rather than reporting its most recent available
+    -- day. Confirmed live: LCW's last snapshot was 2026-07-22 against a global
+    -- max of 2026-07-23, and LCW returned zero rows here as a result.
+    --
+    -- Any brand that misses a run, or simply runs on a slower cadence, hit the
+    -- same silent exclusion. Zero rows read as "this brand never discounts",
+    -- which is the opposite of a missing observation and the more dangerous of
+    -- the two to publish.
+    SELECT brand, max(snapshot_date) AS d
+    FROM snapshots
+    GROUP BY brand
 ),
 baselines AS (
     SELECT
@@ -301,10 +315,23 @@ baselines AS (
     GROUP BY pv.product_id
 ),
 today AS (
-    SELECT s.*
-    FROM snapshots s, latest_day l
-    WHERE s.snapshot_date = l.d
-      AND s.price IS NOT NULL AND s.price > 0
+    -- One row per product, taken from that product's OWN brand's latest day.
+    -- The ROW_NUMBER collapse matters because the Shopify engines snapshot
+    -- three times daily: without it a product can appear several times on its
+    -- latest day, this signal emits duplicates, and `unique_on` then keeps an
+    -- arbitrary one of them rather than the most recently recorded.
+    SELECT * FROM (
+        SELECT s.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY s.product_id
+                   ORDER BY s.recorded_at DESC
+               ) AS rn
+        FROM snapshots s
+        JOIN brand_latest bl
+          ON bl.brand = s.brand
+         AND s.snapshot_date = bl.d
+        WHERE s.price IS NOT NULL AND s.price > 0
+    ) WHERE rn = 1
 )
 SELECT
     t.product_id,
