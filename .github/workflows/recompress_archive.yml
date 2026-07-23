@@ -1,0 +1,49 @@
+name: Recompress archive (zstd -> snappy)
+
+# Manual only. This rewrites cold-archive objects, so it must never fire on a
+# schedule or on push. Default mode is the safe probe.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe = one file to a scratch prefix | apply = whole archive"
+        required: true
+        type: choice
+        options: [probe, apply]
+        default: probe
+      day:
+        description: "Optional day for probe mode, e.g. 2026-07-08"
+        required: false
+        type: string
+
+jobs:
+  recompress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3 pyarrow
+
+      - name: Run
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          if [ "${{ inputs.mode }}" = "probe" ]; then
+            if [ -n "${{ inputs.day }}" ]; then
+              python recompress_archive.py --probe --day "${{ inputs.day }}"
+            else
+              python recompress_archive.py --probe
+            fi
+          else
+            python recompress_archive.py --apply
+          fi
