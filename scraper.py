@@ -4741,6 +4741,7 @@ def collect_bestseller_ranks(supabase, session):
     today_str = str(date.today())
     shopify_brands = [b for b in BRANDS if b["engine"] == "shopify"]
     total_recorded = 0
+    blocked = 0
 
     for brand in shopify_brands:
         brand_name = brand["name"]
@@ -4759,15 +4760,42 @@ def collect_bestseller_ranks(supabase, session):
 
             url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit=250"
             try:
+                # v14.45 FIX: use the SAME session the brand's normal scrape
+                # uses, instead of the shared one passed in.
+                #
+                # The passed-in `session` is a direct connection from the
+                # GitHub Actions runner. Every CF-RAY in the failure logs ended
+                # in "-SEA" — Seattle, i.e. the runner's own datacenter IP, not
+                # a DataImpulse residential exit. Nineteen Shopify brands were
+                # therefore hitting Cloudflare from one datacenter address
+                # within a couple of minutes, and every single one came back
+                # 429 with Retry-After: 60.
+                #
+                # The catalog scrape for these same brands succeeds in the same
+                # run, because it goes through get_shopify_session(). This call
+                # is the only place that skipped it. Nothing in our code
+                # changed when this broke — Cloudflare simply tightened on that
+                # IP range, which is exactly the failure a residential proxy
+                # exists to avoid.
+                #
+                # The explicit "Mozilla/5.0" header is also dropped: it
+                # overrode the Chrome-124 TLS fingerprint the session already
+                # impersonates, producing a request whose headers and TLS
+                # signature disagreed — a combination Cloudflare scores badly
+                # on its own.
+                bs_session = get_shopify_session(brand_name)
                 res = execute_with_retry(
-                    session.get, url, max_retries=2, backoff=3, timeout=30,
-                    headers={"User-Agent": "Mozilla/5.0"}
+                    bs_session.get, url, max_retries=2, backoff=3, timeout=30
                 )
             except Exception as e:
+                if "429" in str(e):
+                    blocked += 1
                 print(f"  ⚠️ [Bestseller] {brand_name}: request failed ({e}). Skipping.")
                 continue
 
             if res.status_code != 200:
+                if res.status_code == 429:
+                    blocked += 1
                 print(f"  ⚠️ [Bestseller] {brand_name}: HTTP {res.status_code}. Skipping.")
                 continue
 
@@ -4829,6 +4857,19 @@ def collect_bestseller_ranks(supabase, session):
     if total_recorded:
         print(f"  🏆 Best-seller ranks recorded: {total_recorded} products across "
               f"{len(shopify_brands)} Shopify brands.")
+
+    # v14.45 — a fleet-wide block is a different problem from one brand being
+    # unreachable, and the old per-brand warnings hid that: nineteen identical
+    # lines scrolled past and the run still ended with a green tick, so the
+    # feed went silent for two days without anything surfacing it. If most of
+    # the fleet is refusing at once, the cause is the connection, not the
+    # brands, and this says so once and plainly.
+    if blocked and blocked >= max(3, len(shopify_brands) // 2):
+        print(f"  ⚠️  [Bestseller] {blocked}/{len(shopify_brands)} brands returned "
+              f"HTTP 429 in the same run. That pattern means the requests are "
+              f"being rate-limited by source IP, not by any individual store. "
+              f"Check that DATAIMPULSE credentials are set and that these "
+              f"brands are listed in DATAIMPULSE_PROXY_BRANDS.")
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
