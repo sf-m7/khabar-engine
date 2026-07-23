@@ -1345,6 +1345,29 @@ def detect_and_write_stockout(supabase, variant_db_id, product_id, brand,
         "price_at_event":       curr_price,
         "discount_pct_at_event": discount_pct,
         "was_on_discount":      bool(discount_pct),
+        # v14.44 FIX: write `witnessed` PROVISIONALLY TRUE at insert time.
+        #
+        # housekeeping.py Task 7 documents, and depends on, exactly this
+        # contract: "The scraper writes `witnessed = true` provisionally on
+        # every new event ... this task re-judges every event against that
+        # variant's FULL history and demotes the ones that don't hold up."
+        # The scraper never actually wrote the column, so every new event
+        # landed as NULL — and Task 7's reclassifier only DEMOTES true→false,
+        # so NULL rows were never judged and never corrected. They simply
+        # accumulated, invisible to every downstream query, because
+        # compute_signals.py materialises stock events witnessed-ONLY.
+        #
+        # Measured 2026-07-23: 4,289 restock and 4,095 stockout rows sitting
+        # at NULL — roughly 16% of all transitions silently dropped out of
+        # Revealed Demand, Size Demand Map and restock-velocity work.
+        #
+        # True is the correct provisional value here: this function only runs
+        # when prev_stock != curr_stock and the caller has already confirmed a
+        # prior observed state exists for this variant, so BOTH endpoints of
+        # the transition were directly observed. Sequence-level failures
+        # (orphan_restock, duplicate_transition) are not visible from here and
+        # remain Task 7's job.
+        "witnessed":            True,
         "recorded_at":          datetime.now(timezone.utc).isoformat(),
     }))
 
@@ -2380,6 +2403,17 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
 
+# v14.44 — set once per process by the LCW field inspector (see scrape_lcw).
+# Module-level so the dump prints a single time per run rather than once per
+# catalog item.
+_LCW_FIELDS_DUMPED = False
+
+# v14.44 — run-level discount tally, used by the sanity check at the end of
+# scrape_lcw. Lists rather than ints so the inner catalog loop can increment
+# them without a `global` declaration at every touch point.
+_LCW_DISCOUNTED_SEEN = [0]
+_LCW_ITEMS_SEEN = [0]
+
 LCW_CATEGORIES = [
     {
         "id": 9, "name": "Men", "gender": "men",
@@ -3108,17 +3142,69 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 product_variant_tracking.setdefault(db_pid, [])
                 opt_id = item.get("OptionId")
 
+                # v14.44 — one-shot field inspector. LCW changes its payload
+                # shape without notice, and a renamed price field fails SILENTLY
+                # (everything reads as full price) rather than raising. Set the
+                # repo variable LCW_DEBUG_FIELDS=1 and read the next run's log to
+                # see the real keys and price-ish values on a live item, instead
+                # of guessing which field died. Off by default; prints once.
+                global _LCW_FIELDS_DUMPED
+                if env_str("LCW_DEBUG_FIELDS", "") == "1" and not _LCW_FIELDS_DUMPED:
+                    _LCW_FIELDS_DUMPED = True
+                    price_ish = {k: v for k, v in item.items()
+                                 if any(t in k.lower() for t in
+                                        ("price", "discount", "old", "amount"))}
+                    print(f"  [LCW][DEBUG] item keys: {sorted(item.keys())}")
+                    print(f"  [LCW][DEBUG] price-related fields: {price_ish}")
+
                 is_discounted  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
                 discounted_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
                 full_val       = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
                 old_val        = _parse_lcw_price(item.get("MinOldPrice"))
 
-                if is_discounted and discounted_val > 0:
-                    price      = discounted_val
-                    compare_at = (old_val or full_val) if (old_val or full_val) > discounted_val else None
+                # v14.44 — DISCOUNT DETECTION IS NOW NUMERIC, NOT FLAG-DRIVEN.
+                #
+                # The old logic gated everything on `is_discounted`. If that flag
+                # is absent or renamed, every LCW item silently reads as full
+                # price, compare_at is never set, and first_observed_price gets
+                # anchored to the discounted price — after which the brand can
+                # never register a genuine drop again, because its baseline IS
+                # the sale price.
+                #
+                # That is not hypothetical. Measured 2026-07-23 across nine
+                # consecutive days and ~11,000 products per day: LCW recorded
+                # ZERO rows with a compare_at_price. Not a low number — zero, on
+                # every single day. Meanwhile price_events held 640 downward
+                # moves for the same brand, and 12,738 of 12,748 products sat at
+                # a price exactly equal to their baseline. A brand that visibly
+                # discounts cannot produce that shape; only a broken read can.
+                # LCW has already moved fields once this year (cartOperationViewModel
+                # went off-page in June 2026), so a renamed flag is the likely
+                # cause and will happen again.
+                #
+                # The fix is to stop asking the API whether something is on sale
+                # and instead compare the numbers it gives us. A "was" price that
+                # sits above the current price IS a discount, whatever the flag
+                # says. The flag is still honoured when present, but it can no
+                # longer VETO a discount that the prices themselves demonstrate.
+                candidates = [v for v in (full_val, old_val) if v and v > 0]
+                if discounted_val and discounted_val > 0:
+                    price = discounted_val
+                elif is_discounted and candidates:
+                    price = min(candidates)
                 else:
-                    price, compare_at = full_val, None
-                if price == 0: continue
+                    price = full_val
+                if not price or price <= 0:
+                    continue
+
+                # compare_at = the highest credible "before" price on the record,
+                # accepted only when it genuinely exceeds what is being charged.
+                # A 1% floor keeps rounding noise out of the discount signals.
+                highest_prior = max(candidates) if candidates else 0
+                compare_at    = highest_prior if highest_prior > price * 1.01 else None
+                if compare_at:
+                    _LCW_DISCOUNTED_SEEN[0] += 1
+                _LCW_ITEMS_SEEN[0] += 1
 
                 is_avail   = int(item.get("AvailableStock") or 0) > 0
                 sku        = f"lcw_{opt_id}"
@@ -3444,6 +3530,28 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
         print(f"  [LCW] Sizes: {fetched} pages fetched, {populated_rows} variant rows populated.")
     except Exception as e:
         print(f"  [LCW] Size population error (non-fatal): {e}")
+
+    # v14.44 — DISCOUNT SANITY CHECK.
+    #
+    # The failure this guards against produced no error, no exception and no
+    # missing rows. Prices kept arriving, snapshots kept being written, and the
+    # only symptom was that compare_at_price was NULL on every row — which
+    # nothing looked at. It survived nine days and ~100,000 observations before
+    # a client-facing question exposed it.
+    #
+    # A full LCW catalog pass finding literally zero discounted items is not a
+    # quiet market day; it means the price fields moved again. Anything above
+    # zero is plausible and stays silent.
+    seen, disc = _LCW_ITEMS_SEEN[0], _LCW_DISCOUNTED_SEEN[0]
+    if seen:
+        pct = 100.0 * disc / seen
+        if disc == 0:
+            print(f"  ⚠️  [LCW] DISCOUNT PARSE SUSPECT — 0 of {seen:,} items "
+                  f"read as discounted. LCW's price fields have almost "
+                  f"certainly been renamed again. Re-run with repo variable "
+                  f"LCW_DEBUG_FIELDS=1 to dump the live payload keys.")
+        else:
+            print(f"  [LCW] Discount capture: {disc:,}/{seen:,} items ({pct:.1f}%).")
 
     return products_seen, price_changes
 
