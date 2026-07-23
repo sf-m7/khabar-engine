@@ -3347,6 +3347,27 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 # If the parent row had no colour, use what the product page told us.
                 # If both are missing, leave it NULL (better than guessing).
                 color        = row.get("color") or page_color
+                # v14.44 FIX: the fallback below is `prev_prices.get(product_id)`,
+                # and prev_prices is MUTATED during the catalog pass to hold each
+                # product's CURRENT price (see the `prev_prices[db_pid] = curr_price`
+                # assignments in the engines above). It is therefore NOT a baseline
+                # — it is today's price. Writing it into first_observed_price on a
+                # row that already has a real baseline destroys the honest anchor
+                # permanently, and it is destroyed in the direction that makes the
+                # brand look like it never discounts.
+                #
+                # Proven live 2026-07-23: LC Waikiki had 640 recorded DOWN price
+                # events, yet ZERO of its 12,748 active products sat below their
+                # own first_observed_price at any depth. Both cannot be true. The
+                # upsert below re-ran on every size pass and reset each child row's
+                # baseline to the then-current (already discounted) price, so every
+                # LCW discount measured as 0%. That silently removed the single
+                # largest brand from L1-01, L1-10 and every product built on them.
+                #
+                # first_observed_price is now written ONLY when the row does not
+                # already have one — see the guarded update after the upsert. This
+                # is the same `.is_("first_observed_price", "null")` idiom already
+                # used by the catalog passes in this file.
                 fop          = row.get("first_observed_price") or prev_prices.get(product_id)
                 # v14.22 FIX 1: parent_stock is STILL read here (used as the
                 # fallback for a size whose own stock count is missing — see
@@ -3389,6 +3410,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                         # write has always belonged to this row alone, never shared
                         # with the parent. This is the correct, real per-size signal.
                         new_sku = f"{row['external_sku']}_{size_value.replace(' ', '_')}"
+                        # first_observed_price deliberately ABSENT from this
+                        # payload (v14.44). An upsert overwrites every column it
+                        # names, so including it here reset the baseline of every
+                        # pre-existing child row on every run.
                         safe_db_execute(
                             supabase.table("product_variants").upsert({
                                 "product_id":           product_id,
@@ -3396,11 +3421,21 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                                 "color":                color,
                                 "size":                 size_value,
                                 "is_in_stock":          size_in_stock,
-                                "first_observed_price": fop,
                                 "delisted_at":          None,
                                 "last_updated_at":      now_iso,
                             }, on_conflict="external_sku")
                         )
+                        # Seed the baseline for genuinely NEW rows only. The
+                        # .is_(null) guard makes this a no-op for any row that
+                        # already carries a real first-sighting price, so the
+                        # anchor can never be moved after it is set.
+                        if fop is not None:
+                            safe_db_execute(
+                                supabase.table("product_variants")
+                                .update({"first_observed_price": fop})
+                                .eq("external_sku", new_sku)
+                                .is_("first_observed_price", "null")
+                            )
                 populated_rows += 1
 
             # Polite delay to avoid pattern detection
@@ -3902,6 +3937,13 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                             )
                         else:
                             sku = f"defacto_{lc}_{sz['size'].replace(' ', '_')}"
+                            # v14.44 FIX: first_observed_price removed from this
+                            # upsert for the same reason as the LCW size pass —
+                            # an upsert overwrites every column it names, and
+                            # `fop` falls back to prev_prices, which holds the
+                            # CURRENT price, not a baseline. Re-running this
+                            # backfill was silently re-anchoring existing rows
+                            # to their already-discounted price.
                             safe_db_execute(
                                 supabase.table("product_variants").upsert({
                                     "product_id":           product_id,
@@ -3909,11 +3951,18 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                                     "color":                color,
                                     "size":                 sz["size"],
                                     "is_in_stock":          sz["is_in_stock"],
-                                    "first_observed_price": fop,
-                                "delisted_at":          None,
+                                    "delisted_at":          None,
                                     "last_updated_at":      now_iso,
                                 }, on_conflict="external_sku")
                             )
+                            # Seed only when absent — never move an existing anchor.
+                            if fop is not None:
+                                safe_db_execute(
+                                    supabase.table("product_variants")
+                                    .update({"first_observed_price": fop})
+                                    .eq("external_sku", sku)
+                                    .is_("first_observed_price", "null")
+                                )
                     populated += 1
                 time.sleep(random.uniform(0.5, 1.0))
             print(f"  [DeFacto] Backfill complete: {populated} variants populated.")
