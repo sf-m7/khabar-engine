@@ -145,8 +145,17 @@ SIGNALS = [
         "min_days":    14,   # below this, an "IQR" is noise dressed as statistics
         "unique_on": ["product_id", "snapshot_date"],
         "sql": """
-WITH latest_day AS (
-    SELECT max(snapshot_date) AS d FROM snapshots
+WITH brand_latest AS (
+    -- PER-BRAND latest day (fixed 2026-07-23), not a single global max().
+    -- Brands do not share a scrape cadence: the Shopify engines run three
+    -- times a day, LC Waikiki once at 18:00 UTC. A global max(snapshot_date)
+    -- therefore sat a day ahead of LCW most of the time, and every LCW row was
+    -- dropped from this signal — not flagged, not logged, just absent. Zero
+    -- rows for a brand is indistinguishable from "this brand did nothing",
+    -- which is the reading that gets published.
+    SELECT brand, max(snapshot_date) AS d
+    FROM snapshots
+    GROUP BY brand
 ),
 -- Per-product distribution over the whole window. Collection gaps
 -- shrink days_observed rather than being silently treated as
@@ -164,10 +173,23 @@ dist AS (
     GROUP BY product_id
 ),
 today AS (
-    SELECT s.*
-    FROM snapshots s, latest_day l
-    WHERE s.snapshot_date = l.d
-      AND s.price IS NOT NULL AND s.price > 0
+    -- One row per product, from that product's OWN brand's latest day. The
+    -- ROW_NUMBER collapse is required because a thrice-daily brand can hold
+    -- several snapshots for the same product on the same date; without it the
+    -- signal emits duplicates and `unique_on` keeps an arbitrary one rather
+    -- than the most recently recorded.
+    SELECT * FROM (
+        SELECT s.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY s.product_id
+                   ORDER BY s.recorded_at DESC
+               ) AS rn
+        FROM snapshots s
+        JOIN brand_latest bl
+          ON bl.brand = s.brand
+         AND s.snapshot_date = bl.d
+        WHERE s.price IS NOT NULL AND s.price > 0
+    ) WHERE rn = 1
 ),
 -- Every product that clears the anomaly test today.
 flagged AS (
@@ -229,8 +251,17 @@ ORDER BY deviation_pct DESC
         # report how many products were withheld for thin history, instead of
         # them simply vanishing.
         "suppressed_sql": """
-WITH latest_day AS (
-    SELECT max(snapshot_date) AS d FROM snapshots
+WITH brand_latest AS (
+    -- PER-BRAND latest day (fixed 2026-07-23), not a single global max().
+    -- Brands do not share a scrape cadence: the Shopify engines run three
+    -- times a day, LC Waikiki once at 18:00 UTC. A global max(snapshot_date)
+    -- therefore sat a day ahead of LCW most of the time, and every LCW row was
+    -- dropped from this signal — not flagged, not logged, just absent. Zero
+    -- rows for a brand is indistinguishable from "this brand did nothing",
+    -- which is the reading that gets published.
+    SELECT brand, max(snapshot_date) AS d
+    FROM snapshots
+    GROUP BY brand
 ),
 dist AS (
     SELECT product_id,
@@ -242,8 +273,22 @@ dist AS (
     GROUP BY product_id
 ),
 today AS (
-    SELECT s.* FROM snapshots s, latest_day l
-    WHERE s.snapshot_date = l.d AND s.price IS NOT NULL AND s.price > 0
+    -- Per-brand latest day + one row per product (see the main query above).
+    -- This suppressed-count query MUST use the identical frame, or the
+    -- "how many did we hold back" number stops describing the same population
+    -- as the signal it accompanies.
+    SELECT * FROM (
+        SELECT s.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY s.product_id
+                   ORDER BY s.recorded_at DESC
+               ) AS rn
+        FROM snapshots s
+        JOIN brand_latest bl
+          ON bl.brand = s.brand
+         AND s.snapshot_date = bl.d
+        WHERE s.price IS NOT NULL AND s.price > 0
+    ) WHERE rn = 1
 )
 SELECT count(*)
 FROM today t
@@ -873,14 +918,35 @@ ORDER BY a.last_depth_pct DESC
             --    first_observed_price rather than the brand's own RRP (see
             --    khabar_lake.py). Brands publishing no RRP -- lc_waikiki above
             --    all -- were previously unable to appear here at all.
-            WITH latest_day AS (
-                SELECT max(snapshot_date) AS d FROM snapshots
+            -- PER-BRAND latest day (fixed 2026-07-23). A single global
+            -- max(snapshot_date) silently excluded any brand running on a
+            -- slower cadence — LC Waikiki scrapes once daily at 18:00 UTC
+            -- against Shopify's three times a day, so it sat a day behind and
+            -- vanished from this signal entirely. Doubly damaging here: the
+            -- comment above notes LCW was ALREADY the brand this signal was
+            -- reworked to include, and the day-lag quietly undid that.
+            WITH brand_latest AS (
+                SELECT brand, max(snapshot_date) AS d
+                FROM snapshots
+                GROUP BY brand
             ),
             discounted_today AS (
-                SELECT s.product_id, s.brand, s.honest_discount_pct, s.snapshot_date
-                FROM snapshots s, latest_day l
-                WHERE s.snapshot_date = l.d
-                  AND s.honest_discount_pct >= 40
+                -- One row per product, most recent observation on that
+                -- brand's own latest day.
+                SELECT product_id, brand, honest_discount_pct, snapshot_date
+                FROM (
+                    SELECT s.product_id, s.brand, s.honest_discount_pct,
+                           s.snapshot_date,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s.product_id
+                               ORDER BY s.recorded_at DESC
+                           ) AS rn
+                    FROM snapshots s
+                    JOIN brand_latest bl
+                      ON bl.brand = s.brand
+                     AND s.snapshot_date = bl.d
+                    WHERE s.honest_discount_pct >= 40
+                ) WHERE rn = 1
             ),
             stock_check AS (
                 SELECT product_id, count(*) AS variant_count,
