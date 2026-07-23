@@ -26,6 +26,18 @@ import khabar_lake
 
 app = Flask(__name__)
 
+
+@app.errorhandler(Exception)
+def _handle_exception(e):
+    """
+    Without this, any unhandled error (a bad DB password, an R2 auth
+    failure, a DuckDB extension that failed to download) produces Flask's
+    generic blank 500 page — the real reason only shows up in Render's
+    server logs, not in the response. This surfaces it directly instead.
+    """
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
+
+
 API_TOKEN = os.environ["QUERY_API_TOKEN"]
 REFRESH_SECONDS = int(os.environ.get("QUERY_API_REFRESH_SECONDS", "1800"))  # 30 min
 MAX_ROWS = int(os.environ.get("QUERY_API_MAX_ROWS", "2000"))
