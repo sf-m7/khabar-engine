@@ -1,5 +1,13 @@
 name: LCW Scraper
 
+# v14.46: twice daily — a morning block at ~05:23-06:03 UTC and the original
+# evening block at ~17:23-18:03 UTC.
+#
+# IMPORTANT: this schedule alone is not enough. scraper.py checkpoints
+# categories BY DATE, so whichever block runs first marks the day complete and
+# the second block exits as a no-op. Slot-aware checkpointing has to land in
+# scraper.py for the second run to do any work at all.
+#
 # v14.41: hourly instead of once daily.
 #
 # Why: a single daily run that hits a bad proxy window loses the whole day,
@@ -33,8 +41,15 @@ on:
     # plus the size pass, which can overrun the next slot — the concurrency
     # group below queues that attempt rather than running it in parallel, and
     # it then exits immediately as a no-op. No overlap, no double-scraping.
+    # ── Evening block (unchanged) ───────────────────────────────────────
     - cron: '23,33,43,53 17 * * *'
     - cron: '3 18 * * *'
+    # ── Morning block, 12 hours earlier ─────────────────────────────────
+    # Same shape as the evening: one real attempt plus four retry slots ten
+    # minutes apart, so a bad proxy window in the morning costs minutes
+    # rather than half a day.
+    - cron: '23,33,43,53 5 * * *'
+    - cron: '3 6 * * *'
   workflow_dispatch:        # manual trigger, unchanged
 
 concurrency:
@@ -72,6 +87,11 @@ jobs:
           DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
           DATAIMPULSE_HOST:            ${{ vars.DATAIMPULSE_HOST }}
           SCRAPE_TARGET:               lcw
+          # Which of the two daily blocks this run belongs to. Consumed by the
+          # checkpoint so the morning and evening runs do not read each
+          # other's completion state. Derived from the clock rather than
+          # hardcoded, because a single workflow serves both blocks.
+          LCW_SLOT:                    ${{ github.event.schedule && (contains(github.event.schedule, ' 5 ') || contains(github.event.schedule, ' 6 ')) && 'am' || 'pm' }}
           LCW_SIZE_CAP:                ${{ vars.LCW_SIZE_CAP }}
           LCW_ROTATION_BUDGET:         ${{ vars.LCW_ROTATION_BUDGET }}
           # ── v14.39-41 knobs. All blank-safe: env_str/env_int treat a blank
