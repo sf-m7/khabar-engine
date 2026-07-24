@@ -40,15 +40,20 @@
 # is_active/delisted flags — first_observed_price and all baselines are
 # untouched by design.
 #
-# File naming: every archive file is named {min_date}_to_{max_date} from
-# the ACTUAL data inside it (fixing the reversed-name bug found in the
-# first archive.py production run).
+# File naming: one file per calendar day (stockout_events, price_events) or
+# per ISO week (weekly_product_summary, weekly_variant_exception,
+# weekly_bestseller_summary) — {table}/YYYY-MM-DD.parquet — merged into on
+# repeat touches, never overwritten. Same pattern as archive.py's
+# price_snapshots. (Earlier versions wrote one {min_date}_to_{max_date} file
+# per run instead; r2_housekeeping_repartition.py is the one-time migration
+# that brought already-archived history into this same layout.)
 # ═══════════════════════════════════════════════════════
 
 import io
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
 import boto3
@@ -152,6 +157,29 @@ def write_parquet(rows):
     return buf
 
 
+def r2_object_exists(object_key):
+    """True if this day/week's Parquet file is already in the bucket."""
+    try:
+        r2.head_object(Bucket=R2_BUCKET_NAME, Key=object_key)
+        return True
+    except Exception:
+        return False
+
+
+def read_existing_rows(object_key):
+    """
+    Pull back the rows already stored in a day/week's file, as plain dicts.
+    Used to MERGE rather than overwrite: a day/week can legitimately be
+    touched by more than one run (a partial failure, a re-run, or the first
+    run after a backlog sweep). Overwriting would silently drop whatever was
+    already archived for that partition — merging cannot. Same pattern as
+    archive.py's price_snapshots handling.
+    """
+    response = r2.get_object(Bucket=R2_BUCKET_NAME, Key=object_key)
+    table = pq.read_table(io.BytesIO(response["Body"].read()))
+    return table.to_pylist()
+
+
 def verify_upload(object_key, expected_row_count):
     """THE GATE — identical philosophy to archive.py: download the file
     BACK from R2 and count actual rows. Exceptions = failed gate."""
@@ -186,9 +214,32 @@ def delete_by_ids(table, ids):
 
 
 def archive_table(label, table, columns, filter_col, cutoff_value,
-                  date_field, flatten_fn=None):
-    """The whole export → upload → verify → delete pipeline for one table.
-    Returns True on success (including 'nothing to do'), False on failure."""
+                  date_field, id_field, flatten_fn=None):
+    """
+    The whole export → partition → merge → verify → delete pipeline for one
+    table. Writes ONE FILE PER CALENDAR DAY (recorded_at-based tables) or
+    PER ISO WEEK (the week_start-based weekly_* tables) — never one lumped
+    file per run — mirroring archive.py's price_snapshots pattern exactly.
+
+    A day/week can legitimately be touched by more than one run (a partial
+    failure, a re-run, or the first run after a backlog sweep), so an
+    existing partition file is always MERGED into — read back, de-duped on
+    id_field, rewritten — never overwritten. Blindly overwriting would
+    silently destroy already-archived rows.
+
+    The verify-before-delete gate is PER PARTITION: a failure on one
+    day/week leaves only that day/week's rows in Supabase for the next run,
+    without blocking the partitions that did succeed.
+
+    id_field: the archived column name to keep the source row's primary key
+    under (e.g. "event_id", "summary_id") — needed so a partition touched by
+    more than one run can be merged/de-duped safely. Its VALUES are the same
+    ids delete_by_ids() uses against Supabase; only the column name differs
+    from the live table's "id".
+
+    Returns True on success (including 'nothing to do'), False if ANY
+    partition failed to archive (its rows stay live, safe, retried next run).
+    """
     print(f"\n📦 [{label}] archiving rows where {filter_col} < {cutoff_value} ...")
     rows = fetch_all(table, columns, filter_col, cutoff_value)
     if not rows:
@@ -199,35 +250,72 @@ def archive_table(label, table, columns, filter_col, cutoff_value,
     if flatten_fn:
         rows = flatten_fn(rows)
 
-    ids = [r.pop("id") for r in rows]  # id used for delete, not archived
+    for r in rows:
+        r[id_field] = r.pop("id")
 
-    dates = sorted(str(r[date_field])[:10] for r in rows)
+    by_partition = defaultdict(list)
+    for r in rows:
+        by_partition[str(r[date_field])[:10]].append(r)
+
+    print(f"  Grouped into {len(by_partition)} partition(s): "
+          f"{min(by_partition)} → {max(by_partition)}")
+
     prefix = f"_pilot_dry_run/{table}" if DRY_RUN else table
-    object_key = f"{prefix}/{dates[0]}_to_{dates[-1]}.parquet"
+    verified_ids, failed_partitions = [], []
 
-    buf = write_parquet(rows)
-    print(f"  Parquet file: {round(buf.getbuffer().nbytes / 1024, 1)} KB "
-          f"for {len(rows)} rows. Uploading as: {object_key}")
-    try:
-        buf.seek(0)
-        r2.upload_fileobj(buf, R2_BUCKET_NAME, object_key)
-    except Exception as e:
-        print(f"  ❌ Upload to R2 failed: {e}. Nothing deleted.")
-        return False
+    for part in sorted(by_partition):
+        part_rows = by_partition[part]
+        object_key = f"{prefix}/{part}.parquet"
 
-    if not verify_upload(object_key, expected_row_count=len(rows)):
-        print("  🛑 Rows remain in Supabase, untouched. Next run retries.")
-        return False
+        rows_to_write = part_rows
+        if r2_object_exists(object_key):
+            try:
+                existing = read_existing_rows(object_key)
+                merged = {r[id_field]: r for r in existing}
+                merged.update({r[id_field]: r for r in part_rows})
+                rows_to_write = list(merged.values())
+                print(f"  [{part}] file exists with {len(existing)} row(s) — "
+                      f"merging to {len(rows_to_write)} total.")
+            except Exception as e:
+                print(f"  ❌ [{part}] could not read existing file to merge: {e}. "
+                      f"Skipping this partition — its rows stay in Supabase.")
+                failed_partitions.append(part)
+                continue
+
+        try:
+            buf = write_parquet(rows_to_write)
+            buf.seek(0)
+            r2.upload_fileobj(buf, R2_BUCKET_NAME, object_key)
+        except Exception as e:
+            print(f"  ❌ [{part}] upload failed: {e}. Rows stay in Supabase.")
+            failed_partitions.append(part)
+            continue
+
+        if not verify_upload(object_key, expected_row_count=len(rows_to_write)):
+            print(f"  🛑 [{part}] verification failed. Rows stay in Supabase.")
+            failed_partitions.append(part)
+            continue
+
+        print(f"  ✅ [{part}] {object_key} — {len(rows_to_write)} row(s).")
+        verified_ids.extend(r[id_field] for r in part_rows)
 
     if DRY_RUN:
-        print(f"  🧪 DRY RUN — would have deleted {len(ids)} rows from "
-              f"{table}. Skipping delete.")
-        return True
+        print(f"  🧪 DRY RUN — would delete {len(verified_ids)} row(s) across "
+              f"{len(by_partition) - len(failed_partitions)} verified partition(s). "
+              f"Nothing touched.")
+    elif verified_ids:
+        deleted = delete_by_ids(table, verified_ids)
+        print(f"  🗑️  Deleted {deleted} row(s) from {table} "
+              f"(verified present in R2 first).")
+    else:
+        print("  🛑 No partition passed the verify gate. Nothing deleted.")
 
-    deleted = delete_by_ids(table, ids)
-    print(f"  🗑️  Deleted {deleted} rows from {table} "
-          f"(verified present in R2 first).")
-    return True
+    if failed_partitions:
+        print(f"  ⚠️  {len(failed_partitions)} partition(s) failed and were NOT "
+              f"archived: {', '.join(failed_partitions)}. They remain intact in "
+              f"Supabase and will be retried on the next run.")
+
+    return not failed_partitions
 
 
 # ─────────────────────────────────────────────
@@ -410,6 +498,7 @@ def main():
             filter_col="recorded_at",
             cutoff_value=(now - timedelta(days=STOCKOUT_DAYS)).isoformat(),
             date_field="recorded_at",
+            id_field="event_id",
             flatten_fn=flatten_with_product,
         )
         if not ok:
@@ -430,6 +519,7 @@ def main():
             filter_col="recorded_at",
             cutoff_value=(now - timedelta(days=PRICE_EVENT_DAYS)).isoformat(),
             date_field="recorded_at",
+            id_field="event_id",
             flatten_fn=flatten_with_product,
         )
         if not ok:
@@ -457,6 +547,7 @@ def main():
             filter_col="week_start",
             cutoff_value=cutoff_week,
             date_field="week_start",
+            id_field="summary_id",
         )
         if not ok:
             failures.append("weekly_product_summary")
@@ -489,6 +580,7 @@ def main():
             filter_col="week_start",
             cutoff_value=cutoff_week,
             date_field="week_start",
+            id_field="exception_id",
         )
         if not ok:
             failures.append("weekly_variant_exception")
@@ -509,6 +601,7 @@ def main():
             filter_col="week_start",
             cutoff_value=cutoff_bs_week,
             date_field="week_start",
+            id_field="summary_id",
         )
         if not ok:
             failures.append("weekly_bestseller_summary")
