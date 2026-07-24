@@ -27,7 +27,6 @@ jobs:
         run: pip install psycopg2-binary
 
       - name: Run health check
-        id: check
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
@@ -37,23 +36,29 @@ jobs:
       # Only fires when the step above exits non-zero. GitHub already emails on
       # a failed run; this puts the actual failing checks on your phone, which
       # is the difference between knowing something broke and knowing what.
+      #
+      # The message is assembled into a file and sent with text@msg.txt rather
+      # than inlined into the curl command. A multi-line shell string spanning
+      # YAML lines is fragile and was breaking the parse.
       - name: Alert on failure
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_ALERT_BOT_TOKEN }}
           TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "$TELEGRAM_ALERT_CHAT_ID" ]; then
-            echo "No TELEGRAM_ALERT_CHAT_ID set — skipping notification."
+          if [ -z "$TELEGRAM_ALERT_CHAT_ID" ] || [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "Telegram secrets not set - skipping notification."
             exit 0
           fi
-          BODY=$(grep -E '^❌' report.txt | head -20)
+          {
+            echo "Khabar health check FAILED"
+            echo ""
+            grep -E '^\xe2\x9d\x8c' report.txt | head -20 || echo "(see run log)"
+            echo ""
+            echo "Run: $RUN_URL"
+          } > msg.txt
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_ALERT_CHAT_ID}" \
-            --data-urlencode text="🚨 Khabar health check FAILED
-
-${BODY}
-
-Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            > /dev/null
+            --data-urlencode text@msg.txt > /dev/null
