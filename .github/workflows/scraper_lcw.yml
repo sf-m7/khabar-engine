@@ -104,3 +104,4 @@ jobs:
           LCW_CHECKPOINT:              ${{ vars.LCW_CHECKPOINT }}      # default 1; "0" disables resume
           LCW_PAGE_ATTEMPTS:           ${{ vars.LCW_PAGE_ATTEMPTS }}   # default 3
           LCW_CIRCUIT_BREAKER:         ${{ vars.LCW_CIRCUIT_BREAKER }} # default 6
+          LCW_DEBUG_FIELDS:            ${{ vars.LCW_DEBUG_FIELDS }}
