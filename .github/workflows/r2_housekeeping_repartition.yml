@@ -1,0 +1,40 @@
+name: Khabar R2 Housekeeping-Tables Re-partition (one-time)
+
+# Manual trigger ONLY — this is a one-time migration, not a recurring job.
+# Delete this workflow and r2_housekeeping_repartition.py once every table
+# it prints comes back "already clean" (no legacy files left).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: read and plan everything, but write nothing and delete nothing. Run this FIRST."
+        type: boolean
+        default: true
+
+jobs:
+  repartition:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Re-partition housekeeping archive tables into per-day/per-week files
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          BACKFILL_DRY_RUN:     ${{ inputs.dry_run }}
+        run: python -u r2_housekeeping_repartition.py
