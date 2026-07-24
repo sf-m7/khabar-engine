@@ -2740,13 +2740,42 @@ def lcw_fetch_page_resilient(session, domain, category_id, page_index, headers,
 #
 # COST: a category that dies on page 50 of 55 is refetched from page 1.
 # Accepted deliberately — correctness of price history outweighs bandwidth.
+# v14.46 — LCW runs in two blocks a day (~05:30 and ~17:30 UTC), so the
+# checkpoint is scoped by SLOT as well as date.
+#
+# Without this the two blocks share one completion record: whichever runs
+# first marks every category complete for the date, and the second block reads
+# that, skips the crawl, skips the size pass and exits in seconds. The morning
+# run would have silently disabled the evening one — turning a deliberate
+# second look at the day's prices back into a single daily snapshot, with no
+# error to show for it.
+#
+# Retries WITHIN a block still resume correctly, because every attempt in the
+# same block carries the same slot value.
+def lcw_slot():
+    """
+    Which daily block this run belongs to: 'am' or 'pm'.
+
+    The workflow passes LCW_SLOT explicitly. The clock fallback exists for
+    manual triggers, where github.event.schedule is empty and the expression
+    in the YAML yields nothing — a manual run at 06:00 should behave like the
+    morning block, not silently land in the evening's checkpoint.
+    """
+    slot = (env_str("LCW_SLOT", "") or "").strip().lower()
+    if slot in ("am", "pm"):
+        return slot
+    return "am" if datetime.now(timezone.utc).hour < 12 else "pm"
+
+
 def load_lcw_progress(supabase, today):
-    """Category IDs already fully scraped today. Empty set on any error."""
+    """Category IDs already fully scraped in THIS slot today. Empty on error."""
+    slot = lcw_slot()
     try:
         res = safe_db_execute(
             supabase.table("lcw_scrape_progress")
             .select("category_id")
             .eq("scrape_date", today.isoformat())
+            .eq("slot", slot)
             .eq("status", "complete")
         )
         return {r["category_id"] for r in (res.data or [])} if res else set()
@@ -2765,6 +2794,7 @@ def mark_lcw_progress(supabase, today, cat_id, cat_name, status,
         safe_db_execute(
             supabase.table("lcw_scrape_progress").upsert({
                 "scrape_date":  today.isoformat(),
+                "slot":         lcw_slot(),
                 "category_id":  cat_id,
                 "category_name": cat_name,
                 "status":       status,
@@ -2772,7 +2802,7 @@ def mark_lcw_progress(supabase, today, cat_id, cat_name, status,
                 "pages_total":  pages_total,
                 "pages_failed": pages_failed,
                 "updated_at":   datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="scrape_date,category_id")
+            }, on_conflict="scrape_date,slot,category_id")
         )
     except Exception as e:
         print(f"  [LCW] Checkpoint write failed for cat={cat_id} ({e}). Continuing.")
