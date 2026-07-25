@@ -67,7 +67,21 @@ def record(status, name, detail):
 
 
 def q(cur, sql, args=None):
-    cur.execute(sql, args or ())
+    """
+    Bug fixed 2026-07-25: the original body was `cur.execute(sql, args or ())`.
+    `args or ()` turns None into an EMPTY TUPLE, not None — and psycopg2 treats
+    "a params value was supplied" (even an empty tuple) as a signal to parse
+    every literal `%` in the SQL as a placeholder needing substitution. Any
+    query with a LIKE pattern like 'signal_l1_%' then fails with "tuple index
+    out of range", because psycopg2 goes looking for an argument to fill that
+    `%` and the tuple has none.
+    check_signal_freshness's own table-discovery query has exactly that
+    pattern, so the health check was failing on itself on its first real run.
+    Passing None through when there are no args (rather than ()) tells
+    psycopg2 to skip parameter substitution entirely, so a literal % is just
+    a character again.
+    """
+    cur.execute(sql, args)
     return cur.fetchall()
 
 
