@@ -3492,8 +3492,39 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 parent_stock = row.get("is_in_stock", True)
 
                 for i, sz in enumerate(sizes):
-                    # Use the API's per-size stock when available; fall back to parent_stock
-                    size_in_stock = (sz.get("stock", 0) > 0) if sz.get("stock") is not None else parent_stock
+                    # v14.47 — DO NOT fall back to parent_stock here.
+                    #
+                    # This used to read:
+                    #   size_in_stock = (sz.get("stock",0)>0) if sz.get("stock") is not None else parent_stock
+                    # The v14.27 ld+json rewrite means sz.get("stock") is now ALWAYS
+                    # None (the schema.org source only exposes ONE overall
+                    # availability, not per-size — see fetch_lcw_product_page's
+                    # docstring). So this line ALWAYS fell through to parent_stock,
+                    # for every size, on every run.
+                    #
+                    # That alone would just mean "color-level stock copied onto
+                    # each size" — stale but roughly honest on day one. The real
+                    # problem is this write only happens ONCE: the backfill loop
+                    # above selects rows WHERE size IS NULL, so once a child row
+                    # is created here (it starts non-null), no future run ever
+                    # looks at it again. Whatever True/False got written on
+                    # creation day is frozen forever, silently drifting from
+                    # reality while still looking like a fresh per-size read to
+                    # anyone querying it later.
+                    #
+                    # Confirmed live 2026-07-25: within one LCW product+color,
+                    # sizes show DIFFERING stock in only 12 of 17,868 multi-size
+                    # groups (0.1%) — vs 78.1% for a real per-size brand (Ravin)
+                    # checked the same way. That is the fingerprint of a frozen
+                    # copy, not live per-size data.
+                    #
+                    # Fix: write NULL — an honest "we don't know this size's
+                    # stock" — instead of a value that will be wrong later but
+                    # still reads as authoritative. The real branch (an actual
+                    # per-size stock count) is left in place for if LCW's page
+                    # ever exposes it again, or if this function is reused for a
+                    # brand that does have per-size data.
+                    size_in_stock = (sz.get("stock", 0) > 0) if sz.get("stock") is not None else None
                     size_value    = sz["size"]
 
                     if i == 0:
@@ -3524,7 +3555,19 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                         # Child rows (one per additional size) are UNAFFECTED by
                         # FIX 1 — each has its OWN external_sku, so this is_in_stock
                         # write has always belonged to this row alone, never shared
-                        # with the parent. This is the correct, real per-size signal.
+                        # with the parent.
+                        #
+                        # v14.47 correction: the claim that used to sit here — "this
+                        # is the correct, real per-size signal" — was wrong for LCW.
+                        # See the v14.47 note above size_in_stock: LCW's source has
+                        # carried no real per-size stock since the June 2026 ld+json
+                        # rewrite, so is_in_stock is now written as NULL (honestly
+                        # unknown) rather than a value copied from parent_stock that
+                        # would freeze here and go stale. variant_baselines in
+                        # khabar_lake.py also marks every LC Waikiki row
+                        # size_level_reliable = FALSE, so nothing downstream should
+                        # be reading size-grain stock for this brand regardless of
+                        # what ends up in this column.
                         new_sku = f"{row['external_sku']}_{size_value.replace(' ', '_')}"
                         # first_observed_price deliberately ABSENT from this
                         # payload (v14.44). An upsert overwrites every column it

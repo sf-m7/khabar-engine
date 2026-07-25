@@ -462,6 +462,14 @@ def variant_baselines(con):
     the two is one-to-many. 96.5% of products have a single baseline across all
     their variants; the rest genuinely differ. Any signal that collapses them
     must state its rule explicitly rather than picking one silently.
+
+    Also exposes `size_level_reliable` (bool) — FALSE for every LC Waikiki row,
+    TRUE otherwise. LCW's per-size is_in_stock is written once at row-creation
+    time and never refreshed (see scraper.py v14.47 note in the LCW size pass),
+    so any query that reads is_in_stock at size grain must filter on this first.
+    Signals that only need color-level LCW stock (the parent row's is_in_stock,
+    refreshed every run by the catalog pass) are unaffected — this flag only
+    matters when a query is distinguishing between sizes.
     """
     # A TABLE, not a view — for the same reason as hot_raw. product_variants is
     # ~481K rows; any signal referencing this view more than once would have
@@ -485,7 +493,33 @@ def variant_baselines(con):
             pv.color                AS color,
             pv.first_observed_price AS first_observed_price,
             pv.is_in_stock          AS is_in_stock,
-            pv.delisted_at          AS delisted_at
+            pv.delisted_at          AS delisted_at,
+            -- size_level_reliable — added 2026-07-25 after confirming live that
+            -- LC Waikiki's per-size is_in_stock is not a fresh read. LCW's product
+            -- page no longer exposes per-size stock (schema.org ld+json rewrite,
+            -- June 2026) so the size-backfill pass falls back to the color-level
+            -- flag ONCE, at the moment a size row is first created, and NEVER
+            -- revisits it afterward (the backfill only selects rows where
+            -- size IS NULL, so an already-sized row is invisible to every future
+            -- pass). Confirmed live: within one LCW product+color, 17,868 groups
+            -- of 2+ sizes show DIFFERING stock across sizes in only 12 of them
+            -- (0.1%) -- vs. 78.1% for a real per-size brand (Ravin) in the same
+            -- check. Every LCW size now also carries a size value (0 nulls left),
+            -- so "size IS NOT NULL" can no longer be used to tell a fresh
+            -- color-level row from a frozen one -- this flag is the replacement.
+            --
+            -- l1_11 (Size Asymmetry Stockout) doesn't need this: it reads
+            -- stockout_events, which never carries a size for LCW (the scraper's
+            -- catalog pass hardcodes size=NULL on every LCW stockout write), so
+            -- it was already structurally safe. This flag exists for anything
+            -- that reads product_variants / variant_baselines directly instead
+            -- -- ad-hoc checks, the chatbot, or a future signal -- which had no
+            -- guard until now. Brand-level, not row-level: LCW's own color-wide
+            -- flag (on what used to be the sole "parent" row) is fine, but since
+            -- every row now looks identical in the schema, there is no reliable
+            -- way to single that row back out, so the whole brand is marked
+            -- unreliable at the size grain. False for LCW, true otherwise.
+            (p.brand != 'lc_waikiki')                          AS size_level_reliable
         FROM variants_raw pv
         JOIN products_dim p ON p.product_id = pv.product_id
         WHERE p.is_active = TRUE
