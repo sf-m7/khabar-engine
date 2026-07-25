@@ -54,7 +54,17 @@ jobs:
           {
             echo "Khabar health check FAILED"
             echo ""
-            grep -E '^\xe2\x9d\x8c' report.txt | head -20 || echo "(see run log)"
+            # v14.48 fix: previously filtered with `grep '^\xe2\x9d\x8c'`,
+            # trying to match the ❌ emoji by raw bytes. That pattern silently
+            # matched nothing — grep's \x escape handling isn't reliable
+            # across locales/versions in -E mode — so every alert arrived with
+            # an empty body: no brand, no signal, nothing to act on.
+            #
+            # The report is already short (the checker only ever prints real
+            # problems), so there's no need to filter it at all. Sending it
+            # whole is simpler and can't silently drop content the way a
+            # pattern match can.
+            cat report.txt
             echo ""
             echo "Run: $RUN_URL"
           } > msg.txt
