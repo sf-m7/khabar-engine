@@ -182,6 +182,16 @@ def check_discount_capture(cur):
 # 4. SIGNAL FRESHNESS — did compute_signals actually write?
 # ──────────────────────────────────────────────────────────────────────────
 def check_signal_freshness(cur):
+    # v14.47 fix: signal_l1_13_product_delisted is derived from products.is_active,
+    # which only changes when housekeeping's weekly stale-delist job runs (Mondays).
+    # A product can sit unseen for up to 14 days before that job marks it delisted,
+    # and the job itself can be up to 6 days from running — so this signal is
+    # LEGITIMATELY quiet for up to ~20 days. Flagging it on the same 3-day
+    # threshold as a daily signal was a false alarm in the checker, not a real
+    # pipeline fault; caught the first time this ran for real.
+    freshness_days = {"signal_l1_13_product_delisted": 22}
+    default_days = 3
+
     tables = q(cur, """
         SELECT c.relname AS t
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -203,10 +213,13 @@ def check_signal_freshness(cur):
         r = q(cur, f"SELECT max({c}) AS last_day, count(*) AS n FROM {name}")[0]
         if r["n"] == 0:
             record("WARN", f"signal/{name}", "table is empty")
-        elif (date.today() - r["last_day"]).days >= 3:
-            record("FAIL", f"signal/{name}",
-                   f"last wrote {r['last_day']} "
-                   f"({(date.today() - r['last_day']).days} days ago)")
+        else:
+            limit = freshness_days.get(name, default_days)
+            stale = (date.today() - r["last_day"]).days
+            if stale >= limit:
+                record("FAIL", f"signal/{name}",
+                       f"last wrote {r['last_day']} ({stale} days ago, "
+                       f"limit {limit})")
 
 
 # ──────────────────────────────────────────────────────────────────────────
