@@ -58,7 +58,24 @@ jobs:
             echo ""
             echo "Run: $RUN_URL"
           } > msg.txt
-          curl -s -X POST \
+
+          # v14.47 fix: the response was previously discarded to /dev/null, so
+          # a rejected send (bad chat id, revoked token, bot never messaged
+          # first) failed with zero visibility — exactly the silent-failure
+          # pattern this whole feature exists to prevent. Now captured and
+          # printed, and a non-2xx or {"ok":false} fails this step so it shows
+          # up red instead of quietly doing nothing.
+          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_ALERT_CHAT_ID}" \
-            --data-urlencode text@msg.txt > /dev/null
+            --data-urlencode text@msg.txt)
+
+          echo "Telegram API response (HTTP $HTTP_CODE):"
+          cat response.json
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ] || grep -q '"ok":false' response.json; then
+            echo "❌ Telegram send failed — see response above."
+            exit 1
+          fi
+          echo "✅ Telegram alert sent."
