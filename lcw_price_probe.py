@@ -34,7 +34,10 @@ from curl_cffi import requests
 DOMAIN = "www.lcwaikiki.eg"
 # Men's T-Shirts (t-345) — full of discounted items like the 169 EGP tee we
 # verified on the live site. Override with LCW_PROBE_CATEGORY if you want another.
-CATEGORY_ID = os.environ.get("LCW_PROBE_CATEGORY", "345")
+# Men's CLOTHING top-level tree node (t-9). This is what the scraper actually
+# crawls — subcategories like t-345 are "virtual" and return filters but no
+# products via this endpoint. Category 9 is full of discounted items.
+CATEGORY_ID = os.environ.get("LCW_PROBE_CATEGORY", "9")
 # Known discounted model to hunt for specifically (o-5208891 = 169 EGP tee).
 KNOWN_DISCOUNTED = os.environ.get("LCW_PROBE_MODEL", "5208891")
 
@@ -87,7 +90,7 @@ def hunt_below(node, path, ceiling, out):
 # The category page used to PRIME the session (pick up the WAF/cookie token).
 # Without this, the ajax endpoint returns metadata but an empty product list —
 # which is exactly what an un-primed probe sees. t-345 = men's t-shirts.
-PRIME_PATH = os.environ.get("LCW_PROBE_PRIME", "men-t-shirts-t-345")
+PRIME_PATH = os.environ.get("LCW_PROBE_PRIME", "men-clothing-t-9")
 
 
 def fetch_page(page_index):
@@ -179,41 +182,56 @@ def main():
     if not (DATAIMPULSE_USER and DATAIMPULSE_PASS):
         print("[probe] FATAL: DataImpulse proxy creds not set in env.")
         return
-    data = fetch_page(1)
-    if not data:
-        print("[probe] could not fetch page after retries — proxy pool likely "
-              "bad right now; try again shortly.")
-        return
-    items = extract_items(data)
-    print(f"[probe] page 1 of category {CATEGORY_ID}: {len(items)} items found.")
-    if not items:
-        print("[probe] no items parsed — dumping raw top-level shape:")
-        print(json.dumps(data, ensure_ascii=False, default=str)[:3000])
+
+    # Scan the first few pages until we find a genuinely discounted item.
+    all_items = []
+    discounted = None
+    for page in range(1, 5):
+        data = fetch_page(page)
+        if not data:
+            print(f"[probe] page {page}: could not fetch after retries.")
+            continue
+        items = extract_items(data)
+        print(f"[probe] page {page} of category {CATEGORY_ID}: {len(items)} items.")
+        if not items:
+            if page == 1:
+                print("[probe] page 1 empty — raw top-level shape:")
+                print(json.dumps(data, ensure_ascii=False, default=str)[:2000])
+            continue
+        all_items.extend(items)
+        # a discounted item = has some nested value below its list price
+        for it in items:
+            lp = to_float(it.get("PriceValue") or it.get("Price"))
+            hits = []
+            hunt_below(it, "item", lp, hits)
+            if hits:
+                discounted = it
+                break
+        if discounted:
+            break  # got what we came for
+
+    if not all_items:
+        print("[probe] no items on any page — cannot analyse.")
         return
 
-    # 1) the specific known-discounted model, if it's on this page
-    match = next((it for it in items
+    # 1) the specific known-discounted model, if we happened to crawl it
+    match = next((it for it in all_items
                   if KNOWN_DISCOUNTED in str(it.get("ModelUrl", ""))
                   or KNOWN_DISCOUNTED in str(it.get("ModelId", ""))), None)
     if match:
         dump_item(f"KNOWN DISCOUNTED MODEL {KNOWN_DISCOUNTED}", match)
 
-    # 2) the first item whose payload contains ANY nested sub-list price — the
-    #    most likely genuinely-discounted item on the page
-    for it in items:
-        lp = to_float(it.get("PriceValue") or it.get("Price"))
-        hits = []
-        hunt_below(it, "item", lp, hits)
-        if hits:
-            dump_item("FIRST ITEM WITH A SUB-LIST-PRICE VALUE", it)
-            break
+    # 2) the first genuinely-discounted item found (the key evidence)
+    if discounted:
+        dump_item("FIRST DISCOUNTED ITEM (has a value below list price)", discounted)
     else:
-        print("\n[probe] NOTE: not one item on this page had any nested value "
-              "below its list price. Strong evidence the sale price is NOT in "
-              "the catalog API and lives only on the product page.")
+        print("\n[probe] NOTE: scanned several pages and NOT ONE item had any "
+              "nested value below its list price. Strong evidence the sale "
+              "price is NOT in the catalog API at all and lives only on the "
+              "product page — which points to a product-page-based fix.")
 
     # 3) first item regardless, for baseline structure
-    dump_item("FIRST ITEM ON PAGE (baseline)", items[0])
+    dump_item("FIRST ITEM ON PAGE 1 (baseline)", all_items[0])
 
 
 if __name__ == "__main__":
