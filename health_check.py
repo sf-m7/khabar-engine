@@ -303,6 +303,46 @@ def check_price_events(cur):
                "no price events recorded in 3 days — change detection is dead")
 
 
+def check_frozen_prices(cur):
+    """The exact fault that hid for a week on LC Waikiki: the site was
+    discounting heavily, but a moved API field made every item read at its list
+    price, so every product sat at ONE unchanging price day after day and change
+    detection went silent. check_discount_capture catches the "zero discounts"
+    shape; this catches the more general "prices don't move at all" fingerprint,
+    which also fires for a stuck scraper writing carried-forward values.
+
+    For each brand with enough history and volume, measure the share of products
+    whose price has been IDENTICAL across the last 7 days. A live mid-range
+    fashion brand always has some churn; >95% frozen is a broken read, not a
+    quiet market. Uses distinct price count per product over the window.
+    """
+    rows = q(cur, """
+        WITH per_prod AS (
+            SELECT ps.brand, ps.product_id,
+                   count(DISTINCT ps.price)        AS distinct_prices,
+                   count(DISTINCT ps.snapshot_date) AS days
+            FROM price_snapshots ps
+            WHERE ps.snapshot_date >= CURRENT_DATE - 7
+            GROUP BY ps.brand, ps.product_id
+        )
+        SELECT brand,
+               count(*)                                          AS products,
+               count(*) FILTER (WHERE distinct_prices = 1)       AS frozen,
+               max(days)                                         AS days
+        FROM per_prod
+        WHERE days >= 5
+        GROUP BY brand
+        HAVING count(*) > 500
+    """)
+    for r in rows:
+        pct = 100.0 * r["frozen"] / r["products"] if r["products"] else 0
+        if pct >= 95.0:
+            record("FAIL", f"frozen_prices/{r['brand']}",
+                   f"{pct:.1f}% of {r['products']:,} products held ONE price "
+                   f"for {r['days']} days — price read has almost certainly "
+                   f"broken (field moved or scraper writing stale values)")
+
+
 def main():
     conn = psycopg2.connect(DB_URL)
     conn.set_session(readonly=True, autocommit=True)
@@ -310,7 +350,7 @@ def main():
 
     for fn in (check_freshness, check_volume, check_discount_capture,
                check_signal_freshness, check_bestsellers, check_witnessed,
-               check_integrity, check_price_events):
+               check_integrity, check_price_events, check_frozen_prices):
         try:
             fn(cur)
         except Exception as e:
