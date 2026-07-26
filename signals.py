@@ -1489,6 +1489,76 @@ ORDER BY a.last_depth_pct DESC
             FROM b
         """,
     },
+
+    # ---------------------------------------------------------------------
+    # DISCOUNT-HONESTY SCORE. Compares each brand's ADVERTISED discount (its
+    # own compare_at_price claim) against the REAL discount measured from
+    # Khabar's manipulation-proof baseline (products.first_observed_price).
+    # The gap is the share of a "sale" that isn't a real drop from where the
+    # price actually started. Standalone edge of the Competitor Promotional
+    # Strategy Decoder and the "competitor fake-sale detection" outreach hook.
+    #
+    # Only fires for brands that publish a compare_at_price claim. LC Waikiki
+    # and a few others publish none and correctly never appear — you cannot
+    # score the honesty of a claim nobody made. Validated live 2026-07-25:
+    # DeFacto/Activ/Tomato honest (~0pp gap), tie_house 44.9pp / 100% pure
+    # fake — the spread discriminates rather than flagging everyone.
+    #
+    # TWO metrics on purpose: high gap + high pct_pure_fake = outright fake
+    # (price never actually below baseline); high gap + low pct_pure_fake =
+    # inflated anchor on a real sale; low gap = honest.
+    # ---------------------------------------------------------------------
+    {
+        "id": "l2_discount_honesty",
+        "name": "Discount-Honesty Score",
+        "level": "L2",
+        "table": "signal_l2_discount_honesty",
+        "unique_on": ["brand", "category_normalized", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 1,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH scored AS (
+                SELECT
+                    pe.brand,
+                    pd.category_normalized,
+                    (pe.compare_at_price - pe.price_after) / pe.compare_at_price
+                                                                    AS claimed_depth,
+                    GREATEST(0.0,
+                        (pd.first_observed_price - pe.price_after)
+                        / pd.first_observed_price)                  AS genuine_depth
+                FROM price_events_raw pe
+                JOIN products_dim pd ON pd.product_id = pe.product_id
+                WHERE pe.direction = 'down'
+                  AND pe.compare_at_price IS NOT NULL
+                  AND pe.compare_at_price > pe.price_after
+                  AND pd.first_observed_price > 0
+                  AND pd.category_normalized <> 'uncategorized'
+            )
+            SELECT
+                brand,
+                category_normalized,
+                count(*)                                              AS scored_events,
+                ROUND((100.0 * avg(claimed_depth))::numeric, 1)       AS avg_claimed_depth_pct,
+                ROUND((100.0 * avg(genuine_depth))::numeric, 1)       AS avg_genuine_depth_pct,
+                ROUND((100.0 * avg(claimed_depth - genuine_depth))::numeric, 1)
+                                                                      AS manufactured_gap_pct,
+                ROUND((100.0 * (count(*) FILTER (WHERE genuine_depth <= 0.01))
+                             / count(*))::numeric, 1)                 AS pct_pure_fake,
+                CASE
+                    WHEN avg(claimed_depth - genuine_depth) <= 0.05
+                        THEN 'honest — advertised depth matches the real drop from baseline'
+                    WHEN avg(claimed_depth - genuine_depth) <= 0.15
+                        THEN 'inflated — advertised depth overstates the real drop'
+                    ELSE 'manufactured — most of the advertised discount is not a real drop from baseline'
+                END                                                   AS honesty_read,
+                CURRENT_DATE                                          AS snapshot_date
+            FROM scored
+            GROUP BY brand, category_normalized
+            HAVING count(*) >= 10
+        """,
+    },
 ]
 
 
