@@ -78,6 +78,43 @@ SUPABASE_DB_URL      = os.environ["SUPABASE_DB_URL"]
 
 LAKE_PREFIX = "price_snapshots"
 
+# ── DATA QUARANTINE ──────────────────────────────────────────────────────────
+# LC Waikiki price data before the fix is not trustworthy and is excluded from
+# every signal, centrally, here — the same way the witnessed filter lives in one
+# place so no signal has to remember it.
+#
+# Around mid-July 2026 LCW moved the live sale price into a nested campaign badge
+# (CampaignBadges[].DiscountedPrice). Until scraper.py v14.50 (2026-07-26) the
+# parser read only the flat list price (PriceValue), so every LCW item was
+# recorded at its FULL price. Confirmed live: LCW snapshots were 99.4% frozen at
+# list price every day through 2026-07-25, with ~zero price events. The 07-26 fix
+# run then emitted ~6,100 one-off "down" events as ~6k products corrected from
+# list to real sale price in a single day — an artifact, not a market move, that
+# would otherwise read as a mass 50%-off event and wreck Discount-Honesty,
+# Genuine Price Drop, First-Mover and Pricing Discipline for LCW.
+#
+# Boundary: LCW price data is trustworthy from 2026-07-27 (first clean scheduled
+# run). Snapshots on/before 07-25 and price_events on/before 07-26 are excluded.
+# first_observed_price is NOT touched — a list-price anchor is the correct honest
+# baseline, so LCW's real discounts still measure correctly against it. To retire
+# this quarantine once the bad days age out of every signal window, delete this
+# block and the two `NOT (... QUARANTINE ...)` clauses that reference it.
+QUARANTINE_BRAND         = "lc_waikiki"
+QUARANTINE_SNAP_THROUGH  = "2026-07-25"   # snapshots on/before this date excluded
+QUARANTINE_EVENT_THROUGH = "2026-07-26"   # price_events on/before this date excluded
+
+
+def _snapshot_quarantine_sql(col="snapshot_date", brand_col="brand"):
+    return (f"NOT ({brand_col} = '{QUARANTINE_BRAND}' "
+            f"AND CAST({col} AS DATE) <= DATE '{QUARANTINE_SNAP_THROUGH}')")
+
+
+def _event_quarantine_sql(col="recorded_at"):
+    return (f"NOT (brand = '{QUARANTINE_BRAND}' "
+            f"AND CAST({col} AS DATE) <= DATE '{QUARANTINE_EVENT_THROUGH}')")
+
+
+
 
 def connect():
     """
@@ -247,6 +284,7 @@ def materialise_hot(con, force=False):
         FROM pg.public.price_snapshots ps
         LEFT JOIN products_dim p  ON p.product_id  = ps.product_id
         LEFT JOIN variants_raw pv ON pv.variant_id = ps.variant_id
+        WHERE """ + _snapshot_quarantine_sql("ps.snapshot_date", "ps.brand") + """
     """)
     _HOT_READY = True
     return con.execute("SELECT count(*) FROM hot_raw").fetchone()[0]
@@ -445,6 +483,7 @@ def snapshots(con, days=30, end_day=None):
             GROUP BY product_id
         ) pf ON pf.product_id = d.product_id
         WHERE d.rn = 1
+          AND """ + _snapshot_quarantine_sql("d.snapshot_date", "d.brand") + """
     """)
 
     n = con.execute("SELECT count(*) FROM snapshots").fetchone()[0]
@@ -647,6 +686,7 @@ def materialise_events(con, force=False):
             is_statistical_deal       AS is_statistical_deal,
             is_flash_sale             AS is_flash_sale
         FROM pg.public.price_events
+        WHERE """ + _event_quarantine_sql() + """
     """)
     _EVENTS_READY = True
     n1 = con.execute("SELECT count(*) FROM stockouts_raw").fetchone()[0]
