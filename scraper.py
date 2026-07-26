@@ -1157,12 +1157,30 @@ def detect_options(variants):
         if u_opt2 > u_opt1: return "option2", "option1"
         return "option1", ("option2" if opt2_values else None)
     def score_col(values):
+        # v14.47 fix: size_flags was missing 2xl/5xl/6xl/7xl and the xxxl
+        # alias. A "big size" product line whose ENTIRE size range is
+        # 2XL-7XL (no S/M/L/XL present at all) scored 0 on its real size
+        # column, fell through to the no-signal branch below, and that
+        # branch picks whichever column has MORE distinct values — which
+        # is usually color, not size. Confirmed live on tomato: a shirt
+        # with sizes {2XL,3XL,4XL,5XL,6XL,7XL} had color and size swapped
+        # in the DB because of exactly this gap.
         score = 0
-        size_flags = {"xs","s","m","l","xl","xxl","3xl","4xl","os","one size","small","medium","large"}
+        size_flags = {"xxs","xs","s","m","l","xl","xxl","2xl","3xl","xxxl","4xl",
+                       "5xl","6xl","7xl","os","one size","free","free size",
+                       "small","medium","large"}
+        # A value shaped like a physical dimension ("18 INCH", "70*140CM")
+        # is a real size axis for non-apparel goods (bags, towels) even
+        # though it doesn't look like a garment size. Without this, the
+        # dimension column scores 0, color (which is usually more numerous)
+        # wins the "size" slot by the distinct-value fallback, and the
+        # dimension gets mislabeled as color. Confirmed live on arafa.
+        dimension_re = re.compile(r"\d+\s*(inch|cm|mm)\b|\d+\s*[*x]\s*\d+", re.I)
         for val in set(values):
-            v_low = val.lower()
+            v_low = val.lower().strip()
             if v_low in size_flags: score += 10
-            if v_low.isdigit() and (4 <= int(v_low) <= 56): score += 5
+            if v_low.isdigit() and (4 <= int(v_low) <= 60): score += 5
+            if dimension_re.search(v_low): score += 8
         return score
     scores = {"option1": score_col(opt1_values), "option2": score_col(opt2_values), "option3": score_col(opt3_values)}
     size_key = max(scores, key=scores.get)
