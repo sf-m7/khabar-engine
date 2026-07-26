@@ -2840,6 +2840,33 @@ def _parse_lcw_price(v):
     s = "".join(c for c in str(v) if c.isdigit() or c == ".")
     return float(s) if s else 0.0
 
+def _lcw_badge_price(item):
+    """The ACTUAL price a customer pays, or 0.0 if not on campaign.
+
+    v14.50 — around 2026-07-21 LCW moved the live sale price out of the flat
+    fields the parser used (DiscountedPriceValue, MinOldPrice, ConvertedPrice*)
+    — all of which now return 0/None on every item — into a nested campaign
+    badge. Proven live 2026-07-26 via lcw_price_probe.py: item o-5208891 shows
+    PriceValue=349 with CampaignBadges[0].DiscountedPrice=169 / DiscountRate=52 /
+    ShowDiscountedPrice=true, matching the 169 (-52%) the website displays. This
+    was the real "LCW prices frozen / zero price events since Jul 21" bug: every
+    item read as its list price (== first_observed_price), so nothing ever moved.
+
+    An item can carry several badges; we take the LOWEST DiscountedPrice among
+    badges whose ShowDiscountedPrice is true — that is what the customer is
+    actually charged. Returns 0.0 when there is no shown campaign discount, so
+    the caller falls back to the flat list price (PriceValue).
+    """
+    if not item.get("HasCampaignBadges"):
+        return 0.0
+    prices = []
+    for b in (item.get("CampaignBadges") or []):
+        if isinstance(b, dict) and b.get("ShowDiscountedPrice"):
+            p = _parse_lcw_price(b.get("DiscountedPrice"))
+            if p and p > 0:
+                prices.append(p)
+    return min(prices) if prices else 0.0
+
 # ── v14.41: detection tail extracted so early exits still commit ────────────
 # Previously the circuit breaker did `return products_seen, price_changes`,
 # which skipped snapshot-writing and price detection entirely — so a run that
@@ -3177,10 +3204,12 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 # in; the DB still enforces the IS NULL guard, but the network
                 # call no longer happens.
                 if db_pid in fop_done_ids: continue
-                is_disc  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
-                disc_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
-                full_val = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
-                fop = disc_val if (is_disc and disc_val > 0) else full_val
+                # v14.50: the actual selling price is the campaign-badge price
+                # when present (LCW moved it there — see _lcw_badge_price), else
+                # the flat list price. The old DiscountedPriceValue is dead (0).
+                full_val   = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
+                badge_val  = _lcw_badge_price(item)
+                fop = badge_val if badge_val > 0 else full_val
                 if fop > 0:
                     safe_db_execute(
                         supabase.table("products")
@@ -3213,85 +3242,32 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     print(f"  [LCW][DEBUG] item keys: {sorted(item.keys())}")
                     print(f"  [LCW][DEBUG] price-related fields: {price_ish}")
 
-                # v14.49 — DEEP PRICE HUNT. The top-level dump above shows every
-                # top-level discount field is empty even though the live site
-                # sells the item discounted, so the real selling price has moved
-                # into a NESTED object (ModelViewModel / GroupOptions /
-                # OptionSummaryList / a campaign field). This block finds the
-                # FIRST item on the page that is actually discounted per the live
-                # site — detected structurally as "some numeric value nested in
-                # the payload is meaningfully below PriceValue" — and dumps (a)
-                # its full raw JSON and (b) every nested numeric field whose value
-                # sits below the list price, with its full path. That path is
-                # exactly the field we need to start reading. Independent of
-                # LCW_DEBUG_FIELDS so it fires even after the one-shot above.
-                if env_str("LCW_DEBUG_DEEP", "") == "1" and not globals().get("_LCW_DEEP_DUMPED"):
-                    _list_price = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
-                    def _hunt(node, path, lo, out):
-                        if isinstance(node, dict):
-                            for k, v in node.items():
-                                _hunt(v, f"{path}.{k}", lo, out)
-                        elif isinstance(node, list):
-                            for i, v in enumerate(node[:5]):
-                                _hunt(v, f"{path}[{i}]", lo, out)
-                        else:
-                            try:
-                                val = float(str(node).replace("EGP", "").replace(",", "").strip())
-                            except (TypeError, ValueError):
-                                return
-                            # a plausible discounted price: positive, below list,
-                            # not a ratio/percentage or a stray small integer
-                            if lo and 0 < val < lo and val >= lo * 0.15:
-                                out.append((path, val))
-                    if _list_price and _list_price > 0:
-                        found = []
-                        _hunt(item, "item", _list_price, found)
-                        if found:
-                            globals()["_LCW_DEEP_DUMPED"] = True
-                            print(f"  [LCW][DEEP] discounted item found — list={_list_price}, "
-                                  f"ModelId={item.get('ModelId')}, OptionId={item.get('OptionId')}")
-                            print(f"  [LCW][DEEP] candidate sub-list-price fields:")
-                            for pth, val in sorted(found, key=lambda x: x[1]):
-                                print(f"      {pth} = {val}")
-                            try:
-                                blob = json.dumps(item, ensure_ascii=False, default=str)
-                            except Exception as e:
-                                blob = f"<json dump failed: {e}>"
-                            print(f"  [LCW][DEEP] full raw item JSON (first 6000 chars):")
-                            print(blob[:6000])
-
                 is_discounted  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
                 discounted_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
                 full_val       = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
                 old_val        = _parse_lcw_price(item.get("MinOldPrice"))
+                badge_val      = _lcw_badge_price(item)   # v14.50 — the real sale price
 
-                # v14.44 — DISCOUNT DETECTION IS NOW NUMERIC, NOT FLAG-DRIVEN.
+                # v14.50 — PRICE RESOLUTION, campaign-badge first.
                 #
-                # The old logic gated everything on `is_discounted`. If that flag
-                # is absent or renamed, every LCW item silently reads as full
-                # price, compare_at is never set, and first_observed_price gets
-                # anchored to the discounted price — after which the brand can
-                # never register a genuine drop again, because its baseline IS
-                # the sale price.
+                # Around 2026-07-21 LCW moved the live sale price into
+                # CampaignBadges[].DiscountedPrice and left the flat fields
+                # (DiscountedPriceValue, MinOldPrice, ConvertedPrice*) returning
+                # 0/None. Proven live 2026-07-26 (lcw_price_probe.py): o-5208891
+                # = PriceValue 349, badge DiscountedPrice 169, -52%, matching the
+                # website. Reading only the flat fields made every item resolve
+                # to its list price (== first_observed_price), which is why LCW
+                # showed frozen prices and zero price events for ~a week.
                 #
-                # That is not hypothetical. Measured 2026-07-23 across nine
-                # consecutive days and ~11,000 products per day: LCW recorded
-                # ZERO rows with a compare_at_price. Not a low number — zero, on
-                # every single day. Meanwhile price_events held 640 downward
-                # moves for the same brand, and 12,738 of 12,748 products sat at
-                # a price exactly equal to their baseline. A brand that visibly
-                # discounts cannot produce that shape; only a broken read can.
-                # LCW has already moved fields once this year (cartOperationViewModel
-                # went off-page in June 2026), so a renamed flag is the likely
-                # cause and will happen again.
-                #
-                # The fix is to stop asking the API whether something is on sale
-                # and instead compare the numbers it gives us. A "was" price that
-                # sits above the current price IS a discount, whatever the flag
-                # says. The flag is still honoured when present, but it can no
-                # longer VETO a discount that the prices themselves demonstrate.
+                # Order: the badge price is the actual charge, so it wins. The
+                # legacy DiscountedPriceValue path is kept as a fallback in case
+                # LCW ever repopulates it. The numeric-min path (v14.44) stays as
+                # a last resort for any odd item that has an old-price field but
+                # no badge. Full list price only when nothing else is present.
                 candidates = [v for v in (full_val, old_val) if v and v > 0]
-                if discounted_val and discounted_val > 0:
+                if badge_val and badge_val > 0:
+                    price = badge_val
+                elif discounted_val and discounted_val > 0:
                     price = discounted_val
                 elif is_discounted and candidates:
                     price = min(candidates)
@@ -3300,11 +3276,16 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 if not price or price <= 0:
                     continue
 
-                # compare_at = the highest credible "before" price on the record,
-                # accepted only when it genuinely exceeds what is being charged.
-                # A 1% floor keeps rounding noise out of the discount signals.
-                highest_prior = max(candidates) if candidates else 0
-                compare_at    = highest_prior if highest_prior > price * 1.01 else None
+                # compare_at = the credible "before" price. With a badge sale the
+                # list price (PriceValue/full_val) is the genuine anchor, so use
+                # it directly; otherwise fall back to the highest prior field.
+                # Accepted only when it genuinely exceeds what is being charged
+                # (1% floor keeps rounding noise out of the discount signals).
+                if badge_val and full_val > price * 1.01:
+                    compare_at = full_val
+                else:
+                    highest_prior = max(candidates) if candidates else 0
+                    compare_at    = highest_prior if highest_prior > price * 1.01 else None
                 if compare_at:
                     _LCW_DISCOUNTED_SEEN[0] += 1
                 _LCW_ITEMS_SEEN[0] += 1
