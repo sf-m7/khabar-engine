@@ -825,11 +825,15 @@ FEMALE_ONLY_BRANDS = {"carina", "just_sbr", "mlameh"}
 
 # ── Category Taxonomy ─────────────────────────────────────────────────────────
 CATEGORY_MAP = {
+    # Order matters: normalize_category returns the FIRST matching category and
+    # matching is substring-based, so the more specific "sweatshirt"/"hoodie"/
+    # "polo" MUST be checked before the generic "shirt" — otherwise "sweatshirt"
+    # matches "shirt" and lands in the wrong family. (Fix 2026-07.)
     "t-shirts":    ["t-shirt", " tee ", " tee,", "تيشيرت", "jersey tee", "jersey t"],
-    "shirts":      ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
-    "polos":       ["polo"],
     "sweatshirts": ["sweatshirt", "سويت شيرت"],
     "hoodies":     ["hoodie", "hoody", "هودي"],
+    "polos":       ["polo"],
+    "shirts":      ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
     "cardigans":   ["cardigan", "كارديجان"],
     "sweaters":    ["sweater", "pullover", "knitwear", "knit", "بلوفر"],
     "bodysuits":   ["bodysuit", "body suit", "بودي"],
@@ -864,7 +868,11 @@ CATEGORY_MAP = {
     "socks":       ["sock", "جوارب", "stocking"],
     "underwear":   ["underwear", "bra", "brief", "boxer", "lingerie", "ملابس داخلية"],
     "swimwear":    ["swimwear", "swimsuit", "bikini", "swim trunk", "مايوه"],
-    "loungewear":  ["pyjama", "pajama", "nightwear", "sleepwear", "homewear", "بيجامة"],
+    # pajamas is its own category (not folded into loungewear) so it matches the
+    # backfill's frozen SUBCATS key "pajamas"; folding it into loungewear meant
+    # pajama subcategories could never fill. (Fix 2026-07.)
+    "pajamas":     ["pyjama", "pajama", "بيجامة"],
+    "loungewear":  ["nightwear", "sleepwear", "homewear", "loungewear"],
     "sportswear":  ["sport", "gym", "athletic", "workout", "training", "active"],
 }
 
@@ -876,7 +884,7 @@ CATEGORY_GROUPS = {
     "footwear":    ["sneakers", "sandals", "boots", "loafers", "heels", "slippers"],
     "accessories": ["bags", "belts", "scarves", "hats", "jewelry", "watches", "sunglasses", "socks", "underwear"],
     "swimwear":    ["swimwear"],
-    "loungewear":  ["loungewear"],
+    "loungewear":  ["loungewear", "pajamas"],
     "sportswear":  ["sportswear"],
 }
 
@@ -1122,6 +1130,11 @@ def safe_db_execute(query, retries=3):
 
 def normalize_category(text):
     text = text.lower()
+    # Guard: the trousers keyword "pant" substring-matches "panties"/"pantyhose",
+    # so underwear was being mis-filed as trousers. Catch it before the loop.
+    # (Fix 2026-07.)
+    if any(kw in text for kw in ("panty", "panties", "pantie", "pantyhose", "knicker")):
+        return "underwear"
     for category, keywords in CATEGORY_MAP.items():
         if any(kw in text for kw in keywords):
             return category
