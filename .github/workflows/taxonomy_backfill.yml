@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - colors
+          - sizes
           - subcat-rules
           - subcat-text
           - subcat-vision
