@@ -304,43 +304,70 @@ def check_price_events(cur):
 
 
 def check_frozen_prices(cur):
-    """The exact fault that hid for a week on LC Waikiki: the site was
-    discounting heavily, but a moved API field made every item read at its list
-    price, so every product sat at ONE unchanging price day after day and change
-    detection went silent. check_discount_capture catches the "zero discounts"
-    shape; this catches the more general "prices don't move at all" fingerprint,
-    which also fires for a stuck scraper writing carried-forward values.
+    """Catch the LC Waikiki failure mode: a moved API field makes every item read
+    at its list price, so prices sit frozen AND we become blind to the brand's
+    discounts entirely.
 
-    For each brand with enough history and volume, measure the share of products
-    whose price has been IDENTICAL across the last 7 days. A live mid-range
-    fashion brand always has some churn; >95% frozen is a broken read, not a
-    quiet market. Uses distinct price count per product over the window.
+    The naive "price hasn't changed in 8 days" test alone is NOT enough — it
+    false-positives on the many Shopify brands that legitimately hold a product
+    at a stable SALE price for weeks (price constant, compare_at_price above it).
+    Their price is frozen but their discounts are fully captured via compare_at,
+    so we are not blind to them and nothing is broken. Confirmed 2026-07-26:
+    andora/tie_house/dalydress etc. are 60-98% on sale via compare_at while their
+    price is stable — healthy, not broken.
+
+    So this fires only when BOTH are true for a brand: (a) price is frozen across
+    the window for ~all products, AND (b) almost none of its products show a
+    compare_at discount either. That combination means our entire view of the
+    brand's pricing is static — the real "field moved, we can't see anything"
+    signature. LCW during the break had exactly this shape (price stuck at list,
+    no compare_at, badges unreadable). check_discount_capture overlaps on the
+    compare_at half; this adds the price-stasis half so a stale-writer bug that
+    keeps serving old compare_at values is still caught.
     """
     rows = q(cur, """
         WITH per_prod AS (
             SELECT ps.brand, ps.product_id,
-                   count(DISTINCT ps.price)        AS distinct_prices,
+                   count(DISTINCT ps.price)         AS distinct_prices,
                    count(DISTINCT ps.snapshot_date) AS days
             FROM price_snapshots ps
             WHERE ps.snapshot_date >= CURRENT_DATE - 7
             GROUP BY ps.brand, ps.product_id
+        ),
+        frozen AS (
+            SELECT brand,
+                   count(*)                                    AS products,
+                   count(*) FILTER (WHERE distinct_prices = 1) AS frozen,
+                   max(days)                                   AS days
+            FROM per_prod WHERE days >= 5 GROUP BY brand HAVING count(*) > 500
+        ),
+        sale AS (
+            SELECT brand,
+                   count(*)                                                     AS n,
+                   count(*) FILTER (WHERE compare_at_price IS NOT NULL
+                                      AND compare_at_price > price*1.01)        AS on_sale
+            FROM (
+                SELECT ps.brand, ps.product_id, ps.price, ps.compare_at_price,
+                       row_number() OVER (PARTITION BY ps.product_id
+                                          ORDER BY ps.snapshot_date DESC) rn
+                FROM price_snapshots ps
+                WHERE ps.snapshot_date >= CURRENT_DATE - 2
+            ) t WHERE rn = 1 GROUP BY brand
         )
-        SELECT brand,
-               count(*)                                          AS products,
-               count(*) FILTER (WHERE distinct_prices = 1)       AS frozen,
-               max(days)                                         AS days
-        FROM per_prod
-        WHERE days >= 5
-        GROUP BY brand
-        HAVING count(*) > 500
+        SELECT f.brand, f.products, f.frozen, f.days,
+               COALESCE(100.0*s.on_sale/NULLIF(s.n,0), 0) AS pct_on_sale
+        FROM frozen f LEFT JOIN sale s ON s.brand = f.brand
     """)
     for r in rows:
-        pct = 100.0 * r["frozen"] / r["products"] if r["products"] else 0
-        if pct >= 95.0:
+        pct_frozen = 100.0 * r["frozen"] / r["products"] if r["products"] else 0
+        pct_on_sale = float(r["pct_on_sale"] or 0)
+        # broken only if frozen AND we can't see its discounts via compare_at
+        if pct_frozen >= 95.0 and pct_on_sale < 5.0:
             record("FAIL", f"frozen_prices/{r['brand']}",
-                   f"{pct:.1f}% of {r['products']:,} products held ONE price "
-                   f"for {r['days']} days — price read has almost certainly "
-                   f"broken (field moved or scraper writing stale values)")
+                   f"{pct_frozen:.1f}% of {r['products']:,} products held ONE "
+                   f"price for {r['days']} days AND only {pct_on_sale:.1f}% show "
+                   f"any compare_at discount — we appear blind to this brand's "
+                   f"pricing (field moved or scraper writing stale values)")
 
 
 def main():
