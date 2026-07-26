@@ -143,6 +143,204 @@ TITLE_RULES = [
 
 
 # ----------------------------------------------------------------------
+# PASS: sizes — deterministic size normalization (no AI; same spirit as
+# subcat-rules). Added 2026-07.
+# ----------------------------------------------------------------------
+#
+# WHY THIS IS ITS OWN PASS, NOT PART OF THE COLOR/SUBCATEGORY WORK:
+# Sizes are not one vocabulary — a product's raw "size" value can come from
+# up to 6 different real-world systems, and the SAME raw text can mean
+# different things depending on category (e.g. "42" is a waist inch on
+# jeans but an EU dress size on a dress). So classification is gated by
+# category_normalized FIRST, then by pattern within that domain.
+#
+# WHAT THIS PASS DELIBERATELY DOES NOT DO:
+# It does not force every raw value into a family. Ambiguous notations
+# (Turkish dual Beden/Boy sizing, waist-inseam combos, dual-size ranges
+# like "S-M") are written to size_review_queue instead of guessed — a wrong
+# guess here becomes a false market claim later. Mohammed reviews that
+# queue; this pass only auto-applies patterns with no real ambiguity.
+#
+# DOMAIN GATE: which categories get which size system.
+SIZE_DOMAIN_BOTTOMS = {"trousers", "jeans", "shorts", "joggers", "sweatpants", "leggings"}
+SIZE_DOMAIN_TOPS_EU = {"t-shirts", "shirts", "dresses", "skirts", "sweaters", "cardigans",
+                        "jackets", "coats", "blazers", "vests", "hoodies", "sweatshirts",
+                        "polos", "tank-tops", "jumpsuits", "kaftans", "bodysuits", "pajamas"}
+# Categories intentionally NOT size-normalized here: bags/belts/hats/jewelry/
+# watches/sunglasses/scarves (not a garment-size axis — arafa's "18 INCH"
+# bug lives here), footwear (EU shoe numbers overlap visually with EU dress
+# numbers but are a different scale — needs its own pass, not this one),
+# underwear (bra-band sizing like "80/B" is its own system).
+
+LETTER_LADDER = {
+    "xxs": ("XXS", 1), "xs": ("XS", 2), "s": ("S", 3), "m": ("M", 4), "l": ("L", 5),
+    "xl": ("XL", 6), "xxl": ("2XL", 7), "2xl": ("2XL", 7), "xxxl": ("3XL", 8),
+    "3xl": ("3XL", 8), "4xl": ("4XL", 9), "5xl": ("5XL", 10), "6xl": ("6XL", 11),
+    "7xl": ("7XL", 12), "small": ("S", 3), "medium": ("M", 4), "large": ("L", 5),
+}
+ONE_SIZE_TOKENS = {"one size", "onesize", "os", "free", "free size", "freesize"}
+
+# Standard EU numeric -> letter-equivalent conversion (general apparel, not
+# menswear collar sizing which uses the same numbers for a different thing —
+# collar sizing only appears on formal/dress shirts and isn't in this data
+# in volume; flagged for later if it shows up).
+EU_TO_LETTER = {
+    "34": ("XXS", 1), "36": ("XS", 2), "38": ("S", 3), "40": ("M", 4),
+    "42": ("L", 5), "44": ("L", 5), "46": ("XL", 6), "48": ("2XL", 7),
+    "50": ("3XL", 8), "52": ("3XL", 8), "54": ("4XL", 9), "56": ("4XL", 9),
+    "58": ("5XL", 10), "60": ("5XL", 10),
+}
+
+COLOR_WORD_RE = re.compile(
+    r"^(black|white|off[\s_-]?white|grey|gray|beige|brown|blue|navy|nave[_ ]?blue|"
+    r"teal|petrol|petroL[_ ]?blue|green|olive|khaki|yellow|orange|red|burgundy|"
+    r"maroon|pink|rose|purple|lilac|lavender|mauve|gold|silver|copper|turquoise|"
+    r"fuchsia|coral|mint|cream|camel|tan|taupe|multi|stone|vison|ecru|russet|"
+    r"anthrcite|anthracite|d[_ ]?blue|light[_ ]?blue|dark[_ ]?grey|dark[_ ]?blue|"
+    r"sky[_ ]?blue|royal[_ ]?blue|bottel[_ ]?green|olive[_ ]?green)$", re.I)
+DIMENSION_RE = re.compile(r"\d+\s*(inch|cm|mm)\b|\d+\s*[*x]\s*\d+", re.I)
+VENDOR_CODE_RE = re.compile(r"^[A-Z]\d{3,4}$")           # N002, J014, L006, U038
+HEIGHT_CM_RE   = re.compile(r"^S1[3-8]\d$", re.I)         # S130..S189, kids/teen height
+KIDS_AGE_RE    = re.compile(r"^\d{1,2}\s*Y$", re.I)
+KIDS_MONTH_RE  = re.compile(r"^\d{1,2}M[\s_-]\d{1,2}M$", re.I)
+KIDS_TODDLER_RE = re.compile(r"^\d[T]$", re.I)
+KIDS_RANGE_RE  = re.compile(r"^\d{1,2}[\s_-]\d{1,2}$")    # bare "8-9", "6-7" — only
+                                                            # trusted as kids in kids-flagged
+                                                            # brands/categories; else -> review
+GARBAGE_EXACT  = {"def"}
+
+# Patterns that are genuinely ambiguous — never auto-classified, always
+# queued for review with a reason so Mohammed can see WHY it's unresolved.
+REVIEW_PATTERNS = [
+    (re.compile(r"^beden\s*\d+\s*-\s*boy\s*\d+$", re.I), "turkish_dual_size_height"),
+    (re.compile(r"^\d{2,3}[\s_-]\d{2,3}$"), "possible_waist_inseam_combo"),
+    (re.compile(r"^(xs|s|m|l|xl|2xl|3xl)[\s/-](xs|s|m|l|xl|2xl|3xl)$", re.I), "dual_letter_range"),
+    (re.compile(r"^(xs|s|m|l|xl)[\s/-]\d{2,3}$", re.I), "letter_plus_eu_combo"),
+    (re.compile(r"^\d{2,3}\s*/\s*[ab]$", re.I), "possible_bra_band_size"),
+    (re.compile(r"^x/xx$", re.I), "ambiguous_dual_notation"),
+]
+
+
+def classify_size(raw, category_normalized):
+    """Returns (size_family, size_system, status, review_reason).
+    status is one of: classified / excluded / review."""
+    if not raw:
+        return None, None, "excluded", None
+    v = str(raw).strip()
+    v_clean = v.lower()
+
+    # Garbage / known-bad placeholder values first.
+    if v_clean in GARBAGE_EXACT:
+        return None, None, "excluded", None
+    # Color words leaking into the size field (the arafa/tomato-class bug —
+    # not brand-specific; seen across several brands). The root cause gets
+    # a scraper fix separately; here we just don't let it pollute the map.
+    if COLOR_WORD_RE.match(v_clean.replace(" ", "_")) or COLOR_WORD_RE.match(v_clean):
+        return None, None, "excluded", None
+    # Physical dimensions (bag/towel "size" — not a garment size at all).
+    if DIMENSION_RE.search(v_clean):
+        return None, None, "excluded", None
+    # Height-based kids/teen sizing (S150 etc) — real signal, but its own
+    # system; not auto-merged into anything else.
+    if HEIGHT_CM_RE.match(v):
+        return v.upper(), "kids_height_cm", "classified", None
+    # Internal vendor/SKU codes (N002, J014, L006, U038 ...) — not sizes.
+    if VENDOR_CODE_RE.match(v):
+        return None, None, "excluded", None
+    # One-size.
+    if v_clean in ONE_SIZE_TOKENS:
+        return "one-size", "one_size", "classified", None
+    # Kids age notations.
+    if KIDS_AGE_RE.match(v) or KIDS_MONTH_RE.match(v) or KIDS_TODDLER_RE.match(v):
+        return v.upper().replace(" ", ""), "kids_age", "classified", None
+
+    # Ambiguous notations — queue, never guess.
+    for pattern, reason in REVIEW_PATTERNS:
+        if pattern.match(v):
+            return None, None, "review", reason
+
+    # Bare numeric range like "8-9" is only trusted as kids sizing when the
+    # category itself is a kids-flagged one; caller passes that context via
+    # category_normalized being in a kids set if/when that taxonomy exists.
+    # For now: treat as review rather than assume.
+    if KIDS_RANGE_RE.match(v):
+        return None, None, "review", "bare_numeric_range_unclear_domain"
+
+    # Letter ladder (case/space insensitive).
+    if v_clean in LETTER_LADDER:
+        fam, order = LETTER_LADDER[v_clean]
+        return fam, "letter", "classified", None
+
+    # Numeric — meaning depends on domain gate.
+    if v.isdigit():
+        if category_normalized in SIZE_DOMAIN_BOTTOMS:
+            n = int(v)
+            if 20 <= n <= 60:
+                return v, "waist_numeric", "classified", None
+        if category_normalized in SIZE_DOMAIN_TOPS_EU:
+            if v in EU_TO_LETTER:
+                fam, order = EU_TO_LETTER[v]
+                return fam, "eu_numeric", "classified", None
+            # numeric outside the known EU ladder in a tops/dresses category
+            # is very likely a kids numeric size (tree/arafa pattern) —
+            # queue rather than guess which kids ladder it belongs to.
+            return None, None, "review", "numeric_outside_eu_ladder_possible_kids"
+
+    return None, None, "review", "unrecognized_pattern"
+
+
+def pass_sizes():
+    print("== PASS sizes: deterministic size normalization (no AI) ==")
+    conn = db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute(
+        """SELECT DISTINCT pv.size, p.category_normalized, p.brand
+           FROM product_variants pv JOIN products p ON p.id = pv.product_id
+           WHERE pv.delisted_at IS NULL AND p.is_active = true
+             AND pv.size IS NOT NULL AND pv.size <> ''
+             AND pv.size_status IS NULL"""
+    )
+    rows = cur.fetchall()
+    print(f"  distinct (size, category, brand) combinations to classify: {len(rows)}")
+
+    classified = excluded = queued = 0
+    review_rows = []
+    for r in rows:
+        fam, system, status, reason = classify_size(r["size"], r["category_normalized"])
+        cur.execute(
+            """UPDATE product_variants pv SET size_family=%s, size_system=%s, size_status=%s
+               FROM products p
+               WHERE pv.product_id = p.id AND pv.delisted_at IS NULL
+                 AND pv.size = %s AND p.category_normalized IS NOT DISTINCT FROM %s
+                 AND p.brand = %s""",
+            (fam, system, status, r["size"], r["category_normalized"], r["brand"]),
+        )
+        if status == "classified":
+            classified += cur.rowcount
+        elif status == "excluded":
+            excluded += cur.rowcount
+        else:
+            queued += cur.rowcount
+            review_rows.append((r["size"], r["category_normalized"], r["brand"], cur.rowcount, reason))
+        conn.commit()
+
+    # Dedup review rows into the queue (one row per size+category+brand).
+    for size_raw, cat, brand, n, reason in review_rows:
+        cur.execute(
+            """INSERT INTO size_review_queue (size_raw, category_normalized, brand, sample_count, reason)
+               VALUES (%s,%s,%s,%s,%s)""",
+            (size_raw, cat, brand, n, reason),
+        )
+    conn.commit()
+
+    print(f"  classified: {classified} variants")
+    print(f"  excluded (garbage/color-leak/dimension/vendor-code): {excluded} variants")
+    print(f"  queued for review: {queued} variants across {len(review_rows)} distinct patterns")
+    print("  Review queue is in size_review_queue — nothing there was guessed.")
+    conn.close()
+
+
+# ----------------------------------------------------------------------
 # Plumbing
 # ----------------------------------------------------------------------
 def db():
@@ -687,7 +885,7 @@ def _subcat_progress(cur):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--pass", dest="which", required=True,
-                    choices=["colors", "subcat-rules", "subcat-text",
+                    choices=["colors", "sizes", "subcat-rules", "subcat-text",
                              "subcat-vision", "audit", "all"])
     ap.add_argument("--vision-limit", type=int, default=4000)
     ap.add_argument("--audit-sample", type=int, default=40)
@@ -695,16 +893,17 @@ if __name__ == "__main__":
 
     steps = {
         "colors": pass_colors,
+        "sizes": pass_sizes,
         "subcat-rules": pass_subcat_rules,
         "subcat-text": pass_subcat_text,
         "subcat-vision": lambda: pass_subcat_vision(args.vision_limit),
         "audit": lambda: pass_audit(args.audit_sample),
     }
-    order = (["colors", "subcat-rules", "subcat-text", "subcat-vision",
+    order = (["colors", "sizes", "subcat-rules", "subcat-text", "subcat-vision",
               "audit"] if args.which == "all" else [args.which])
 
-    # Pick the Google lane (skip for subcat-rules, which needs no AI)
-    if any(p != "subcat-rules" for p in order):
+    # Pick the Google lane (skip for the no-AI deterministic passes)
+    if any(p not in ("subcat-rules", "sizes") for p in order):
         _init_backend()
 
     for name in order:
