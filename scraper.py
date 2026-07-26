@@ -3213,6 +3213,53 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     print(f"  [LCW][DEBUG] item keys: {sorted(item.keys())}")
                     print(f"  [LCW][DEBUG] price-related fields: {price_ish}")
 
+                # v14.49 — DEEP PRICE HUNT. The top-level dump above shows every
+                # top-level discount field is empty even though the live site
+                # sells the item discounted, so the real selling price has moved
+                # into a NESTED object (ModelViewModel / GroupOptions /
+                # OptionSummaryList / a campaign field). This block finds the
+                # FIRST item on the page that is actually discounted per the live
+                # site — detected structurally as "some numeric value nested in
+                # the payload is meaningfully below PriceValue" — and dumps (a)
+                # its full raw JSON and (b) every nested numeric field whose value
+                # sits below the list price, with its full path. That path is
+                # exactly the field we need to start reading. Independent of
+                # LCW_DEBUG_FIELDS so it fires even after the one-shot above.
+                if env_str("LCW_DEBUG_DEEP", "") == "1" and not globals().get("_LCW_DEEP_DUMPED"):
+                    _list_price = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
+                    def _hunt(node, path, lo, out):
+                        if isinstance(node, dict):
+                            for k, v in node.items():
+                                _hunt(v, f"{path}.{k}", lo, out)
+                        elif isinstance(node, list):
+                            for i, v in enumerate(node[:5]):
+                                _hunt(v, f"{path}[{i}]", lo, out)
+                        else:
+                            try:
+                                val = float(str(node).replace("EGP", "").replace(",", "").strip())
+                            except (TypeError, ValueError):
+                                return
+                            # a plausible discounted price: positive, below list,
+                            # not a ratio/percentage or a stray small integer
+                            if lo and 0 < val < lo and val >= lo * 0.15:
+                                out.append((path, val))
+                    if _list_price and _list_price > 0:
+                        found = []
+                        _hunt(item, "item", _list_price, found)
+                        if found:
+                            globals()["_LCW_DEEP_DUMPED"] = True
+                            print(f"  [LCW][DEEP] discounted item found — list={_list_price}, "
+                                  f"ModelId={item.get('ModelId')}, OptionId={item.get('OptionId')}")
+                            print(f"  [LCW][DEEP] candidate sub-list-price fields:")
+                            for pth, val in sorted(found, key=lambda x: x[1]):
+                                print(f"      {pth} = {val}")
+                            try:
+                                blob = json.dumps(item, ensure_ascii=False, default=str)
+                            except Exception as e:
+                                blob = f"<json dump failed: {e}>"
+                            print(f"  [LCW][DEEP] full raw item JSON (first 6000 chars):")
+                            print(blob[:6000])
+
                 is_discounted  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
                 discounted_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
                 full_val       = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
