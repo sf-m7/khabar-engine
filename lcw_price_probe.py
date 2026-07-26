@@ -84,38 +84,60 @@ def hunt_below(node, path, ceiling, out):
             out.append((path, val))
 
 
+# The category page used to PRIME the session (pick up the WAF/cookie token).
+# Without this, the ajax endpoint returns metadata but an empty product list —
+# which is exactly what an un-primed probe sees. t-345 = men's t-shirts.
+PRIME_PATH = os.environ.get("LCW_PROBE_PRIME", "men-t-shirts-t-345")
+
+
 def fetch_page(page_index):
-    url = (f"https://{DOMAIN}/en/ajax/ProductList/ProductListPageData"
-           f"?xhrKeys=CategoryTreeId,xhrKeys&CategoryTreeId={CATEGORY_ID}"
-           f"&PageIndex={page_index}&Layout=three-column")
+    ajax_url = (f"https://{DOMAIN}/en/ajax/ProductList/ProductListPageData"
+                f"?xhrKeys=CategoryTreeId,xhrKeys&CategoryTreeId={CATEGORY_ID}"
+                f"&PageIndex={page_index}&Layout=three-column")
+    prime_url = f"https://{DOMAIN}/en/{PRIME_PATH}"
     headers = {
         "accept": "application/json, text/plain, */*",
         "accept-language": "en-US,en;q=0.9",
         "origin": f"https://{DOMAIN}",
-        "referer": f"https://{DOMAIN}/en/men-clothing-t-9",
+        "referer": prime_url,
         "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin", "priority": "u=1, i",
     }
+    prime_headers = {
+        "accept": "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
+        "referer": f"https://{DOMAIN}/en",
+    }
     body = {"CategoryParameterList": [], "FilterListJson": "[]",
             "LastSeenOptionIdsJson": "[]"}
-    # up to 6 attempts, each on a fresh session, 12s timeout — enough to get
+    # up to 6 attempts, each a fresh primed session, 15s timeout — enough to get
     # through even if a few proxy peers are bad, without any full-crawl machinery.
     for attempt in range(6):
         sess = make_session()
         try:
-            res = sess.post(url, json=body, headers=headers, timeout=12,
+            # 1) PRIME: load the category HTML page first so LCW hands us the
+            #    cookie/WAF token the ajax endpoint requires to return products.
+            pr = sess.get(prime_url, headers=prime_headers, timeout=15,
+                          **_http1_kwargs())
+            print(f"[probe] attempt {attempt+1}: primed HTTP {pr.status_code} "
+                  f"({len(pr.content)//1024} KB)")
+            # 2) now the real ajax product-list call on the SAME session
+            res = sess.post(ajax_url, json=body, headers=headers, timeout=15,
                             **_http1_kwargs())
             if res.status_code == 200:
                 return res.json()
-            print(f"[probe] attempt {attempt+1}: HTTP {res.status_code}")
+            print(f"[probe] attempt {attempt+1}: ajax HTTP {res.status_code}")
         except Exception as e:
             print(f"[probe] attempt {attempt+1} failed: {e}")
     return None
 
 
 def extract_items(data):
-    """LCW nests the product list; find the first list of dicts that look like
-    products (have a PriceValue or ModelId)."""
+    """Primary path is the scraper's own: data['CatalogList']['Items'].
+    Fall back to a tree walk only if that's empty (in case the shape changed)."""
+    items = (data.get("CatalogList") or {}).get("Items") or []
+    if items:
+        return items
     found = []
 
     def walk(node):
