@@ -760,7 +760,7 @@ def env_int(name, default):
 # Edit this set directly as brands recover or new ones get blocked.
 DATAIMPULSE_PROXY_BRANDS = {
     "dalydress", "eagle", "just_sbr", "mlameh", "khotwh", "tomato",
-    "ravin", "tree", "mobaco", "arafa", "tie_house", "premoda", "activ", "esla", "town_team", "mens_club", "dott_jeans", "carina", "andora", "cizaro"
+    "ravin", "tree", "mobaco", "rojada", "arafa", "tie_house", "premoda", "activ", "esla", "town_team", "mens_club", "dott_jeans", "carina", "andora", "cizaro"
 }
 
 BRANDS = [
@@ -785,6 +785,7 @@ BRANDS = [
     {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
+    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
 
@@ -809,6 +810,7 @@ BRAND_DISPLAY = {
     "dalydress":  "Dalydress",
     "esla":       "Esla",
     "mobaco":     "Mobaco",
+    "rojada":     "Rojada",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
     "arafa":      "Arafa Stores",
@@ -827,7 +829,7 @@ BRAND_DISPLAY = {
 # normal "unisex" fallback for genuinely mixed-gender catalogs) is completely
 # unaffected. Same opt-in-set pattern as COLOR_FROM_TITLE_BRANDS and
 # ARABIC_COLOR_BRANDS below.
-FEMALE_ONLY_BRANDS = {"carina", "just_sbr", "mlameh"}
+FEMALE_ONLY_BRANDS = {"carina", "just_sbr", "mlameh", "rojada"}
 
 # ── Category Taxonomy ─────────────────────────────────────────────────────────
 CATEGORY_MAP = {
@@ -5204,6 +5206,11 @@ if __name__ == "__main__":
         active_brands = [b for b in BRANDS if b["engine"] == "defacto"]
     elif SCRAPE_TARGET == "mobaco":
         active_brands = [b for b in BRANDS if b["engine"] == "woocommerce"]
+    elif SCRAPE_TARGET in {b["name"] for b in BRANDS}:
+        # single-brand isolation: SCRAPE_TARGET=<brand name> runs just that one.
+        # Lets a newly-added brand (e.g. rojada) be validated on its own before
+        # joining the shared run, without scraping every brand on its engine.
+        active_brands = [b for b in BRANDS if b["name"] == SCRAPE_TARGET]
     else:
         active_brands = BRANDS
     print(f"🚀 Khabar Scraper starting... target={SCRAPE_TARGET} ({len(active_brands)} brands)")
