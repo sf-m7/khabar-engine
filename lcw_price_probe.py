@@ -111,7 +111,14 @@ def fetch_page(page_index):
         "accept-language": "en-US,en;q=0.9",
         "referer": f"https://{DOMAIN}/en",
     }
-    body = {"CategoryParameterList": [], "FilterListJson": "[]",
+    # The Men category (tree id 9) requires these params in CategoryParameterList
+    # or the endpoint returns an empty virtual-filter page (what an empty list
+    # gets you). Copied verbatim from scraper.py's LCW_CATEGORIES config.
+    cat_params = [
+        {"PropertyId": 67, "PropertyValueId": [10]},
+        {"PropertyId": 63, "PropertyValueId": [57794]},
+    ]
+    body = {"CategoryParameterList": cat_params, "FilterListJson": "[]",
             "LastSeenOptionIdsJson": "[]"}
     # up to 6 attempts, each a fresh primed session, 15s timeout — enough to get
     # through even if a few proxy peers are bad, without any full-crawl machinery.
