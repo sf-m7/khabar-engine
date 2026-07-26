@@ -1142,9 +1142,20 @@ def normalize_category(text):
 
 def normalize_gender(tags, product_type, title):
     text = f"{' '.join(tags)} {product_type} {title}".lower()
+    # v14.47 fix: "kid","child","baby","infant" missed junior/boys/girls-
+    # labeled kids lines entirely. Confirmed live on mobaco: 127 "Junior
+    # Boys" t-shirts were falling through to unisex (7 even matched
+    # "women" by accident), dragging that category's pricing/positioning
+    # data down with genuine kids items. Word-boundary regex avoids
+    # "boy"/"girl" matching inside unrelated words; "boyfriend" is
+    # explicitly excluded because "boyfriend fit" is a real women's cut
+    # name, not a kids signal, and would otherwise be misrouted.
+    text_no_boyfriend = re.sub(r"\bboyfriend\b", "", text)
+    if re.search(r"\b(kid|kids|child|children|baby|infant|junior|toddler|"
+                 r"boys?|girls?)\b", text_no_boyfriend) or "أطفال" in text:
+        return "kids"
     if any(w in text for w in ["women", "woman", "female", "ladies", "girl", "نسائي"]): return "women"
     if any(w in text for w in ["men", "man", "male", "gents", "رجالي"]): return "men"
-    if any(w in text for w in ["kid", "child", "baby", "infant", "أطفال"]): return "kids"
     return "unisex"
 
 def detect_options(variants):
