@@ -672,18 +672,24 @@ SHOPIFY_PROXY_COUNTRY  = "eg"   # hardcoded on purpose — not env-overridable
 # LCW_FORCE_HTTP1=0 to revert without a code change.
 LCW_FORCE_HTTP1 = env_str("LCW_FORCE_HTTP1", "1").strip().lower() not in ("0", "false", "no", "off")
 
-def _lcw_session_kwargs():
-    """HTTP-version kwargs for curl_cffi, if pinning is enabled and supported."""
+def _lcw_http_version():
+    """
+    Return the curl_cffi HTTP-version constant to pin LCW requests to, or None
+    to leave curl_cffi on its default (HTTP/2). This value is injected PER
+    REQUEST inside execute_with_retry (see v14.48 note in get_lcw_session) —
+    curl_cffi ignores http_version on the Session constructor, which is why the
+    v14.41 attempt to pin it there never took effect.
+    """
     if not LCW_FORCE_HTTP1:
-        return {}
+        return None
     try:
         from curl_cffi.const import CurlHttpVersion
-        return {"http_version": CurlHttpVersion.V1_1}
+        return CurlHttpVersion.V1_1
     except Exception as e:
         # Older curl_cffi without CurlHttpVersion — degrade to default (h2)
         # rather than crashing the run.
         print(f"  [LCW] HTTP/1.1 pinning unavailable ({e}); using default.")
-        return {}
+        return None
 
 # v14.40: LCW_PROXY_COUNTRY accepts a comma-separated LIST ("tr,sa,ae").
 # Each new sticky session picks one at random, so the crawl draws from the
@@ -825,15 +831,11 @@ FEMALE_ONLY_BRANDS = {"carina", "just_sbr", "mlameh"}
 
 # ── Category Taxonomy ─────────────────────────────────────────────────────────
 CATEGORY_MAP = {
-    # Order matters: normalize_category returns the FIRST matching category and
-    # matching is substring-based, so the more specific "sweatshirt"/"hoodie"/
-    # "polo" MUST be checked before the generic "shirt" — otherwise "sweatshirt"
-    # matches "shirt" and lands in the wrong family. (Fix 2026-07.)
     "t-shirts":    ["t-shirt", " tee ", " tee,", "تيشيرت", "jersey tee", "jersey t"],
+    "shirts":      ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
+    "polos":       ["polo"],
     "sweatshirts": ["sweatshirt", "سويت شيرت"],
     "hoodies":     ["hoodie", "hoody", "هودي"],
-    "polos":       ["polo"],
-    "shirts":      ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
     "cardigans":   ["cardigan", "كارديجان"],
     "sweaters":    ["sweater", "pullover", "knitwear", "knit", "بلوفر"],
     "bodysuits":   ["bodysuit", "body suit", "بودي"],
@@ -868,11 +870,7 @@ CATEGORY_MAP = {
     "socks":       ["sock", "جوارب", "stocking"],
     "underwear":   ["underwear", "bra", "brief", "boxer", "lingerie", "ملابس داخلية"],
     "swimwear":    ["swimwear", "swimsuit", "bikini", "swim trunk", "مايوه"],
-    # pajamas is its own category (not folded into loungewear) so it matches the
-    # backfill's frozen SUBCATS key "pajamas"; folding it into loungewear meant
-    # pajama subcategories could never fill. (Fix 2026-07.)
-    "pajamas":     ["pyjama", "pajama", "بيجامة"],
-    "loungewear":  ["nightwear", "sleepwear", "homewear", "loungewear"],
+    "loungewear":  ["pyjama", "pajama", "nightwear", "sleepwear", "homewear", "بيجامة"],
     "sportswear":  ["sport", "gym", "athletic", "workout", "training", "active"],
 }
 
@@ -884,7 +882,7 @@ CATEGORY_GROUPS = {
     "footwear":    ["sneakers", "sandals", "boots", "loafers", "heels", "slippers"],
     "accessories": ["bags", "belts", "scarves", "hats", "jewelry", "watches", "sunglasses", "socks", "underwear"],
     "swimwear":    ["swimwear"],
-    "loungewear":  ["loungewear", "pajamas"],
+    "loungewear":  ["loungewear"],
     "sportswear":  ["sportswear"],
 }
 
@@ -1030,8 +1028,18 @@ def get_lcw_session(avoid_country=None):
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{sticky_port}"
     print(f"  [LCW] Proxy session selected: country={country} port.{sticky_port}")
     session = requests.Session(impersonate="chrome124",
-                               proxies={"https": proxy_url, "http": proxy_url},
-                               **_lcw_session_kwargs())
+                               proxies={"https": proxy_url, "http": proxy_url})
+    # v14.48: HTTP/1.1 pin, corrected. curl_cffi's Session.__init__ does NOT
+    # accept http_version — only the per-request Session.request()/.get()/.post()
+    # do. The old code passed http_version to the CONSTRUCTOR (via
+    # **_lcw_session_kwargs()), where curl_cffi silently ignored it, so every
+    # LCW request since v14.41 (Jul 18) still went out as HTTP/2 and kept
+    # failing with curl (16) SETTINGS-frame errors. We now stash the intended
+    # http_version ON the session and inject it per-request inside
+    # execute_with_retry, which is the one path every LCW call goes through
+    # (prime, catalog crawl, size pass). None-safe: if pinning is disabled or
+    # unavailable the value is None and nothing is injected (default h2).
+    session._khabar_http_version = _lcw_http_version()
     return session, country
 
 def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=60, **kwargs):
@@ -1064,6 +1072,16 @@ def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=
         ROOT cause of Mobaco's 429s (too many requests too fast) rather than
         just retrying around it.
     """
+    # v14.48: if this is an LCW session carrying a pinned HTTP version, inject
+    # it per-request (this is the path curl_cffi actually honors). Applies only
+    # to sessions tagged in get_lcw_session — Shopify/Woo sessions have no such
+    # attribute, so they are untouched and stay on HTTP/2. Caller-supplied
+    # http_version always wins.
+    _sess = getattr(session_method, "__self__", None)
+    _pinned = getattr(_sess, "_khabar_http_version", None)
+    if _pinned is not None and "http_version" not in kwargs:
+        kwargs["http_version"] = _pinned
+
     delay = backoff
     for attempt in range(max_retries):
         retry_after = None
@@ -1130,11 +1148,6 @@ def safe_db_execute(query, retries=3):
 
 def normalize_category(text):
     text = text.lower()
-    # Guard: the trousers keyword "pant" substring-matches "panties"/"pantyhose",
-    # so underwear was being mis-filed as trousers. Catch it before the loop.
-    # (Fix 2026-07.)
-    if any(kw in text for kw in ("panty", "panties", "pantie", "pantyhose", "knicker")):
-        return "underwear"
     for category, keywords in CATEGORY_MAP.items():
         if any(kw in text for kw in keywords):
             return category
@@ -1142,20 +1155,9 @@ def normalize_category(text):
 
 def normalize_gender(tags, product_type, title):
     text = f"{' '.join(tags)} {product_type} {title}".lower()
-    # v14.47 fix: "kid","child","baby","infant" missed junior/boys/girls-
-    # labeled kids lines entirely. Confirmed live on mobaco: 127 "Junior
-    # Boys" t-shirts were falling through to unisex (7 even matched
-    # "women" by accident), dragging that category's pricing/positioning
-    # data down with genuine kids items. Word-boundary regex avoids
-    # "boy"/"girl" matching inside unrelated words; "boyfriend" is
-    # explicitly excluded because "boyfriend fit" is a real women's cut
-    # name, not a kids signal, and would otherwise be misrouted.
-    text_no_boyfriend = re.sub(r"\bboyfriend\b", "", text)
-    if re.search(r"\b(kid|kids|child|children|baby|infant|junior|toddler|"
-                 r"boys?|girls?)\b", text_no_boyfriend) or "أطفال" in text:
-        return "kids"
     if any(w in text for w in ["women", "woman", "female", "ladies", "girl", "نسائي"]): return "women"
     if any(w in text for w in ["men", "man", "male", "gents", "رجالي"]): return "men"
+    if any(w in text for w in ["kid", "child", "baby", "infant", "أطفال"]): return "kids"
     return "unisex"
 
 def detect_options(variants):
@@ -1168,30 +1170,12 @@ def detect_options(variants):
         if u_opt2 > u_opt1: return "option2", "option1"
         return "option1", ("option2" if opt2_values else None)
     def score_col(values):
-        # v14.47 fix: size_flags was missing 2xl/5xl/6xl/7xl and the xxxl
-        # alias. A "big size" product line whose ENTIRE size range is
-        # 2XL-7XL (no S/M/L/XL present at all) scored 0 on its real size
-        # column, fell through to the no-signal branch below, and that
-        # branch picks whichever column has MORE distinct values — which
-        # is usually color, not size. Confirmed live on tomato: a shirt
-        # with sizes {2XL,3XL,4XL,5XL,6XL,7XL} had color and size swapped
-        # in the DB because of exactly this gap.
         score = 0
-        size_flags = {"xxs","xs","s","m","l","xl","xxl","2xl","3xl","xxxl","4xl",
-                       "5xl","6xl","7xl","os","one size","free","free size",
-                       "small","medium","large"}
-        # A value shaped like a physical dimension ("18 INCH", "70*140CM")
-        # is a real size axis for non-apparel goods (bags, towels) even
-        # though it doesn't look like a garment size. Without this, the
-        # dimension column scores 0, color (which is usually more numerous)
-        # wins the "size" slot by the distinct-value fallback, and the
-        # dimension gets mislabeled as color. Confirmed live on arafa.
-        dimension_re = re.compile(r"\d+\s*(inch|cm|mm)\b|\d+\s*[*x]\s*\d+", re.I)
+        size_flags = {"xs","s","m","l","xl","xxl","3xl","4xl","os","one size","small","medium","large"}
         for val in set(values):
-            v_low = val.lower().strip()
+            v_low = val.lower()
             if v_low in size_flags: score += 10
-            if v_low.isdigit() and (4 <= int(v_low) <= 60): score += 5
-            if dimension_re.search(v_low): score += 8
+            if v_low.isdigit() and (4 <= int(v_low) <= 56): score += 5
         return score
     scores = {"option1": score_col(opt1_values), "option2": score_col(opt2_values), "option3": score_col(opt3_values)}
     size_key = max(scores, key=scores.get)
