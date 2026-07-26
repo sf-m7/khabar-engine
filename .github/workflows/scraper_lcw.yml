@@ -1,107 +1,62 @@
-name: LCW Scraper
+name: LCW Scraper (bi-daily)
 
-# v14.46: twice daily — a morning block at ~05:23-06:03 UTC and the original
-# evening block at ~17:23-18:03 UTC.
+# LC Waikiki runs TWICE a day, 12h apart. The scraper's checkpoint is scoped by
+# (date, slot), so the two runs keep separate progress and the second (pm) run
+# re-crawls and catches intraday price moves instead of skipping as "already
+# done today". LCW_SLOT tells the scraper which block this run is; without it
+# the code falls back to a UTC-clock guess (am before 12:00, pm after), but we
+# pass it explicitly so a manual re-trigger lands in the intended slot.
 #
-# IMPORTANT: this schedule alone is not enough. scraper.py checkpoints
-# categories BY DATE, so whichever block runs first marks the day complete and
-# the second block exits as a no-op. Slot-aware checkpointing has to land in
-# scraper.py for the second run to do any work at all.
-#
-# v14.41: hourly instead of once daily.
-#
-# Why: a single daily run that hits a bad proxy window loses the whole day,
-# and the next attempt is 24 hours away. With category-level checkpointing in
-# scraper.py, each run skips categories already completed today and only
-# attempts the rest. Most runs will therefore be no-ops that exit in seconds.
-#
-# Cost: GitHub Actions minutes are free on public repos, so the extra runs are
-# free. Proxy bandwidth is only spent on categories that still need fetching,
-# so a completed day costs roughly nothing beyond one cheap DB read.
-#
-# The 06:00-21:00 window covers the day with margin; the previous single run
-# was at 18:00 UTC.
+# Times are UTC. Evening-UTC windows are when the DataImpulse Turkey pool is
+# healthiest, so both slots are placed in the more reliable half of the day:
+#   05:00 UTC  = 07:00 Cairo  (am)
+#   17:00 UTC  = 19:00 Cairo  (pm)
+# Adjust if you find a better window, but keep the two ~12h apart.
 
 on:
   schedule:
-    # v14.43: one real attempt plus four retry slots, 10 minutes apart.
-    #
-    # GitHub cron cannot express "retry 10 minutes after the previous run
-    # finished" — it only schedules by clock time, with no knowledge of the
-    # outcome. The checkpoint table gives the same result: whichever attempt
-    # succeeds first marks the categories complete, and every later attempt
-    # reads that, skips the crawl, skips the size pass, and exits in seconds.
-    # So the retries are effectively free unless they are actually needed.
-    #
-    # The first slot is 37 minutes before the original 18:00 so the whole
-    # sequence lands on or before the time LCW used to be scraped.
-    #
-    # A failed run aborts in about 5 minutes via the circuit breaker, so a
-    # 10-minute gap is comfortable. A SUCCESSFUL run takes roughly 12 minutes
-    # plus the size pass, which can overrun the next slot — the concurrency
-    # group below queues that attempt rather than running it in parallel, and
-    # it then exits immediately as a no-op. No overlap, no double-scraping.
-    # ── Evening block (unchanged) ───────────────────────────────────────
-    - cron: '23,33,43,53 17 * * *'
-    - cron: '3 18 * * *'
-    # ── Morning block, 12 hours earlier ─────────────────────────────────
-    # Same shape as the evening: one real attempt plus four retry slots ten
-    # minutes apart, so a bad proxy window in the morning costs minutes
-    # rather than half a day.
-    - cron: '23,33,43,53 5 * * *'
-    - cron: '3 6 * * *'
-  workflow_dispatch:        # manual trigger, unchanged
-
-concurrency:
-  # Never let two LCW runs overlap — they would fight over the same
-  # checkpoint rows and double-fetch the same categories.
-  group: lcw-scraper
-  cancel-in-progress: false
+    - cron: '0 5 * * *'    # am slot
+    - cron: '0 17 * * *'   # pm slot
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: 'Which slot to run as (am/pm). Leave blank for clock-based.'
+        required: false
+        default: ''
 
 jobs:
-  scrape:
+  scrape-lcw:
     runs-on: ubuntu-latest
-    timeout-minutes: 45     # circuit breaker should abort long before this
-
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: pip
-
+          python-version: '3.12'
       - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine slot
+        id: slot
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # Priority: manual input > schedule cron > empty (clock fallback in code)
+          if [ -n "${{ github.event.inputs.slot }}" ]; then
+            echo "value=${{ github.event.inputs.slot }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 5 * * *" ]; then
+            echo "value=am" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 17 * * *" ]; then
+            echo "value=pm" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run LCW scraper
-        run: python -u scraper.py
         env:
-          SUPABASE_URL:                ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:                ${{ secrets.SUPABASE_KEY }}
-          SUPABASE_DB_URL:             ${{ secrets.SUPABASE_DB_URL }}
-          TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
-          DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
-          DATAIMPULSE_HOST:            ${{ vars.DATAIMPULSE_HOST }}
-          SCRAPE_TARGET:               lcw
-          # Which of the two daily blocks this run belongs to. Consumed by the
-          # checkpoint so the morning and evening runs do not read each
-          # other's completion state. Derived from the clock rather than
-          # hardcoded, because a single workflow serves both blocks.
-          LCW_SLOT:                    ${{ github.event.schedule && (contains(github.event.schedule, ' 5 ') || contains(github.event.schedule, ' 6 ')) && 'am' || 'pm' }}
-          LCW_SIZE_CAP:                ${{ vars.LCW_SIZE_CAP }}
-          LCW_ROTATION_BUDGET:         ${{ vars.LCW_ROTATION_BUDGET }}
-          # ── v14.39-41 knobs. All blank-safe: env_str/env_int treat a blank
-          # repo variable exactly as unset, so leaving them undefined keeps
-          # the documented defaults. Wired here so they can be changed from
-          # the GitHub UI without a code edit or redeploy.
-          LCW_PROXY_COUNTRY:           ${{ vars.LCW_PROXY_COUNTRY }}   # default tr; "eg" to roll back; "tr,sa" for a pool
-          LCW_PAGE_TIMEOUT:            ${{ vars.LCW_PAGE_TIMEOUT }}    # default 12 (seconds)
-          LCW_FORCE_HTTP1:             ${{ vars.LCW_FORCE_HTTP1 }}     # default 1; "0" to restore HTTP/2
-          LCW_CHECKPOINT:              ${{ vars.LCW_CHECKPOINT }}      # default 1; "0" disables resume
-          LCW_PAGE_ATTEMPTS:           ${{ vars.LCW_PAGE_ATTEMPTS }}   # default 3
-          LCW_CIRCUIT_BREAKER:         ${{ vars.LCW_CIRCUIT_BREAKER }} # default 6
-          LCW_DEBUG_FIELDS:            ${{ vars.LCW_DEBUG_FIELDS }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          SCRAPE_TARGET: lcw
+          LCW_SLOT: ${{ steps.slot.outputs.value }}
+        run: python -u scraper.py
