@@ -572,6 +572,96 @@ SUPABASE_DB_URL    = os.environ.get("SUPABASE_DB_URL", "").strip() or None
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# =====================================================================
+# v14.23 — CHANGE-DETECTION (write-skip) for product_variants.
+#
+# WHY: the scraper rewrote all ~483K variant rows every run whether or not
+# anything changed. In Postgres an UPDATE is a delete+insert, so that churned
+# ~2M dead tuples/day, inflating storage toward the 500MB cap between weekly
+# VACUUMs and making last_updated_at meaningless (it said "changed today" for
+# rows untouched in weeks).
+#
+# WHAT: before upserting a variant, compare it against the prev_stock_state we
+# already loaded (free — no extra read). If is_in_stock, color, size and
+# baseline are all unchanged AND the row is not coming back from delisted,
+# there is nothing to write but a new timestamp — so skip it.
+#
+# THE ONE RULE THAT KEEPS THIS SAFE: bias to WRITE on any doubt. A needless
+# write costs a few bytes; a wrongly-skipped write could miss a real change.
+# So: no prev record -> write. delisted_at set but row is live now -> write
+# (clears the known never-cleared-delisted bug). Any field we can't compare
+# with confidence -> write. Only a fully-confident match is skipped.
+#
+# CHANGE_DETECT_LOG_ONLY: when true (default for first deploys), NOTHING is
+# skipped — every row still writes exactly as before — but the counts of
+# "would-skip vs would-write" are logged, so you can verify against live data
+# that skipped rows really are unchanged BEFORE trusting it to skip for real.
+# Flip to false via env CHANGE_DETECT_ACTIVE=1 once the logs look right.
+# =====================================================================
+
+CHANGE_DETECT_LOG_ONLY = os.environ.get("CHANGE_DETECT_ACTIVE", "").strip() not in ("1", "true", "True")
+
+
+def variant_needs_write(row, prev):
+    """
+    True if this variant must be written; False if it's a confident no-op.
+    'row' is a batch_variants entry (has _meta_* fields); 'prev' is the
+    prev_stock_state entry for the same SKU (or None).
+
+    Biased hard toward True — only returns False on a fully-confident match.
+    """
+    if prev is None:
+        return True                                   # never seen -> write
+    if prev.get("delisted_at") is not None:
+        return True                                   # coming back from delisted -> must clear flag
+    # is_in_stock changed?
+    if bool(prev.get("is_in_stock")) != bool(row.get("is_in_stock")):
+        return True
+    # baseline (first_observed_price) changed? compare as float w/ small eps
+    pb, rb = prev.get("first_observed_price"), row.get("first_observed_price")
+    if (pb is None) != (rb is None):
+        return True
+    if pb is not None and rb is not None and abs(float(pb) - float(rb)) > 0.001:
+        return True
+    # color changed? (None vs value, or different string)
+    if (prev.get("color") or None) != (row.get("color") or None):
+        return True
+    # size changed? NOTE: LCW omits size from its payload on purpose, so only
+    # compare when the row actually carries a size key — otherwise treat as
+    # unchanged (the upsert wouldn't touch size anyway).
+    if "size" in row and (prev.get("size") or None) != (row.get("size") or None):
+        return True
+    return False                                      # confident no-op -> skip
+
+
+def apply_change_detection(batch_variants, prev_stock_state, brand_name):
+    """
+    Splits batch_variants into (to_write, skipped_ids_by_sku) and logs counts.
+    In LOG_ONLY mode returns ALL rows to write (skips nothing) but still logs
+    what it WOULD have skipped. Returns (rows_to_upsert, skipped_sku_to_id).
+
+    skipped_sku_to_id lets the caller still attach variant_db_id to skipped
+    rows (from prev_stock_state) so stockout detection is unaffected.
+    """
+    to_write, skipped_sku_to_id = [], {}
+    would_skip = 0
+    for row in batch_variants:
+        prev = prev_stock_state.get(row["external_sku"])
+        if variant_needs_write(row, prev):
+            to_write.append(row)
+        else:
+            would_skip += 1
+            # carry the known DB id forward for downstream stockout attach
+            skipped_sku_to_id[row["external_sku"]] = prev.get("variant_id")
+            if CHANGE_DETECT_LOG_ONLY:
+                to_write.append(row)          # log-only: don't actually skip
+    mode = "LOG-ONLY (nothing skipped)" if CHANGE_DETECT_LOG_ONLY else "ACTIVE"
+    print(f"    change-detect [{mode}] {brand_name}: "
+          f"{len(batch_variants)} seen, would-skip {would_skip}, "
+          f"writing {len(to_write)}")
+    return to_write, skipped_sku_to_id
+
+
 # Minimum true discount (vs first_observed_price) before a user is alerted.
 # Keeps alerts genuine and naturally caps alert volume.
 MIN_ALERT_DISCOUNT_PCT = 10
@@ -2357,8 +2447,13 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
 
 
         if batch_variants:
+            # v14.23: decide which variants actually changed. In log-only mode
+            # rows_to_write == batch_variants (nothing skipped) but counts are
+            # logged; when ACTIVE, unchanged rows are dropped from the upsert.
+            rows_to_write, skipped_sku_to_id = apply_change_detection(
+                batch_variants, prev_stock_state, brand_name)
             db_payload = [{**{k: v for k, v in row.items() if not k.startswith("_meta_")},
-                           "delisted_at": None} for row in batch_variants]
+                           "delisted_at": None} for row in rows_to_write]
             variant_upsert_rows = []
             for i in range(0, len(db_payload), 100):
                 res = safe_db_execute(
@@ -2366,6 +2461,9 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                 )
                 if res and res.data: variant_upsert_rows.extend(res.data)
             sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+            # skipped rows never hit the upsert, so their DB id comes from the
+            # preload instead — stockout detection & snapshots stay whole.
+            sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
             for vr in batch_variants:
                 vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
                 product_variant_tracking[vr["product_id"]].append(vr)
@@ -3334,8 +3432,13 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 })
 
             if batch_variants:
+                # v14.23: change-detection (see helper). LCW rows carry no
+                # "size" key so variant_needs_write skips the size comparison
+                # for them automatically.
+                rows_to_write, skipped_sku_to_id = apply_change_detection(
+                    batch_variants, prev_stock_state, brand_name)
                 db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
-                           "delisted_at": None} for r in batch_variants]
+                           "delisted_at": None} for r in rows_to_write]
                 variant_upsert_rows = []
                 for i in range(0, len(db_payload), 100):
                     res_v = safe_db_execute(
@@ -3343,6 +3446,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     )
                     if res_v and res_v.data: variant_upsert_rows.extend(res_v.data)
                 sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+                sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
                 for vr in batch_variants:
                     vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
                     product_variant_tracking[vr["product_id"]].append(vr)
@@ -3963,8 +4067,15 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 })
 
             if batch_variants:
+                # v14.23: change-detection. Note the size-population block below
+                # keys off prev.get("size"), and any row skipped here by
+                # definition has an UNCHANGED size (already in prev), so it would
+                # never have been a size-fetch candidate anyway — the two are
+                # consistent.
+                rows_to_write, skipped_sku_to_id = apply_change_detection(
+                    batch_variants, prev_stock_state, brand_name)
                 db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
-                           "delisted_at": None} for r in batch_variants]
+                           "delisted_at": None} for r in rows_to_write]
                 variant_upsert_rows = []
                 for i in range(0, len(db_payload), 100):
                     res_v = safe_db_execute(
@@ -3976,6 +4087,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                         variant_upsert_rows.extend(res_v.data)
 
                 sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+                sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
                 for vr in batch_variants:
                     vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
                     product_variant_tracking[vr["product_id"]].append(vr)
@@ -4692,8 +4804,11 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 continue
 
         if batch_variants:
+            # v14.23: change-detection (see helper).
+            rows_to_write, skipped_sku_to_id = apply_change_detection(
+                batch_variants, prev_stock_state, brand_name)
             db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
-                           "delisted_at": None} for r in batch_variants]
+                           "delisted_at": None} for r in rows_to_write]
             variant_upsert_rows = []
             for i in range(0, len(db_payload), 100):
                 res_v = safe_db_execute(
@@ -4702,6 +4817,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 if res_v and res_v.data:
                     variant_upsert_rows.extend(res_v.data)
             sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+            sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
             for vr in batch_variants:
                 vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
                 product_variant_tracking[vr["product_id"]].append(vr)
@@ -5056,7 +5172,10 @@ def load_prev_state_direct(brand_name):
                    pv.external_sku,
                    pv.is_in_stock,
                    pv.size,
-                   pv.first_observed_price
+                   pv.first_observed_price,
+                   pv.id,
+                   pv.color,
+                   pv.delisted_at
             FROM product_variants pv
             JOIN products p ON p.id = pv.product_id
             WHERE p.brand = %s
@@ -5065,7 +5184,7 @@ def load_prev_state_direct(brand_name):
         )
 
         prev_stock_state, fop_done_ids = {}, set()
-        for product_id, external_sku, is_in_stock, size, fop in cur:
+        for product_id, external_sku, is_in_stock, size, fop, variant_id, color, delisted_at in cur:
             prev_stock_state[external_sku] = {
                 "product_id":           product_id,
                 "external_sku":         external_sku,
@@ -5075,6 +5194,16 @@ def load_prev_state_direct(brand_name):
                 # float/str. Every consumer wraps this in float(), but cast here
                 # anyway so the in-memory types match the old path exactly.
                 "first_observed_price": float(fop) if fop is not None else None,
+                # v14.23: these three added for change-detection (write-skip).
+                # variant_id lets a SKIPPED row still resolve its DB id for
+                # stockout detection without the upsert round-trip. color and
+                # delisted_at are compared to decide whether a write is needed —
+                # a variant coming back from delisted (delisted_at was set, now
+                # should be NULL) MUST always be written to clear the flag, which
+                # is the known delisted_at-never-cleared bug.
+                "variant_id":           variant_id,
+                "color":                color,
+                "delisted_at":          delisted_at,
             }
             if product_id:
                 fop_done_ids.add(product_id)
