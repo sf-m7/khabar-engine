@@ -58,4 +58,5 @@ jobs:
           SCRAPE_TARGET:              shopify
           DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          CHANGE_DETECT_ACTIVE: "1"
         run: python -u scraper.py
