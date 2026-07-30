@@ -1559,6 +1559,254 @@ ORDER BY a.last_depth_pct DESC
             HAVING count(*) >= 10
         """,
     },
+
+    # -----------------------------------------------------------------------------
+    # #1 — MARKET VELOCITY INDEX. The single market-wide sell-through pulse: how
+    # fast the whole market is clearing stock, week over week. Witnessed stockouts
+    # vs restocks across all real-stock brands, per ISO week, with the week-on-week
+    # delta. This is the one number a brand's own POS can never produce — the
+    # market slowed/accelerated this week — and the intended pitch opener.
+    # NOTE: the current (newest) week is partial; read its delta with that in mind.
+    # -----------------------------------------------------------------------------
+    {
+        "id": "l2_market_velocity",
+        "name": "Market Velocity Index",
+        "level": "L2",
+        "table": "signal_l2_market_velocity",
+        "unique_on": ["week_start", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 14,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH weekly AS (
+                SELECT
+                    CAST(date_trunc('week', event_date) AS DATE)          AS week_start,
+                    count(*) FILTER (WHERE event_type = 'stockout')       AS stockouts,
+                    count(*) FILTER (WHERE event_type = 'restock')        AS restocks,
+                    count(DISTINCT variant_id)
+                        FILTER (WHERE event_type = 'stockout')            AS variants_stocked_out
+                FROM stock_events
+                WHERE brand NOT IN ('lc_waikiki', 'defacto', 'mobaco')
+                GROUP BY 1
+            )
+            SELECT
+                week_start,
+                stockouts,
+                restocks,
+                variants_stocked_out,
+                -- >1 = market clearing faster than it replenishes (tightening);
+                -- <1 = restocking outpaces sell-through (softening demand).
+                ROUND(stockouts::numeric / NULLIF(restocks, 0), 2)        AS stockout_restock_ratio,
+                stockouts - LAG(stockouts) OVER (ORDER BY week_start)     AS wow_stockout_delta,
+                ROUND(100.0 * (stockouts - LAG(stockouts) OVER (ORDER BY week_start))
+                            / NULLIF(LAG(stockouts) OVER (ORDER BY week_start), 0), 1)
+                                                                          AS wow_pct,
+                CASE
+                    WHEN LAG(stockouts) OVER (ORDER BY week_start) IS NULL
+                        THEN 'baseline week'
+                    WHEN stockouts >= 1.15 * LAG(stockouts) OVER (ORDER BY week_start)
+                        THEN 'accelerating — market clearing faster than last week'
+                    WHEN stockouts <= 0.85 * LAG(stockouts) OVER (ORDER BY week_start)
+                        THEN 'slowing — market clearing slower than last week'
+                    ELSE 'steady'
+                END                                                       AS velocity_read,
+                CURRENT_DATE                                              AS snapshot_date
+            FROM weekly
+        """,
+    },
+
+
+    # -----------------------------------------------------------------------------
+    # #2 — REPLENISHMENT BENCHMARK. How fast each brand puts a sold-out variant
+    # back in stock, ranked against the market median. A clean stockout immediately
+    # followed by a restock on the SAME variant is one replenishment cycle; the
+    # per-brand median cycle length is its supply-chain responsiveness. Slower than
+    # market = a supply chain that can't keep pace with its own demand.
+    # CENSORING: only completed cycles count. At ~9 weeks of history a variant that
+    # stocked out very recently may not have restocked yet, so this reads slightly
+    # optimistic at the tail — directionally sound, not a precise SLA.
+    # -----------------------------------------------------------------------------
+    {
+        "id": "l2_replenishment_benchmark",
+        "name": "Replenishment Benchmark",
+        "level": "L2",
+        "table": "signal_l2_replenishment_benchmark",
+        "unique_on": ["brand", "snapshot_date"],
+        "window_days": 90,
+        "min_days": 14,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH ev AS (
+                SELECT
+                    variant_id,
+                    brand,
+                    event_type,
+                    recorded_at,
+                    event_date,
+                    LEAD(event_type)  OVER (PARTITION BY variant_id ORDER BY recorded_at) AS next_type,
+                    LEAD(event_date)  OVER (PARTITION BY variant_id ORDER BY recorded_at) AS next_date
+                FROM stock_events
+                WHERE brand NOT IN ('lc_waikiki', 'defacto', 'mobaco')
+            ),
+            cycles AS (
+                -- a stockout whose very next event on the same variant is a restock
+                SELECT brand, (next_date - event_date) AS replen_days
+                FROM ev
+                WHERE event_type = 'stockout'
+                  AND next_type  = 'restock'
+                  AND next_date >= event_date
+            ),
+            market AS (
+                SELECT median(replen_days) AS market_median_days,
+                       count(*)            AS market_cycles
+                FROM cycles
+            ),
+            per_brand AS (
+                SELECT brand,
+                       count(*)               AS cycles,
+                       median(replen_days)    AS brand_median_days
+                FROM cycles
+                GROUP BY brand
+                HAVING count(*) >= 30   -- need a real sample to benchmark a brand
+            )
+            SELECT
+                b.brand,
+                b.cycles,
+                ROUND(b.brand_median_days::numeric, 1)                    AS median_replen_days,
+                ROUND(m.market_median_days::numeric, 1)                   AS market_median_days,
+                ROUND((b.brand_median_days / NULLIF(m.market_median_days, 0))::numeric, 2)
+                                                                          AS vs_market_ratio,
+                CASE
+                    WHEN b.brand_median_days <= 0.7 * m.market_median_days
+                        THEN 'fast — replenishes well ahead of the market'
+                    WHEN b.brand_median_days >= 1.3 * m.market_median_days
+                        THEN 'slow — replenishes well behind the market'
+                    ELSE 'at market pace'
+                END                                                       AS replenishment_read,
+                CURRENT_DATE                                              AS snapshot_date
+            FROM per_brand b
+            CROSS JOIN market m
+        """,
+    },
+
+
+    # -----------------------------------------------------------------------------
+    # #3 — CATEGORY SHARE-OF-LAUNCH. Of every genuinely new SKU launched into a
+    # category market-wide, what share is each brand putting out. The competitive
+    # read on assortment: who is pouring product into dresses this month and who
+    # has gone quiet — invisible from any single brand's own catalogue.
+    # FIRST-DAY GUARD: reuses l1_12's onboarding_day rule — a product first seen on
+    # the brand's very first scrape day is the initial catalogue dump, NOT a launch,
+    # so it is excluded. Without this, a newly-onboarded brand's entire catalogue
+    # reads as launches and swamps the share math (tie_house, rojada, eagle, etc.).
+    # -----------------------------------------------------------------------------
+    {
+        "id": "l2_share_of_launch",
+        "name": "Category Share-of-Launch",
+        "level": "L2",
+        "table": "signal_l2_share_of_launch",
+        "unique_on": ["category_normalized", "brand", "snapshot_date"],
+        "window_days": 30,
+        "min_days": 7,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH onboarding_day AS (
+                SELECT brand, min(CAST(first_seen_at AS DATE)) AS brand_onboarded_on
+                FROM products_dim
+                GROUP BY brand
+            ),
+            launches AS (
+                SELECT pd.brand, pd.category_normalized
+                FROM products_dim pd
+                JOIN onboarding_day ob ON ob.brand = pd.brand
+                WHERE CAST(pd.first_seen_at AS DATE) > ob.brand_onboarded_on      -- skip day-1 dump
+                  AND CAST(pd.first_seen_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+                  AND pd.category_normalized <> 'uncategorized'
+            ),
+            cat_total AS (
+                SELECT category_normalized, count(*) AS category_launches
+                FROM launches GROUP BY category_normalized
+            ),
+            brand_cat AS (
+                SELECT category_normalized, brand, count(*) AS brand_launches
+                FROM launches GROUP BY category_normalized, brand
+            )
+            SELECT
+                bc.category_normalized,
+                bc.brand,
+                bc.brand_launches,
+                ct.category_launches,
+                ROUND(100.0 * bc.brand_launches / ct.category_launches, 1)  AS share_pct,
+                CASE
+                    WHEN 100.0 * bc.brand_launches / ct.category_launches >= 40
+                        THEN 'dominating the category launch flow'
+                    WHEN 100.0 * bc.brand_launches / ct.category_launches >= 20
+                        THEN 'major contributor'
+                    ELSE 'minor contributor'
+                END                                                        AS launch_read,
+                CURRENT_DATE                                               AS snapshot_date
+            FROM brand_cat bc
+            JOIN cat_total ct ON ct.category_normalized = bc.category_normalized
+            WHERE ct.category_launches >= 20   -- category needs real launch volume to talk share
+        """,
+    },
+
+
+    # -----------------------------------------------------------------------------
+    # #4 — MARKET SIZE-DEMAND CURVE. Within one size system, which sizes are
+    # actually selling through across the whole market. Aggregate stockouts by
+    # normalized size family, per system, so the shape is real demand — "the market
+    # is short on XL, oversupplied on S." A factory-facing product: it answers the
+    # size-curve question no single brand can see beyond its own shelves.
+    # COMPUTED PER SIZE SYSTEM, never across (letter S–XL and eu_numeric 38–46 are
+    # different rulers). kids_age (3 brands) and one_size are excluded as too thin
+    # / not a demand axis. Requires the variants_raw patch at the bottom of file.
+    # -----------------------------------------------------------------------------
+    {
+        "id": "l2_size_demand_curve",
+        "name": "Market Size-Demand Curve",
+        "level": "L2",
+        "table": "signal_l2_size_demand_curve",
+        "unique_on": ["size_system", "size_family", "snapshot_date"],
+        "window_days": 60,
+        "min_days": 7,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH sized_stockouts AS (
+                SELECT vr.size_system, vr.size_family, se.brand
+                FROM stock_events se
+                JOIN variants_raw vr ON vr.variant_id = se.variant_id
+                WHERE se.event_type = 'stockout'
+                  AND se.brand NOT IN ('lc_waikiki', 'defacto', 'mobaco')
+                  AND vr.size_status = 'classified'
+                  AND vr.size_system IN ('letter', 'waist_numeric', 'eu_numeric')
+            ),
+            system_total AS (
+                SELECT size_system, count(*) AS system_stockouts
+                FROM sized_stockouts GROUP BY size_system
+            ),
+            fam AS (
+                SELECT size_system, size_family,
+                       count(*)              AS stockouts,
+                       count(DISTINCT brand) AS brands
+                FROM sized_stockouts GROUP BY size_system, size_family
+            )
+            SELECT
+                f.size_system,
+                f.size_family,
+                f.stockouts,
+                f.brands,
+                ROUND(100.0 * f.stockouts / st.system_stockouts, 1)        AS demand_share_pct,
+                CURRENT_DATE                                               AS snapshot_date
+            FROM fam f
+            JOIN system_total st ON st.size_system = f.size_system
+            WHERE f.brands >= 3 AND f.stockouts >= 20   -- cross-brand + real volume
+        """,
+    },
 ]
 
 
