@@ -55,6 +55,12 @@ import psycopg2.extras
 # ------------------------------------------------------------------ thresholds
 STALE_WARN = 2      # days since last data before we warn
 STALE_CRIT = 4      # days since last data before we fail the build
+
+# Signals whose newest date lags by design and must NOT be judged on the normal
+# freshness rule. product_delisted dates each delist by the product's last-seen
+# date; with a 14-day stale window + weekly delist cadence, its freshest event
+# is always ~14-21 days old. Given a wider window so real breakage still trips.
+LAGGED_STALE = {"signal_l1_13_product_delisted": 25}
 NULL_WARN  = 0.05   # >5%  null in a meaningful output column -> warn
 NULL_CRIT  = 0.25   # >25% null -> critical
 TODAY      = date.today()
@@ -213,10 +219,12 @@ def audit_table(cur, table, active_brands, runs, runs_today, run_ids):
         distinct_dates = q1(cur, f'SELECT count(distinct {date_col}::date) FROM "{table}"')
         if max_date:
             stale_days = (TODAY - max_date).days
-            if stale_days >= STALE_CRIT:
+            crit_at = LAGGED_STALE.get(table, STALE_CRIT)
+            warn_at = max(STALE_WARN, crit_at - 2)
+            if stale_days >= crit_at:
                 rec["flags"].append(("CRITICAL", f"stale {stale_days}d (max {max_date})"))
                 fresh_score = 0.0
-            elif stale_days >= STALE_WARN:
+            elif stale_days >= warn_at:
                 rec["flags"].append(("WARN", f"stale {stale_days}d (max {max_date})"))
                 fresh_score = 0.5
             else:
