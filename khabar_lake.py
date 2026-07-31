@@ -77,6 +77,10 @@ R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
 SUPABASE_DB_URL      = os.environ["SUPABASE_DB_URL"]
 
 LAKE_PREFIX = "price_snapshots"
+EVENT_WINDOW_DAYS = 90   # how much event history to stitch (hot + R2 cold).
+                         # Caps the local event tables so they cannot grow
+                         # unbounded as the archive deepens; must stay >= the
+                         # largest window_days of any event-based signal (90).
 
 # ── DATA QUARANTINE ──────────────────────────────────────────────────────────
 # LC Waikiki price data before the fix is not trustworthy and is excluded from
@@ -184,6 +188,7 @@ _BASELINES_READY  = False
 _PRODUCTS_READY   = False
 _EVENTS_READY     = False
 _GLOB_CACHE       = None
+_EVENT_GLOB_CACHE = {}
 
 
 def _lake_files(con):
@@ -335,6 +340,32 @@ def _day_files(con, start_day, end_day):
             d = date.fromisoformat(stem)
         except ValueError:
             continue  # legacy batch file or stray object — not part of the lake
+        if start_day <= d <= end_day:
+            wanted.append(path)
+    return sorted(wanted)
+
+
+def _event_files(con, prefix, start_day, end_day):
+    """
+    R2 day-files for an archived EVENT table (stockout_events / price_events),
+    same layout housekeeping.py writes: {prefix}/YYYY-MM-DD.parquet. Listed
+    once per prefix per process. A missing day is absent, not an error —
+    identical contract to _day_files() for price_snapshots. Returns [] when the
+    archive for this prefix is still empty (nothing has aged out yet), in which
+    case the caller degrades cleanly to hot-only.
+    """
+    global _EVENT_GLOB_CACHE
+    if prefix not in _EVENT_GLOB_CACHE:
+        _EVENT_GLOB_CACHE[prefix] = con.execute(f"""
+            SELECT file FROM glob('s3://{R2_BUCKET_NAME}/{prefix}/*.parquet')
+        """).fetchall()
+    wanted = []
+    for (path,) in _EVENT_GLOB_CACHE[prefix]:
+        stem = path.split("/")[-1].replace(".parquet", "")
+        try:
+            d = date.fromisoformat(stem)
+        except ValueError:
+            continue  # legacy or stray object — not a day-partition
         if start_day <= d <= end_day:
             wanted.append(path)
     return sorted(wanted)
@@ -651,46 +682,140 @@ def materialise_events(con, force=False):
                                  # regardless of call order — no extra Postgres read if
                                  # already materialised, materialise_products() no-ops.
 
-    con.execute("DROP TABLE IF EXISTS stockouts_raw")
-    con.execute("""
-        CREATE TABLE stockouts_raw AS
-        SELECT
-            id                        AS event_id,
-            variant_id                AS variant_id,
-            product_id                AS product_id,
-            brand                     AS brand,
-            size                      AS size,
-            color                     AS color,
-            event_type                AS event_type,
-            CAST(price_at_event AS DOUBLE)          AS price_at_event,
-            CAST(discount_pct_at_event AS DOUBLE)   AS discount_pct_at_event,
-            was_on_discount           AS was_on_discount,
-            CAST(recorded_at AS TIMESTAMP) AS recorded_at,
-            witnessed                 AS witnessed,
-            seed_reason               AS seed_reason
-        FROM pg.public.stockout_events
-        WHERE witnessed = TRUE OR witnessed IS NULL
-    """)
+    # =========================================================================
+    # HOT + COLD STITCH (added 2026-07-31). Both event tables age out of
+    # Supabase into R2 on a rolling window (housekeeping.py: stockout_events
+    # >21d, price_events >30d), exactly like price_snapshots. Reading only the
+    # hot table silently capped every event-based signal at that window — a
+    # 90-day window signal was really seeing 21-30 days. These now stitch the
+    # R2 day-file archive back in, deduped on event_id (hot wins on overlap),
+    # the same overlap rule snapshots() uses for price_snapshots.
+    #
+    # STRICT SUPERSET: while a table's R2 prefix is still empty (nothing has
+    # aged out yet), the cold branch is skipped and the ORIGINAL hot-only query
+    # runs unchanged — so deploying this is a no-op until the archive fills,
+    # then it deepens automatically. Bounded to EVENT_WINDOW_DAYS so the local
+    # tables cannot grow without limit as the archive deepens.
+    # =========================================================================
+    _ev_end   = date.today()
+    _ev_start = _ev_end - timedelta(days=EVENT_WINDOW_DAYS - 1)
 
-    con.execute("DROP TABLE IF EXISTS price_events_raw")
-    con.execute("""
-        CREATE TABLE price_events_raw AS
+    # ---- stockout_events ----------------------------------------------------
+    so_hot = f"""
         SELECT
-            id                        AS event_id,
-            product_id                AS product_id,
-            brand                     AS brand,
-            CAST(price_before AS DOUBLE)       AS price_before,
-            CAST(price_after AS DOUBLE)        AS price_after,
-            CAST(compare_at_price AS DOUBLE)   AS compare_at_price,
-            CAST(discount_pct AS DOUBLE)       AS discount_pct,
-            direction                 AS direction,
-            CAST(sizes_in_stock AS VARCHAR)    AS sizes_in_stock,
-            CAST(recorded_at AS TIMESTAMP)     AS recorded_at,
-            is_statistical_deal       AS is_statistical_deal,
-            is_flash_sale             AS is_flash_sale
+            id AS event_id, variant_id, product_id, brand, size, color, event_type,
+            CAST(price_at_event AS DOUBLE)        AS price_at_event,
+            CAST(discount_pct_at_event AS DOUBLE) AS discount_pct_at_event,
+            was_on_discount,
+            CAST(recorded_at AS TIMESTAMP)        AS recorded_at,
+            witnessed, seed_reason
+        FROM pg.public.stockout_events
+        WHERE CAST(recorded_at AS DATE) >= DATE '{_ev_start}'
+    """
+    so_files = _event_files(con, "stockout_events", _ev_start, _ev_end)
+    con.execute("DROP TABLE IF EXISTS stockouts_raw")
+    if not so_files:
+        con.execute(f"""
+            CREATE TABLE stockouts_raw AS
+            SELECT * FROM ({so_hot})
+            WHERE witnessed = TRUE OR witnessed IS NULL
+        """)
+    else:
+        _so_list = ", ".join(f"'{f}'" for f in so_files)
+        con.execute(f"""
+            CREATE TABLE stockouts_raw AS
+            WITH hot AS ({so_hot}),
+                 cold AS (
+                     -- union_by_name tolerates any file written before the
+                     -- housekeeping witnessed/seed_reason fix (missing → NULL);
+                     -- the archive also carries name/category/gender, ignored here.
+                     SELECT
+                         event_id, variant_id, product_id, brand, size, color, event_type,
+                         CAST(price_at_event AS DOUBLE)        AS price_at_event,
+                         CAST(discount_pct_at_event AS DOUBLE) AS discount_pct_at_event,
+                         was_on_discount,
+                         CAST(recorded_at AS TIMESTAMP)        AS recorded_at,
+                         witnessed, seed_reason
+                     FROM read_parquet([{_so_list}], union_by_name=true)
+                 ),
+                 unioned AS (
+                     SELECT *, 1 AS tier_rank FROM hot
+                     UNION ALL BY NAME
+                     SELECT *, 2 AS tier_rank FROM cold
+                 ),
+                 deduped AS (
+                     SELECT *, ROW_NUMBER() OVER (
+                                 PARTITION BY event_id ORDER BY tier_rank
+                             ) AS rn
+                     FROM unioned
+                 )
+            SELECT event_id, variant_id, product_id, brand, size, color, event_type,
+                   price_at_event, discount_pct_at_event, was_on_discount,
+                   recorded_at, witnessed, seed_reason
+            FROM deduped
+            WHERE rn = 1
+              AND (witnessed = TRUE OR witnessed IS NULL)
+        """)
+
+    # ---- price_events -------------------------------------------------------
+    pe_hot = f"""
+        SELECT
+            id AS event_id, product_id, brand,
+            CAST(price_before AS DOUBLE)     AS price_before,
+            CAST(price_after AS DOUBLE)      AS price_after,
+            CAST(compare_at_price AS DOUBLE) AS compare_at_price,
+            CAST(discount_pct AS DOUBLE)     AS discount_pct,
+            direction,
+            CAST(sizes_in_stock AS VARCHAR)  AS sizes_in_stock,
+            CAST(recorded_at AS TIMESTAMP)   AS recorded_at,
+            is_statistical_deal, is_flash_sale
         FROM pg.public.price_events
-        WHERE """ + _event_quarantine_sql() + """
-    """)
+        WHERE CAST(recorded_at AS DATE) >= DATE '{_ev_start}'
+    """
+    pe_files = _event_files(con, "price_events", _ev_start, _ev_end)
+    con.execute("DROP TABLE IF EXISTS price_events_raw")
+    if not pe_files:
+        con.execute(f"""
+            CREATE TABLE price_events_raw AS
+            SELECT * FROM ({pe_hot})
+            WHERE {_event_quarantine_sql()}
+        """)
+    else:
+        _pe_list = ", ".join(f"'{f}'" for f in pe_files)
+        con.execute(f"""
+            CREATE TABLE price_events_raw AS
+            WITH hot AS ({pe_hot}),
+                 cold AS (
+                     SELECT
+                         event_id, product_id, brand,
+                         CAST(price_before AS DOUBLE)     AS price_before,
+                         CAST(price_after AS DOUBLE)      AS price_after,
+                         CAST(compare_at_price AS DOUBLE) AS compare_at_price,
+                         CAST(discount_pct AS DOUBLE)     AS discount_pct,
+                         direction,
+                         CAST(sizes_in_stock AS VARCHAR)  AS sizes_in_stock,
+                         CAST(recorded_at AS TIMESTAMP)   AS recorded_at,
+                         is_statistical_deal, is_flash_sale
+                     FROM read_parquet([{_pe_list}], union_by_name=true)
+                 ),
+                 unioned AS (
+                     SELECT *, 1 AS tier_rank FROM hot
+                     UNION ALL BY NAME
+                     SELECT *, 2 AS tier_rank FROM cold
+                 ),
+                 deduped AS (
+                     SELECT *, ROW_NUMBER() OVER (
+                                 PARTITION BY event_id ORDER BY tier_rank
+                             ) AS rn
+                     FROM unioned
+                 )
+            SELECT event_id, product_id, brand, price_before, price_after,
+                   compare_at_price, discount_pct, direction, sizes_in_stock,
+                   recorded_at, is_statistical_deal, is_flash_sale
+            FROM deduped
+            WHERE rn = 1
+              AND {_event_quarantine_sql()}
+        """)
     _EVENTS_READY = True
     n1 = con.execute("SELECT count(*) FROM stockouts_raw").fetchone()[0]
     n2 = con.execute("SELECT count(*) FROM price_events_raw").fetchone()[0]
