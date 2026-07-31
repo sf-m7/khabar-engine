@@ -655,6 +655,22 @@ def materialise_products(con, force=False):
     return con.execute("SELECT count(*) FROM products_dim").fetchone()[0]
 
 
+def _parquet_columns(con, file_list_sql):
+    """
+    Column names present across a set of R2 parquet files (schema union).
+    Lets the cold-tier SELECT degrade gracefully when older archive files
+    predate a column — e.g. stockout_events files written before the
+    2026-07-31 housekeeping witnessed/seed_reason fix. union_by_name only
+    surfaces columns that exist in at least one file, so a column absent from
+    EVERY file cannot be referenced at all; we emit a typed default for it
+    instead of letting DuckDB raise a binder error mid-run.
+    """
+    rows = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true)"
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def materialise_events(con, force=False):
     """
     stockout_events and price_events, pulled once each.
@@ -722,22 +738,37 @@ def materialise_events(con, force=False):
         """)
     else:
         _so_list = ", ".join(f"'{f}'" for f in so_files)
+        _cols = _parquet_columns(con, _so_list)
+        # Columns added by the 2026-07-31 housekeeping fix are absent from any
+        # file archived before it. Absent (or NULL) witnessed → treat as NOT
+        # witnessed (FALSE), so unverifiable pre-fix history is excluded rather
+        # than silently polluting stockouts_raw. Stock history therefore only
+        # genuinely deepens as post-fix day-files accumulate.
+        _wit  = ("COALESCE(CAST(witnessed AS BOOLEAN), FALSE)"
+                 if "witnessed" in _cols else "FALSE")
+        _seed = ("CAST(seed_reason AS VARCHAR)"
+                 if "seed_reason" in _cols else "CAST(NULL AS VARCHAR)")
+        so_cold = f"""
+            SELECT
+                event_id,
+                CAST(variant_id AS BIGINT)            AS variant_id,
+                CAST(product_id AS BIGINT)            AS product_id,
+                CAST(brand AS VARCHAR)                AS brand,
+                CAST(size AS VARCHAR)                 AS size,
+                CAST(color AS VARCHAR)                AS color,
+                CAST(event_type AS VARCHAR)           AS event_type,
+                CAST(price_at_event AS DOUBLE)        AS price_at_event,
+                CAST(discount_pct_at_event AS DOUBLE) AS discount_pct_at_event,
+                CAST(was_on_discount AS BOOLEAN)      AS was_on_discount,
+                CAST(recorded_at AS TIMESTAMP)        AS recorded_at,
+                {_wit}                                AS witnessed,
+                {_seed}                               AS seed_reason
+            FROM read_parquet([{_so_list}], union_by_name=true)
+        """
         con.execute(f"""
             CREATE TABLE stockouts_raw AS
             WITH hot AS ({so_hot}),
-                 cold AS (
-                     -- union_by_name tolerates any file written before the
-                     -- housekeeping witnessed/seed_reason fix (missing → NULL);
-                     -- the archive also carries name/category/gender, ignored here.
-                     SELECT
-                         event_id, variant_id, product_id, brand, size, color, event_type,
-                         CAST(price_at_event AS DOUBLE)        AS price_at_event,
-                         CAST(discount_pct_at_event AS DOUBLE) AS discount_pct_at_event,
-                         was_on_discount,
-                         CAST(recorded_at AS TIMESTAMP)        AS recorded_at,
-                         witnessed, seed_reason
-                     FROM read_parquet([{_so_list}], union_by_name=true)
-                 ),
+                 cold AS ({so_cold}),
                  unioned AS (
                      SELECT *, 1 AS tier_rank FROM hot
                      UNION ALL BY NAME
@@ -782,22 +813,31 @@ def materialise_events(con, force=False):
         """)
     else:
         _pe_list = ", ".join(f"'{f}'" for f in pe_files)
+        _cols = _parquet_columns(con, _pe_list)
+        _stat  = ("CAST(is_statistical_deal AS BOOLEAN)"
+                  if "is_statistical_deal" in _cols else "CAST(NULL AS BOOLEAN)")
+        _flash = ("CAST(is_flash_sale AS BOOLEAN)"
+                  if "is_flash_sale" in _cols else "CAST(NULL AS BOOLEAN)")
+        pe_cold = f"""
+            SELECT
+                event_id,
+                CAST(product_id AS BIGINT)       AS product_id,
+                CAST(brand AS VARCHAR)           AS brand,
+                CAST(price_before AS DOUBLE)     AS price_before,
+                CAST(price_after AS DOUBLE)      AS price_after,
+                CAST(compare_at_price AS DOUBLE) AS compare_at_price,
+                CAST(discount_pct AS DOUBLE)     AS discount_pct,
+                CAST(direction AS VARCHAR)       AS direction,
+                CAST(sizes_in_stock AS VARCHAR)  AS sizes_in_stock,
+                CAST(recorded_at AS TIMESTAMP)   AS recorded_at,
+                {_stat}                          AS is_statistical_deal,
+                {_flash}                         AS is_flash_sale
+            FROM read_parquet([{_pe_list}], union_by_name=true)
+        """
         con.execute(f"""
             CREATE TABLE price_events_raw AS
             WITH hot AS ({pe_hot}),
-                 cold AS (
-                     SELECT
-                         event_id, product_id, brand,
-                         CAST(price_before AS DOUBLE)     AS price_before,
-                         CAST(price_after AS DOUBLE)      AS price_after,
-                         CAST(compare_at_price AS DOUBLE) AS compare_at_price,
-                         CAST(discount_pct AS DOUBLE)     AS discount_pct,
-                         direction,
-                         CAST(sizes_in_stock AS VARCHAR)  AS sizes_in_stock,
-                         CAST(recorded_at AS TIMESTAMP)   AS recorded_at,
-                         is_statistical_deal, is_flash_sale
-                     FROM read_parquet([{_pe_list}], union_by_name=true)
-                 ),
+                 cold AS ({pe_cold}),
                  unioned AS (
                      SELECT *, 1 AS tier_rank FROM hot
                      UNION ALL BY NAME
