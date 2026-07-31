@@ -70,6 +70,59 @@ def log_run(pg, signal, status, **kw):
     pg.commit()
 
 
+def ensure_table(pg, table, columns, rows):
+    """
+    Create the signal's output table if it does not already exist.
+
+    WHY THIS EXISTS
+    The runner used to assume every signal's Supabase table was created
+    out-of-band by a migration. Add a signal to the registry but forget the
+    migration, and every run died silently on `relation "<table>" does not
+    exist` at the DELETE step — logged as a failure, but easy to miss among 38
+    signals. Four L2 signals (market_velocity, replenishment_benchmark,
+    share_of_launch, size_demand_curve) sat empty for weeks for exactly this
+    reason. Now a signal is genuinely just a registry entry: its table
+    provisions itself on first successful compute.
+
+    Types are inferred from the first NON-NULL value seen per column across the
+    result — so a leading NULL in one row doesn't collapse a numeric column to
+    TEXT. Aggregate signal outputs are simple scalars, which this covers
+    exactly. If a future signal needs a richer type (arrays, jsonb), it can
+    pre-create its table via migration and this becomes a harmless no-op.
+    """
+    import decimal
+    import datetime as _dt
+
+    def pgtype(v):
+        if isinstance(v, bool):
+            return "BOOLEAN"
+        if isinstance(v, int):
+            return "BIGINT"
+        if isinstance(v, (float, decimal.Decimal)):
+            return "NUMERIC"
+        if isinstance(v, _dt.datetime):
+            return "TIMESTAMPTZ"
+        if isinstance(v, _dt.date):
+            return "DATE"
+        return "TEXT"
+
+    # First non-null value per column (scan the batch, not just row 0).
+    resolved = {}
+    for r in rows:
+        for c, v in zip(columns, r):
+            if c not in resolved and v is not None:
+                resolved[c] = pgtype(v)
+        if len(resolved) == len(columns):
+            break
+
+    coldefs = ", ".join(
+        f'"{c}" {resolved.get(c, "TEXT")}' for c in columns
+    )
+    with pg.cursor() as cur:
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {table} ({coldefs})")
+    pg.commit()
+
+
 def replace_rows(pg, table, unique_on, rows, columns):
     """
     Write a signal's output for THIS computed day, replacing that day wholesale.
@@ -207,6 +260,10 @@ def run_signal(con, pg, signal):
                     days_available=days_available,
                     duration_seconds=round(time.time() - started, 2))
             return "ok"
+
+        # Self-provision the table before the first write, so a newly-registered
+        # signal never dies on a missing relation.
+        ensure_table(pg, signal["table"], columns, rows)
 
         written = replace_rows(
             pg, signal["table"], signal["unique_on"], rows, columns
