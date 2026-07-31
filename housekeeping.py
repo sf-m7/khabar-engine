@@ -494,7 +494,7 @@ def main():
             table="stockout_events",
             columns="id, variant_id, product_id, brand, size, color, "
                     "event_type, price_at_event, discount_pct_at_event, "
-                    "was_on_discount, recorded_at",
+                    "was_on_discount, recorded_at, witnessed, seed_reason",  # witnessed/seed_reason preserved so aged-out stock events stay usable by the lake stitch
             filter_col="recorded_at",
             cutoff_value=(now - timedelta(days=STOCKOUT_DAYS)).isoformat(),
             date_field="recorded_at",
