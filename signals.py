@@ -1461,7 +1461,13 @@ ORDER BY a.last_depth_pct DESC
                 FROM price_events_raw
                 WHERE direction = 'down' AND discount_pct > 0
                 GROUP BY brand
+                -- >=50 events AND >=14 days of clean history. The span guard
+                -- excludes brands with too few days to trust the ratio -- e.g.
+                -- LCW, whose price quarantine (<=Jul 26) leaves only ~5 days,
+                -- which would otherwise read a false 100% / "high risk".
                 HAVING count(*) >= 50
+                   AND (max(CAST(recorded_at AS DATE))
+                        - min(CAST(recorded_at AS DATE)) + 1) >= 14
             )
             SELECT
                 brand,
