@@ -60,7 +60,13 @@ STALE_CRIT = 4      # days since last data before we fail the build
 # freshness rule. product_delisted dates each delist by the product's last-seen
 # date; with a 14-day stale window + weekly delist cadence, its freshest event
 # is always ~14-21 days old. Given a wider window so real breakage still trips.
-LAGGED_STALE = {"signal_l1_13_product_delisted": 25}
+LAGGED_STALE = {
+    "signal_l1_13_product_delisted": 25,
+    # anchor_inflation fires only when a brand actually inflates a compare-at
+    # anchor — a handful of times a month. A 5-day gap between events is normal,
+    # not a break; a real stall still shows via run-health. Widen its window.
+    "signal_l1_04_anchor_inflation": 30,
+}
 NULL_WARN  = 0.05   # >5%  null in a meaningful output column -> warn
 NULL_CRIT  = 0.25   # >25% null -> critical
 TODAY      = date.today()
@@ -278,25 +284,55 @@ def audit_table(cur, table, active_brands, runs, runs_today, run_ids):
     # ---- history depth (diminishing returns; 30+ distinct dates = full)
     hist_score = min((distinct_dates or 0) / 30.0, 1.0)
 
-    # ---- null integrity on meaningful output columns
+    # ---- null integrity
+    # Philosophy: an aggregate row is a brand x category (x date). Its supporting
+    # metrics are legitimately null wherever they don't apply — flagging the
+    # single worst-null metric as CRITICAL is whack-a-mole and wrong for this
+    # table shape. A row is only BAD if it is an orphan (null key/date) or truly
+    # EMPTY (every metric null). Individual metric nulls are informational; a
+    # metric that is almost entirely null (>=90%) gets a WARN as "never fills".
     by_design = NULL_BY_DESIGN.get(table, {})
     numeric = numeric_columns_of(cur, table)
-    meaningful = [c for c in numeric
-                  if c not in by_design
-                  and any(h in c for h in MEANINGFUL_COL_HINTS)]
-    worst_null = 0.0
-    worst_col = None
-    for c in meaningful:
-        nulls = q1(cur, f'SELECT count(*) FROM "{table}" WHERE "{c}" IS NULL')
+    metric_cols = [c for c in numeric
+                   if c not in by_design
+                   and any(h in c for h in MEANINGFUL_COL_HINTS)]
+
+    # (1) orphan rows — null identity. Date is always required; brand too unless
+    # the signal is market-wide by design.
+    orphan = 0
+    if date_col:
+        orphan += q1(cur, f'SELECT count(*) FROM "{table}" WHERE {date_col} IS NULL') or 0
+    if brand_col and table not in BRAND_AGNOSTIC:
+        orphan += q1(cur, f'SELECT count(*) FROM "{table}" WHERE {brand_col} IS NULL') or 0
+    if orphan:
+        rec["flags"].append(("CRITICAL", f"{orphan} orphan row(s) with null key/date"))
+
+    # (2) empty rows — every metric null at once (a row carrying no information).
+    empty_rate = 0.0
+    if metric_cols:
+        cond = " AND ".join(f'"{c}" IS NULL' for c in metric_cols)
+        empty = q1(cur, f'SELECT count(*) FROM "{table}" WHERE {cond}') or 0
+        empty_rate = empty / n if n else 0
+        if empty_rate >= 0.05:
+            rec["flags"].append(("CRITICAL",
+                f"{empty_rate:.0%} of rows have every metric null"))
+
+    # (3) per-column: informational; WARN only on a near-dead column.
+    worst_null, worst_col = 0.0, None
+    for c in metric_cols:
+        nulls = q1(cur, f'SELECT count(*) FROM "{table}" WHERE "{c}" IS NULL') or 0
         rate = nulls / n if n else 0
         if rate > worst_null:
             worst_null, worst_col = rate, c
-    if worst_col:
-        if worst_null >= NULL_CRIT:
-            rec["flags"].append(("CRITICAL", f"{worst_col} {worst_null:.0%} null"))
-        elif worst_null >= NULL_WARN:
-            rec["flags"].append(("WARN", f"{worst_col} {worst_null:.0%} null"))
-    null_score = 1.0 - min(worst_null / NULL_CRIT, 1.0)
+    if worst_col and worst_null >= 0.90:
+        rec["flags"].append(("WARN",
+            f"{worst_col} {worst_null:.0%} null — column almost never populates"))
+    rec["worst_null_col"] = worst_col
+    rec["worst_null_rate"] = round(worst_null, 3)
+
+    null_score = 0.0 if orphan else 1.0 - min(empty_rate / 0.25, 1.0)
+    if worst_null >= 0.90:
+        null_score = min(null_score, 0.8)
 
     # Record the by-design columns' real null rates. Not flagged, not scored —
     # but never hidden: printed under "Expected nulls" so a shift is visible.
