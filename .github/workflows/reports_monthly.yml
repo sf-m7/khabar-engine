@@ -44,5 +44,7 @@ jobs:
           git config user.name  "khabar-bot"
           git config user.email "bot@khabar.local"
           git add reports/
-          git diff --cached --quiet || git commit -m "reports: monthly $(date -u +%Y-%m)"
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "reports: monthly $(date -u +%Y-%m)"
+          git pull --rebase origin main      # avoid racing a concurrent push
           git push
