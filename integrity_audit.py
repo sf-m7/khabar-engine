@@ -88,12 +88,15 @@ def connect():
 
 
 def q(cur, sql, args=None):
-    cur.execute(sql, args or ())
+    # Pass params ONLY when present. With an (even empty) args tuple, psycopg2
+    # treats a literal % (e.g. LIKE 'signal_l1_%') as a placeholder and raises
+    # IndexError. No args -> no interpolation -> % stays literal.
+    cur.execute(sql, args) if args else cur.execute(sql)
     return cur.fetchall()
 
 
 def q1(cur, sql, args=None):
-    cur.execute(sql, args or ())
+    cur.execute(sql, args) if args else cur.execute(sql)
     row = cur.fetchone()
     return row[0] if row else None
 
