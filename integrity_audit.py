@@ -71,12 +71,36 @@ MEANINGFUL_COL_HINTS = (
     "read", "pct", "price", "score", "index", "depth", "gap",
     "share", "change", "drop", "trajectory", "verdict",
 )
-# Columns that are legitimately allowed to be null (documented data facts) and
-# must NOT count against a signal's null-integrity score.
-NULL_ALLOWED = {
-    "avg_claimed_depth_pct",   # NULL where the brand publishes no RRP (correct)
-    "manufactured_gap_pct",
-    "compare_at_price",
+# Columns whose NULLs are correct by design, declared per (table, column) so
+# each exemption is an explicit, auditable decision — never a broad pattern that
+# could silently swallow a real regression. An exempted column is not flagged
+# and does not dock the score, BUT its actual null rate is still computed and
+# printed every run under "Expected nulls", so a change is never invisible.
+NULL_BY_DESIGN = {
+    "signal_l1_13_product_delisted": {
+        "final_discount_pct": "delisted at full price -> null; ~100% expected",
+    },
+    "signal_l2_market_velocity": {
+        "wow_pct": "baseline (first) week has no prior week to compare",
+        "wow_stockout_delta": "baseline (first) week has no prior week",
+    },
+    "signal_l2_discount_honesty": {
+        "avg_claimed_depth_pct": "null where the brand publishes no RRP",
+        "manufactured_gap_pct": "null where the brand publishes no RRP",
+    },
+    "product_l2_08_brand_health": {
+        "avg_dead_discount_pct": "only dead-stock rows carry a discount; null elsewhere",
+    },
+    "product_l2_12_liquidation_calendar": {
+        "avg_current_depth_pct": "only currently-discounted rows carry depth",
+    },
+}
+
+# Signals that aggregate market-wide and have no brand dimension by design.
+# Their brand count is legitimately 0 — coverage must not be scored or warned.
+BRAND_AGNOSTIC = {
+    "signal_l2_market_velocity",
+    "signal_l2_size_demand_curve",
 }
 
 
@@ -238,7 +262,9 @@ def audit_table(cur, table, active_brands, runs, runs_today, run_ids):
     # ---- coverage
     brands = 0
     cov_score = 0.5
-    if brand_col:
+    if table in BRAND_AGNOSTIC:
+        cov_score = 1.0   # market-wide by design; no brand dimension to cover
+    elif brand_col:
         brands = q1(cur, f'SELECT count(distinct {brand_col}) FROM "{table}"')
         if active_brands:
             ratio = brands / active_brands
@@ -253,9 +279,10 @@ def audit_table(cur, table, active_brands, runs, runs_today, run_ids):
     hist_score = min((distinct_dates or 0) / 30.0, 1.0)
 
     # ---- null integrity on meaningful output columns
+    by_design = NULL_BY_DESIGN.get(table, {})
     numeric = numeric_columns_of(cur, table)
     meaningful = [c for c in numeric
-                  if c not in NULL_ALLOWED
+                  if c not in by_design
                   and any(h in c for h in MEANINGFUL_COL_HINTS)]
     worst_null = 0.0
     worst_col = None
@@ -270,6 +297,16 @@ def audit_table(cur, table, active_brands, runs, runs_today, run_ids):
         elif worst_null >= NULL_WARN:
             rec["flags"].append(("WARN", f"{worst_col} {worst_null:.0%} null"))
     null_score = 1.0 - min(worst_null / NULL_CRIT, 1.0)
+
+    # Record the by-design columns' real null rates. Not flagged, not scored —
+    # but never hidden: printed under "Expected nulls" so a shift is visible.
+    if by_design:
+        rec["expected_nulls"] = {}
+        for c, reason in by_design.items():
+            if c in numeric:
+                nulls = q1(cur, f'SELECT count(*) FROM "{table}" WHERE "{c}" IS NULL')
+                rec["expected_nulls"][c] = dict(
+                    rate=round(nulls / n, 3) if n else 0, reason=reason)
 
     # ---- run health
     run_score = _attach_run(rec, table, runs, runs_today, run_ids)
@@ -440,6 +477,16 @@ def render(records, substrate, r2):
           f"{r['distinct_dates']} | {r['brands']} | {r['max_date'] or '—'} | "
           f"{r['score']} |")
     P("")
+
+    # expected nulls — exempt from failing the build, but shown so a shift in
+    # a by-design null column can still be caught by eye.
+    exp = [r for r in records if r.get("expected_nulls")]
+    if exp:
+        P("## Expected nulls (informational — not scored)")
+        for r in exp:
+            for c, d in r["expected_nulls"].items():
+                P(f"- `{r['table']}`.{c}: {d['rate']:.0%} null — {d['reason']}")
+        P("")
 
     # substrate
     P("## Substrate (what signals are computed from)")
