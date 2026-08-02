@@ -18,10 +18,16 @@
 #                Supabase by their primary key (id), nothing else
 #
 # Any failure or mismatch at any step aborts BEFORE deletion. Nothing is
-# ever deleted on a guess. Scoped to price_snapshots only — products,
-# product_variants, and the weekly rollup tables are untouched by this
-# script, on purpose, because they don't have the unbounded-growth problem
-# this job exists to solve.
+# ever deleted on a guess.
+#
+# PHASE 1 (below): price_snapshots — unchanged, proven.
+# PHASE 2 (further below): the append-only signal_l1_*/signal_l2_*/product_l2_*
+#   and weekly rollup tables, which DO have the unbounded-growth problem now.
+#   Same verify-before-delete contract, reusing the same guard functions. It is
+#   OFF by default (ARCHIVE_SIGNALS_ENABLED) so this file can be merged safely
+#   and piloted with ARCHIVE_DRY_RUN=true before it deletes anything.
+#   Still untouched by BOTH phases: products, product_variants, price_events,
+#   stockout_events, bestseller_rank (live/current-state or feeds the rollup).
 # ═══════════════════════════════════════════════════════
 
 import io
@@ -279,7 +285,10 @@ def delete_archived_rows(snapshot_ids):
     return deleted
 
 
-if __name__ == "__main__":
+def archive_price_snapshots():
+    """The original, proven price_snapshots archive — logic UNCHANGED. Only the
+    terminal sys.exit()/os._exit() calls became `return`s so a second phase can
+    run after it. Returns 'nothing' | 'ok' | 'failed'."""
     mode_label = "PILOT (dry run, no deletion)" if DRY_RUN else "PRODUCTION"
     print(f"🚀 Khabar cold archive starting... mode={mode_label}")
     cutoff = date.today() - timedelta(days=ARCHIVE_THRESHOLD_DAYS)
@@ -288,8 +297,8 @@ if __name__ == "__main__":
 
     rows = fetch_aging_snapshot_ids(cutoff)
     if not rows:
-        print("  Nothing to archive yet — no rows older than the hot window. Exiting cleanly.")
-        sys.exit(0)
+        print("  Nothing to archive yet — no rows older than the hot window.")
+        return "nothing"
 
     print(f"  Found {len(rows)} rows eligible for archiving.")
 
@@ -378,8 +387,8 @@ if __name__ == "__main__":
         verified_ids.extend(r["snapshot_id"] for r in day_rows)
 
     if not verified_ids:
-        print("  🛑 No day passed the verify gate. Nothing deleted. Exiting.")
-        sys.exit(1)
+        print("  🛑 No day passed the verify gate. Nothing deleted.")
+        return "failed"
 
     if DRY_RUN:
         print(f"  🧪 DRY RUN — would have deleted {len(verified_ids)} rows across "
@@ -403,14 +412,242 @@ if __name__ == "__main__":
         print(f"\n🏁 Archive run complete. {deleted_count} rows moved to R2 across "
               f"{len(by_day) - len(failed_days)} day-file(s), removed from the hot tier.")
 
-    # Explicit, immediate, successful exit — BEFORE Python's normal interpreter
-    # shutdown runs. Seen live in a pilot run: pyarrow/Arrow's C++ layer can
-    # abort during that shutdown sequence (exit code 134, "core dumped") AFTER
-    # every line of this script's real work has already completed and printed
-    # successfully — it is teardown noise, not a failure of select/flatten/
-    # write/upload/verify/delete-skip. Forcing the exit here removes the
-    # ambiguity entirely rather than relying on log-reading to tell the two
-    # apart, and is what makes GitHub Actions report this run as ✅ green
-    # instead of ❌ red despite nothing having actually gone wrong.
+    return "ok"
+
+
+# ═══════════════════════════════════════════════════════
+# PHASE 2 — append-only signal / product / rollup tables → R2
+# ═══════════════════════════════════════════════════════
+# Same safety contract as phase 1: SELECT the aging rows, WRITE them to R2 as
+# Parquet, VERIFY the file's row count matches, and only THEN delete — from
+# Supabase. Two deliberate differences from the price path, both because these
+# tables behave differently:
+#
+#   • DELETE BY DATE, not by id. A past snapshot_date/report_date/week_start is
+#     IMMUTABLE here — compute_signals only ever writes TODAY's partition and
+#     never rewrites an older one. So a whole past day is a safe, complete unit
+#     to verify-then-delete. (price_snapshots deletes by id because its current
+#     day is still being written; these tables have no such live day among the
+#     aging rows.)
+#   • OVERWRITE the day file, don't merge. Because the day is immutable, the
+#     Supabase rows for it ARE the complete truth; re-archiving writes the same
+#     set. And since the delete is atomic per day (one filtered DELETE), a day
+#     is never half-in-Supabase / half-in-R2.
+#
+# ROLLOUT SAFETY: this whole phase is OFF unless ARCHIVE_SIGNALS_ENABLED=true,
+# so dropping the file into the repo changes NOTHING until you pilot it. Pilot
+# with ARCHIVE_DRY_RUN=true first (writes + verifies R2, deletes nothing), read
+# the log, THEN set ARCHIVE_SIGNALS_ENABLED=true.
+#
+# KNOWN DEPENDENCY TO CONFIRM BEFORE ENABLING: the reports only read the LATEST
+# day of each table, so 7 days is ample for them. But if the PRODUCT computation
+# or the Telegram BOT read signal history further back than the keep window,
+# they'll be starved. Confirm those read windows first. Worst case is anyway
+# recoverable — everything is in R2 before a single row is deleted.
+# ═══════════════════════════════════════════════════════
+
+ARCHIVE_SIGNALS_ENABLED = os.environ.get("ARCHIVE_SIGNALS_ENABLED", "false").lower() == "true"
+SIGNAL_KEEP_DAYS = int(os.environ.get("SIGNAL_ARCHIVE_KEEP_DAYS", "7"))    # l1/l2 signals + l2 products
+ROLLUP_KEEP_DAYS = int(os.environ.get("ROLLUP_ARCHIVE_KEEP_DAYS", "28"))   # weekly rollups (4 weeks)
+
+# Table families discovered by pattern so a NEW signal is covered automatically
+# (an unarchived append-only table is exactly the silent-growth trap this fixes).
+SIGNAL_TABLE_PATTERNS = ("signal_l1_", "signal_l2_", "product_l2_")
+
+# Rollups are named individually (no shared pattern) — explicit list, keep 28d.
+ROLLUP_TABLES = ("weekly_bestseller_summary", "weekly_product_summary",
+                 "weekly_variant_exception")
+
+# NEVER archive these, whatever a pattern might match: live current-state tables
+# the scraper/bot read, the price path handled above, run logs, and the raw
+# bestseller feed the weekly rollup still reads.
+ARCHIVE_BLOCKLIST = {
+    "products", "product_variants", "price_snapshots", "price_events",
+    "stockout_events", "signal_runs", "product_runs", "bestseller_rank",
+}
+
+
+# Fallback used only if live discovery can't run (no SUPABASE_DB_URL in this
+# job's env). Auto-discovery is preferred so a NEWLY added signal is covered
+# without editing this file; this list is the safety net, not the source of
+# truth. Keep it in sync if you add signals AND can't enable discovery.
+_FALLBACK_TARGETS = (
+    [(f"signal_{s}", "snapshot_date", None) for s in (
+        "l1_01_genuine_price_drop", "l1_03_price_staircase", "l1_04_anchor_inflation",
+        "l1_06_discount_recovery", "l1_07_price_anomaly", "l1_08_variant_stockout",
+        "l1_09_variant_restock", "l1_10_dead_stock", "l1_11_size_asymmetry",
+        "l1_12_new_sku_launch", "l1_13_product_delisted", "l1_14_launch_to_discount",
+        "l1_17_depth_escalation", "l1_22_discount_velocity", "l1_24_restock_density",
+        "l2_discount_honesty", "l2_first_mover", "l2_market_velocity",
+        "l2_pricing_discipline", "l2_replenishment_benchmark", "l2_share_of_launch",
+        "l2_size_demand_curve", "l2_trained_customer")]
+    + [(f"product_{p}", "report_date", None) for p in (
+        "l2_01_price_elasticity", "l2_02_production_blueprint", "l2_08_brand_health",
+        "l2_09_revealed_demand", "l2_10_market_entry", "l2_12_liquidation_calendar",
+        "l2_13_wallet_allocator")]
+)
+
+
+def discover_targets():
+    """Return [(table, date_col, keep_days), ...] to archive. Signal/product
+    tables auto-discovered by pattern; rollups explicit. Blocklist always wins.
+    Falls back to a built-in list if the DB can't be introspected here."""
+    dsn = os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        print("  ⚠️ SUPABASE_DB_URL not set — using built-in target list "
+              "(new signals won't be auto-covered until it is).")
+        out = [(t, dc, SIGNAL_KEEP_DAYS) for t, dc, _ in _FALLBACK_TARGETS
+               if t not in ARCHIVE_BLOCKLIST]
+        out += [(t, "week_start", ROLLUP_KEEP_DAYS) for t in ROLLUP_TABLES]
+        return sorted(out)
+
+    import psycopg2
+    targets = []
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name, string_agg(column_name, ',') AS cols
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                GROUP BY table_name
+            """)
+            colmap = {t: set(c.split(",")) for t, c in cur.fetchall()}
+    finally:
+        conn.close()
+
+    for table, cols in colmap.items():
+        if table in ARCHIVE_BLOCKLIST:
+            continue
+        if table in ROLLUP_TABLES:
+            if "week_start" in cols:
+                targets.append((table, "week_start", ROLLUP_KEEP_DAYS))
+            continue
+        if any(table.startswith(p) for p in SIGNAL_TABLE_PATTERNS):
+            date_col = ("snapshot_date" if "snapshot_date" in cols
+                        else "report_date" if "report_date" in cols else None)
+            if date_col:
+                targets.append((table, date_col, SIGNAL_KEEP_DAYS))
+    return sorted(targets)
+
+
+def _sanitize(row):
+    """Parquet has no dict/list type. Any nested value (e.g. l1_11's
+    sizes_still_in_stock array, JSONB columns) is stored as a JSON string —
+    lossless and queryable via DuckDB json_extract() later."""
+    import json as _json
+    out = {}
+    for k, v in row.items():
+        out[k] = _json.dumps(v) if isinstance(v, (dict, list)) else v
+    return out
+
+
+def fetch_aging_table_rows(table, date_col, cutoff):
+    """All rows of `table` older than cutoff, paginated past PostgREST's 1000 cap."""
+    all_rows, offset = [], 0
+    while True:
+        chunk = safe_db_execute(
+            supabase.table(table).select("*")
+            .lt(date_col, str(cutoff))
+            .order(date_col)
+            .range(offset, offset + 999)
+        )
+        rows = (chunk.data or []) if chunk else []
+        all_rows.extend(rows)
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    return all_rows
+
+
+def delete_table_day(table, date_col, day):
+    """Delete one immutable past partition, atomically, by its date value only."""
+    res = safe_db_execute(supabase.table(table).delete().eq(date_col, str(day)))
+    return res is not None
+
+
+def archive_one_table(table, date_col, keep_days):
+    """SELECT aging rows → per-day Parquet to R2 → verify count → delete that
+    day. Returns (archived_days, deleted_rows, failed_days)."""
+    cutoff = date.today() - timedelta(days=keep_days)
+    rows = fetch_aging_table_rows(table, date_col, cutoff)
+    if not rows:
+        print(f"  · {table}: nothing older than {cutoff} (keep {keep_days}d).")
+        return 0, 0, 0
+
+    by_day = {}
+    for r in rows:
+        by_day.setdefault(str(r[date_col]), []).append(_sanitize(r))
+
+    prefix = "_pilot_dry_run/tables" if DRY_RUN else "tables"
+    ok_days, deleted, failed = 0, 0, 0
+    for day in sorted(by_day):
+        day_rows = by_day[day]
+        object_key = f"{prefix}/{table}/{day}.parquet"
+        try:
+            buf = write_parquet(day_rows)          # reused guard
+            upload_to_r2(buf, object_key)          # reused guard
+        except Exception as e:
+            print(f"  ❌ [{table} {day}] upload failed: {e}. Rows stay in Supabase.")
+            failed += 1
+            continue
+        if not verify_upload(object_key, expected_row_count=len(day_rows)):   # reused gate
+            print(f"  🛑 [{table} {day}] verify failed. Rows stay in Supabase.")
+            failed += 1
+            continue
+        if DRY_RUN:
+            print(f"  🧪 [{table} {day}] {len(day_rows)} rows verified in R2 — "
+                  f"would delete. Nothing touched.")
+            ok_days += 1
+            continue
+        if delete_table_day(table, date_col, day):
+            print(f"  ✅ [{table} {day}] {len(day_rows)} rows → R2, deleted from Supabase.")
+            ok_days += 1
+            deleted += len(day_rows)
+        else:
+            print(f"  ⚠️ [{table} {day}] archived to R2 but delete call failed — "
+                  f"rows remain, will retry next run (already safe in R2).")
+            failed += 1
+    return ok_days, deleted, failed
+
+
+def archive_generic_tables():
+    """Phase 2 driver. Returns 'skipped' | 'nothing' | 'ok' | 'failed'."""
+    if not (ARCHIVE_SIGNALS_ENABLED or DRY_RUN):
+        print("\n⏭  Phase 2 (signals/products/rollups) disabled "
+              "(set ARCHIVE_SIGNALS_ENABLED=true to enable).")
+        return "skipped"
+
+    print(f"\n📦 Phase 2 — archiving append-only tables "
+          f"(signals/products keep {SIGNAL_KEEP_DAYS}d, rollups keep {ROLLUP_KEEP_DAYS}d)"
+          f"{' — DRY RUN' if DRY_RUN else ''}...")
+    targets = discover_targets()
+    print(f"  {len(targets)} table(s) in scope.")
+
+    tot_days = tot_rows = tot_failed = 0
+    for table, date_col, keep in targets:
+        d, r, f = archive_one_table(table, date_col, keep)
+        tot_days += d; tot_rows += r; tot_failed += f
+
+    if DRY_RUN:
+        print(f"\n🏁 Phase 2 pilot: {tot_days} day-file(s) verified in R2. "
+              f"0 rows deleted (dry run).")
+        return "ok"
+    print(f"\n🏁 Phase 2: {tot_rows} rows across {tot_days} day-file(s) moved to R2 "
+          f"and removed from Supabase. {tot_failed} day(s) failed (kept for retry).")
+    return "failed" if tot_failed and tot_days == 0 else "ok"
+
+
+if __name__ == "__main__":
+    price_status = archive_price_snapshots()
+    generic_status = archive_generic_tables()
+
+    print(f"\n══ Archive summary — price_snapshots: {price_status}, "
+          f"phase 2: {generic_status} ══")
+
+    # os._exit avoids a pyarrow/Arrow C++ teardown abort (exit 134) that can fire
+    # during normal interpreter shutdown AFTER all real work has succeeded. Exit
+    # non-zero only on a genuine failure so CI stays honest.
     sys.stdout.flush()
-    os._exit(0)
+    hard_fail = price_status == "failed" or generic_status == "failed"
+    os._exit(1 if hard_fail else 0)
