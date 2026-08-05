@@ -555,7 +555,7 @@ import sys
 import time
 import traceback
 from curl_cffi import requests
-from supabase import create_client
+from khabar_db import create_client
 from datetime import datetime, timezone, timedelta, date
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -569,6 +569,7 @@ SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
 # silently falls back to the old PostgREST path and the run behaves exactly
 # as before. Safe to deploy, and revertible by unsetting the secret alone.
 SUPABASE_DB_URL    = os.environ.get("SUPABASE_DB_URL", "").strip() or None
+KHABAR_DB_URL      = os.environ.get("KHABAR_DB_URL", "").strip() or SUPABASE_DB_URL  # single switch: point at PlanetScale (or Supabase-direct to A/B test)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -5157,12 +5158,12 @@ def load_prev_state_direct(brand_name):
     Returns None on any failure so the caller falls back to PostgREST rather
     than losing a scrape run.
     """
-    if not SUPABASE_DB_URL:
+    if not KHABAR_DB_URL:
         return None
 
     conn = None
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URL, connect_timeout=30)
+        conn = psycopg2.connect(KHABAR_DB_URL, connect_timeout=30)
         conn.set_session(readonly=True)
 
         # Server-side (named) cursor: streams in itersize batches instead of
