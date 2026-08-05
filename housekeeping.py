@@ -59,7 +59,7 @@ from datetime import date, datetime, timedelta, timezone
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
-from supabase import create_client
+from khabar_db import create_client
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -76,8 +76,9 @@ R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 # scheduled runs always use these defaults.
 STOCKOUT_DAYS = int(os.environ.get("HK_STOCKOUT_DAYS_OVERRIDE", "21"))
 PRICE_EVENT_DAYS = int(os.environ.get("HK_PRICE_EVENT_DAYS_OVERRIDE", "30"))
-WEEKLY_SUMMARY_WEEKS = int(os.environ.get("HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE", "2"))
-WEEKLY_VARIANT_EXCEPTION_WEEKS = int(os.environ.get("HK_WEEKLY_VARIANT_EXCEPTION_WEEKS_OVERRIDE", "2"))
+WEEKLY_SUMMARY_WEEKS = int(os.environ.get("HK_WEEKLY_SUMMARY_WEEKS_OVERRIDE", "4"))
+WEEKLY_VARIANT_EXCEPTION_WEEKS = int(os.environ.get("HK_WEEKLY_VARIANT_EXCEPTION_WEEKS_OVERRIDE", "4"))
+WEEKLY_BESTSELLER_WEEKS = int(os.environ.get("HK_WEEKLY_BESTSELLER_WEEKS_OVERRIDE", "4"))
 STALE_PRODUCT_DAYS = 14  # matches the scraper's original behaviour exactly
 
 DRY_RUN = os.environ.get("HK_DRY_RUN", "false").lower() == "true"
@@ -591,7 +592,7 @@ def main():
 # Task 6 — weekly_bestseller_summary, same pattern as Task 5.
     try:
         cutoff_bs_week = (date.today()
-                          - timedelta(weeks=2)).isoformat()
+                          - timedelta(weeks=WEEKLY_BESTSELLER_WEEKS)).isoformat()
         ok = archive_table(
             label="weekly_bestseller_summary",
             table="weekly_bestseller_summary",

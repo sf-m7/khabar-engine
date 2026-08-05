@@ -38,7 +38,7 @@ from datetime import date, timedelta
 import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
-from supabase import create_client
+from khabar_db import create_client, CA_BUNDLE
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -51,7 +51,7 @@ R2_ACCOUNT_ID        = os.environ["R2_ACCOUNT_ID"]
 R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
 R2_ENDPOINT_URL      = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-ARCHIVE_THRESHOLD_DAYS = int(os.environ.get("ARCHIVE_THRESHOLD_DAYS_OVERRIDE", "8"))
+ARCHIVE_THRESHOLD_DAYS = int(os.environ.get("ARCHIVE_THRESHOLD_DAYS_OVERRIDE", "14"))
 # Default is 8, matching the hot window described in the architecture
 # report and the scraper's own purge logic elsewhere in the codebase.
 # ARCHIVE_THRESHOLD_DAYS_OVERRIDE exists ONLY so a manual workflow_dispatch
@@ -492,7 +492,7 @@ def discover_targets():
     """Return [(table, date_col, keep_days), ...] to archive. Signal/product
     tables auto-discovered by pattern; rollups explicit. Blocklist always wins.
     Falls back to a built-in list if the DB can't be introspected here."""
-    dsn = os.environ.get("SUPABASE_DB_URL")
+    dsn = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ.get("SUPABASE_DB_URL")
     if not dsn:
         print("  ⚠️ SUPABASE_DB_URL not set — using built-in target list "
               "(new signals won't be auto-covered until it is).")
@@ -503,7 +503,7 @@ def discover_targets():
 
     import psycopg2
     targets = []
-    conn = psycopg2.connect(dsn)
+    conn = psycopg2.connect(dsn, sslrootcert=CA_BUNDLE)
     try:
         with conn.cursor() as cur:
             cur.execute("""

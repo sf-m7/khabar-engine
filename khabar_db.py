@@ -249,7 +249,11 @@ class _Query:
         cnt = None
         if self._count == "exact":
             cp = []
-            csql = f'SELECT count(*) AS n FROM "{self._t}"' + self._where(cp)
+            saved = (self._order, self._limit, self._offset)
+            self._order, self._limit, self._offset = [], None, None
+            inner = self._build_select(cp)          # correct for joins + filters
+            self._order, self._limit, self._offset = saved
+            csql = f"SELECT count(*) AS n FROM ({inner}) _cnt"
             cnt = (self._c._run(csql, cp) or [{"n": 0}])[0]["n"]
         data = [_normrow(r) for r in rows]
         return _Result(data, cnt)

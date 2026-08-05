@@ -36,13 +36,13 @@ import sys
 from datetime import date, timedelta
 
 import psycopg2
-from supabase import create_client
+from khabar_db import create_client, CA_BUNDLE
 
 sys.stdout.reconfigure(line_buffering=True)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-DB_URL       = os.environ["SUPABASE_DB_URL"]
+DB_URL       = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ["SUPABASE_DB_URL"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -109,7 +109,7 @@ if __name__ == "__main__":
 
     ok, failed = [], []
     bs_ok, bs_failed = [], []
-    conn = psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(DB_URL, sslrootcert=CA_BUNDLE)
     conn.autocommit = True  # each week is its own unit of work; commit independently
     try:
         with conn.cursor() as cur:
