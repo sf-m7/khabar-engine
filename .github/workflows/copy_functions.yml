@@ -24,11 +24,7 @@ jobs:
           PS: ${{ secrets.PLANETSCALE_DB_URL }}
         run: |
           set -euo pipefail
-          psql "$SB" -tAc "
-            SELECT string_agg(pg_get_functiondef(p.oid), E';\n\n') || ';'
-            FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
-            WHERE n.nspname='public' AND p.prokind='f';" > /tmp/functions.sql
-          echo \"Function bytes: \$(wc -c < /tmp/functions.sql)\"
+          psql "$SB" -tAc "SELECT string_agg(pg_get_functiondef(p.oid), E';\n\n') || ';' FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname='public' AND p.prokind='f';" > /tmp/functions.sql
+          wc -c /tmp/functions.sql
           psql "$PS" -v ON_ERROR_STOP=1 -f /tmp/functions.sql
-          echo "Verifying on PlanetScale:"
-          psql "$PS" -tAc "SELECT 'functions on PlanetScale: '||count(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace=n.oid WHERE n.nspname='public' AND p.prokind='f';"
+          psql "$PS" -tAc "SELECT 'functions on PlanetScale: ' || count(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace=n.oid WHERE n.nspname='public' AND p.prokind='f';"
