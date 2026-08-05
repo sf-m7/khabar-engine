@@ -1,0 +1,34 @@
+name: Copy DB functions Supabase → PlanetScale
+
+# One-off. Copies all public database functions (run_weekly_rollup_week, etc.)
+# from Supabase to PlanetScale. Safe to re-run: every function is CREATE OR REPLACE.
+on:
+  workflow_dispatch:
+
+jobs:
+  copy-functions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Copy functions
+        env:
+          SB: ${{ secrets.SUPABASE_DB_URL }}
+          PS: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: |
+          set -euo pipefail
+          psql "$SB" -tAc "
+            SELECT string_agg(pg_get_functiondef(p.oid), E';\n\n') || ';'
+            FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname='public' AND p.prokind='f';" > /tmp/functions.sql
+          echo \"Function bytes: \$(wc -c < /tmp/functions.sql)\"
+          psql "$PS" -v ON_ERROR_STOP=1 -f /tmp/functions.sql
+          echo "Verifying on PlanetScale:"
+          psql "$PS" -tAc "SELECT 'functions on PlanetScale: '||count(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace=n.oid WHERE n.nspname='public' AND p.prokind='f';"
