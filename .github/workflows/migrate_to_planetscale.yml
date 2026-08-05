@@ -1,0 +1,50 @@
+name: Migrate Supabase → PlanetScale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: 1) Build schema on PlanetScale (tables only)
+        env:
+          PS: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: psql "$PS" -v ON_ERROR_STOP=1 -f migrations/01_schema.sql
+
+      - name: 2) Copy data Supabase → PlanetScale
+        env:
+          SB: ${{ secrets.SUPABASE_DB_URL }}
+          PS: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: |
+          set -euo pipefail
+          TABLES=$(grep -oP 'CREATE TABLE public\.\K[a-z0-9_]+' migrations/01_schema.sql | sed 's/^/-t public./' | tr '\n' ' ')
+          echo "Dumping $(echo "$TABLES" | grep -o 'public\.' | wc -l) tables..."
+          pg_dump "$SB" --data-only --no-owner --no-privileges $TABLES \
+            | grep -v "pg_catalog.setval" \
+            | psql "$PS" -v ON_ERROR_STOP=1 --single-transaction
+
+      - name: 3) Add indexes, keys, reset counters
+        env:
+          PS: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: psql "$PS" -v ON_ERROR_STOP=1 -f migrations/02_constraints.sql
+
+      - name: 4) Verify — row counts per table
+        env:
+          PS: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: |
+          psql "$PS" -v ON_ERROR_STOP=1 -c "
+          SELECT relname AS table, n_live_tup AS approx_rows
+          FROM pg_stat_user_tables WHERE schemaname='public'
+          ORDER BY n_live_tup DESC;"
+          psql "$PS" -tAc "SELECT 'TOTAL TABLES: '||count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';"
