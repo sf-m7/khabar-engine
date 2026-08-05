@@ -1,0 +1,53 @@
+name: TEST — scrape one brand (Supabase or PlanetScale)
+
+# Manual only. Runs ONE brand through the new khabar_db compatibility layer,
+# against whichever database you pick. Use this to prove the layer works on
+# Supabase first, then on PlanetScale — before switching the real jobs over.
+# Telegram alerts are disabled here so testing never messages your users.
+
+on:
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: "Single brand to scrape (e.g. ravin, andora, carina)"
+        required: true
+        default: "ravin"
+      db:
+        description: "Which database to write to"
+        required: true
+        type: choice
+        default: "supabase"
+        options:
+          - supabase
+          - planetscale
+
+jobs:
+  test-scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run one brand
+        env:
+          # These stay set so the scraper imports/runs normally:
+          SUPABASE_URL:               ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:               ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_DB_URL:            ${{ secrets.SUPABASE_DB_URL }}
+          TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          # The switch: KHABAR_DB_URL decides which DB the new layer writes to.
+          KHABAR_DB_URL: ${{ inputs.db == 'planetscale' && secrets.PLANETSCALE_DB_URL || secrets.SUPABASE_DB_URL }}
+          # Only the chosen brand:
+          SCRAPE_TARGET: ${{ inputs.brand }}
+          # Safety: no change-detection / no user alerts during a test run.
+          CHANGE_DETECT_ACTIVE: "0"
+        run: python -u scraper.py
