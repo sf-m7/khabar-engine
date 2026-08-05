@@ -24,6 +24,17 @@ _DB_URL = (os.environ.get("KHABAR_DB_URL", "").strip()
            or os.environ.get("SUPABASE_DB_URL", "").strip()
            or None)
 
+def _ca_bundle():
+    # PlanetScale requires sslmode=verify-full; psycopg2-binary bundles its own
+    # OpenSSL and needs to be told where the CA certs are.
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return "/etc/ssl/certs/ca-certificates.crt"
+
+CA_BUNDLE = _ca_bundle()
+
 # Known parent-child relationships for embedded selects (child.col -> parent.col).
 # Used to translate  select("...parent!inner(...)")  into a SQL JOIN. Extra
 # relationships are auto-resolved from information_schema on first use.
@@ -251,7 +262,7 @@ class Client:
         self._fk_cache = dict(_REL)
 
     def _connect(self):
-        self._conn = psycopg2.connect(self._dsn, connect_timeout=30, sslmode='require')
+        self._conn = psycopg2.connect(self._dsn, connect_timeout=30, sslrootcert=CA_BUNDLE)
         self._conn.autocommit = True
 
     def _run(self, sql, params):
