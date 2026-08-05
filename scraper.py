@@ -555,7 +555,7 @@ import sys
 import time
 import traceback
 from curl_cffi import requests
-from khabar_db import create_client
+from khabar_db import create_client, CA_BUNDLE
 from datetime import datetime, timezone, timedelta, date
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -5163,7 +5163,7 @@ def load_prev_state_direct(brand_name):
 
     conn = None
     try:
-        conn = psycopg2.connect(KHABAR_DB_URL, connect_timeout=30, sslmode="require")
+        conn = psycopg2.connect(KHABAR_DB_URL, connect_timeout=30, sslrootcert=CA_BUNDLE)
         conn.set_session(readonly=True)
 
         # Server-side (named) cursor: streams in itersize batches instead of
