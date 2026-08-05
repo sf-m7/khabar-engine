@@ -16,6 +16,11 @@ jobs:
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
+          # Put the pg17 binaries ahead of the runner's preinstalled pg16 on PATH
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Confirm client version
+        run: pg_dump --version
 
       - name: 1) Build schema on PlanetScale (tables only)
         env:
