@@ -17,6 +17,8 @@ import time
 import psycopg2
 import psycopg2.extras
 from psycopg2.extras import Json
+from datetime import date as _date, datetime as _datetime
+from decimal import Decimal as _Decimal
 
 _DB_URL = (os.environ.get("KHABAR_DB_URL", "").strip()
            or os.environ.get("SUPABASE_DB_URL", "").strip()
@@ -44,6 +46,20 @@ def _adapt(v):
     if isinstance(v, (dict, list)):
         return Json(v)
     return v
+
+
+def _norm(v):
+    # Match the old Supabase/PostgREST JSON shapes the app code expects:
+    # dates/timestamps -> ISO strings, numeric -> float.
+    if isinstance(v, (_datetime, _date)):
+        return v.isoformat()
+    if isinstance(v, _Decimal):
+        return float(v)
+    return v
+
+
+def _normrow(r):
+    return {k: _norm(v) for k, v in r.items()}
 
 
 def _split_top_level(s):
@@ -224,7 +240,7 @@ class _Query:
             cp = []
             csql = f'SELECT count(*) AS n FROM "{self._t}"' + self._where(cp)
             cnt = (self._c._run(csql, cp) or [{"n": 0}])[0]["n"]
-        data = [dict(r) for r in rows]
+        data = [_normrow(r) for r in rows]
         return _Result(data, cnt)
 
 
@@ -235,7 +251,7 @@ class Client:
         self._fk_cache = dict(_REL)
 
     def _connect(self):
-        self._conn = psycopg2.connect(self._dsn, connect_timeout=30)
+        self._conn = psycopg2.connect(self._dsn, connect_timeout=30, sslmode='require')
         self._conn.autocommit = True
 
     def _run(self, sql, params):
@@ -285,7 +301,7 @@ class Client:
         q = _Query(self, fn)
         q._op = "_rpc_done"
         rows = self._run(sql, vals)
-        q.execute = lambda: _Result([dict(r) for r in (rows or [])])
+        q.execute = lambda: _Result([_normrow(r) for r in (rows or [])])
         return q
 
 
