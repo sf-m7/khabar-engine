@@ -30,12 +30,13 @@ import time
 from datetime import date
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 import psycopg2.extras
 
 import khabar_lake
 from signals import SIGNALS, BLOCKERS, blocked_by, runnable
 
-SUPABASE_DB_URL = os.environ["SUPABASE_DB_URL"]
+SUPABASE_DB_URL = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ["SUPABASE_DB_URL"]
 
 # A dry run computes everything and reports what it WOULD write, but touches
 # no Supabase table. Use it to inspect a new signal's output before trusting it.
@@ -342,7 +343,7 @@ if __name__ == "__main__":
     n_events = khabar_lake.stockout_events(con)
     print(f"  📦 Stock events materialised: {n_events:,} witnessed transitions.")
 
-    pg  = psycopg2.connect(SUPABASE_DB_URL)
+    pg  = psycopg2.connect(SUPABASE_DB_URL, sslrootcert=CA_BUNDLE)
 
     tally = {"ok": 0, "skipped": 0, "failed": 0}
     for signal in SIGNALS:

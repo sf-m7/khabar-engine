@@ -29,10 +29,11 @@ import sys
 from datetime import datetime, timezone
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 
 sys.stdout.reconfigure(line_buffering=True)
 
-DB_URL = os.environ["SUPABASE_DB_URL"]
+DB_URL = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ["SUPABASE_DB_URL"]
 
 # Tables confirmed to accumulate real dead-row bloat with no purge
 # mechanism of their own (price_snapshots and bestseller_rank ARE purged
@@ -64,7 +65,7 @@ def check_no_active_queries(cur):
 if __name__ == "__main__":
     print(f"🚀 Khabar monthly compaction — {datetime.now(timezone.utc).isoformat()}")
 
-    conn = psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(DB_URL, sslrootcert=CA_BUNDLE)
     conn.autocommit = True  # REQUIRED — VACUUM cannot run inside a transaction block
     try:
         with conn.cursor() as cur:

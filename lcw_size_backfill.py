@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 sys.stdout.reconfigure(line_buffering=True)
 
 # Import real, tested logic directly from scraper.py — see DESIGN note above.
-from supabase import create_client
+from khabar_db import create_client
 from scraper import (
     SUPABASE_URL,
     SUPABASE_KEY,

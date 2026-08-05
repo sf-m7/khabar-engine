@@ -74,7 +74,9 @@ R2_ACCESS_KEY_ID     = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
 R2_ACCOUNT_ID        = os.environ["R2_ACCOUNT_ID"]
 R2_BUCKET_NAME       = os.environ["R2_BUCKET_NAME"]
-SUPABASE_DB_URL      = os.environ["SUPABASE_DB_URL"]
+from khabar_db import CA_BUNDLE
+os.environ.setdefault("PGSSLROOTCERT", CA_BUNDLE)  # let DuckDB's libpq verify PlanetScale
+SUPABASE_DB_URL      = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ["SUPABASE_DB_URL"]
 
 LAKE_PREFIX = "price_snapshots"
 EVENT_WINDOW_DAYS = 90   # how much event history to stitch (hot + R2 cold).

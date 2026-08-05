@@ -35,13 +35,14 @@ import sys
 import time
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 import psycopg2.extras
 import requests
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-DB_URL = os.environ.get("SUPABASE_DB_URL")
+DB_URL = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ.get("SUPABASE_DB_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SERVICE_ACCOUNT_KEY = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
 MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "5000"))
@@ -346,7 +347,7 @@ def pass_sizes():
 def db():
     if not DB_URL:
         sys.exit("ERROR: SUPABASE_DB_URL env var is missing.")
-    return psycopg2.connect(DB_URL)
+    return psycopg2.connect(DB_URL, sslrootcert=CA_BUNDLE)
 
 
 def _init_backend():

@@ -7,7 +7,7 @@ import sys
 import time
 import json
 from curl_cffi import requests
-from supabase import create_client
+from khabar_db import create_client
 from datetime import datetime, timezone
 
 sys.stdout.reconfigure(line_buffering=True)

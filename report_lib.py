@@ -30,6 +30,7 @@ from pathlib import Path
 from datetime import date
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 import pandas as pd
 
 import matplotlib
@@ -64,10 +65,10 @@ plt.rcParams.update({
 
 # --------------------------------------------------------------------- data
 def connect():
-    dsn = os.environ.get("SUPABASE_DB_URL")
+    dsn = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ.get("SUPABASE_DB_URL")
     if not dsn:
         raise SystemExit("FATAL: SUPABASE_DB_URL not set.")
-    return psycopg2.connect(dsn)
+    return psycopg2.connect(dsn, sslrootcert=CA_BUNDLE)
 
 
 def df_sql(conn, sql):

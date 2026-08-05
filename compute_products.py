@@ -30,11 +30,12 @@ import time
 from datetime import date, timezone, datetime
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 import psycopg2.extras
 
 from products import PRODUCTS
 
-SUPABASE_DB_URL = os.environ["SUPABASE_DB_URL"]
+SUPABASE_DB_URL = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ["SUPABASE_DB_URL"]
 
 DRY_RUN = os.environ.get("PRODUCTS_DRY_RUN", "false").lower() == "true"
 
@@ -160,7 +161,7 @@ if __name__ == "__main__":
     print(f"🚀 Khabar L2 product engine — mode={mode}")
     print(f"   Registry: {len(PRODUCTS)} product(s) declared.\n")
 
-    pg = psycopg2.connect(SUPABASE_DB_URL)
+    pg = psycopg2.connect(SUPABASE_DB_URL, sslrootcert=CA_BUNDLE)
 
     tally = {"ok": 0, "skipped": 0, "failed": 0}
     for product in PRODUCTS:

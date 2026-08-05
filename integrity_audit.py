@@ -50,6 +50,7 @@ import json
 from datetime import date, datetime, timezone
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 import psycopg2.extras
 
 # ------------------------------------------------------------------ thresholds
@@ -111,10 +112,10 @@ BRAND_AGNOSTIC = {
 
 
 def connect():
-    dsn = os.environ.get("SUPABASE_DB_URL")
+    dsn = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ.get("SUPABASE_DB_URL")
     if not dsn:
         sys.exit("FATAL: SUPABASE_DB_URL is not set.")
-    return psycopg2.connect(dsn)
+    return psycopg2.connect(dsn, sslrootcert=CA_BUNDLE)
 
 
 def q(cur, sql, args=None):

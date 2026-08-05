@@ -51,9 +51,10 @@ import sys
 from datetime import date, timedelta
 
 import psycopg2
+from khabar_db import CA_BUNDLE
 import psycopg2.extras
 
-DB_URL = os.environ["SUPABASE_DB_URL"]
+DB_URL = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ["SUPABASE_DB_URL"]
 
 # A brand needs some history before "compare against its own median" means
 # anything. Newer brands are reported but never fail the build.
@@ -371,7 +372,7 @@ def check_frozen_prices(cur):
 
 
 def main():
-    conn = psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(DB_URL, sslrootcert=CA_BUNDLE)
     conn.set_session(readonly=True, autocommit=True)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
