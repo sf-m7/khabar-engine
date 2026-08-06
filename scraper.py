@@ -880,7 +880,7 @@ BRANDS = [
     {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
-    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
+#    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
 
@@ -905,7 +905,7 @@ BRAND_DISPLAY = {
     "dalydress":  "Dalydress",
     "esla":       "Esla",
     "mobaco":     "Mobaco",
-    "rojada":     "Rojada",
+#    "rojada":     "Rojada",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
     "arafa":      "Arafa Stores",
