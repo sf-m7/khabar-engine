@@ -47,6 +47,7 @@ jobs:
           R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
           SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           # Scheduled runs are ALWAYS production — github.event.inputs is empty
           # on a schedule trigger, so a past manual dry run can never leak into
           # the cron's behaviour. Same guard as archive.yml and housekeeping.yml.

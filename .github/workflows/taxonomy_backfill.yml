@@ -44,6 +44,7 @@ jobs:
       - name: Run backfill pass
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MAX_GEMINI_CALLS: "5000"

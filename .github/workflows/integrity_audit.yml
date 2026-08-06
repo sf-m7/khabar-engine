@@ -28,6 +28,7 @@ jobs:
       - name: Run audit
         env:
           SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}

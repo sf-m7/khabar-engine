@@ -32,4 +32,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
         run: python -u rollup.py

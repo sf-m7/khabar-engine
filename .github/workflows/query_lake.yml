@@ -40,6 +40,7 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           QUERY_SQL: ${{ inputs.sql }}
           WINDOW_DAYS: ${{ inputs.window_days }}
         run: python query_lake.py

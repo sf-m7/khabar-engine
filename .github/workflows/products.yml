@@ -46,6 +46,7 @@ jobs:
       - name: Run L2 product engine
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           # Scheduled (cron) runs are ALWAYS production: github.event_name is
           # 'schedule', so this evaluates to 'false' and writes for real. Only
           # a manual workflow_dispatch can request a dry run, via its checkbox.

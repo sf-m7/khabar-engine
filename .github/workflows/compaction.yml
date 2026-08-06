@@ -44,4 +44,5 @@ jobs:
       - name: Run compaction
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
         run: python -u compaction.py

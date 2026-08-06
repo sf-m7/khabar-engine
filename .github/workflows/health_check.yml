@@ -29,6 +29,7 @@ jobs:
       - name: Run health check
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
         run: |
           set -o pipefail
           python -u health_check.py 2>&1 | tee report.txt
