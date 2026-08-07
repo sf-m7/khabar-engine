@@ -24,7 +24,7 @@ name: LCW Scraper
 
 on:
   schedule:
-    # v14.43: one real attempt plus four retry slots, 10 minutes apart.
+    # v14.43: one real attempt plus four retry slots, 20 minutes apart.
     #
     # GitHub cron cannot express "retry 10 minutes after the previous run
     # finished" — it only schedules by clock time, with no knowledge of the
@@ -42,14 +42,14 @@ on:
     # group below queues that attempt rather than running it in parallel, and
     # it then exits immediately as a no-op. No overlap, no double-scraping.
     # ── Evening block (unchanged) ───────────────────────────────────────
-    - cron: '23,33,43,53 17 * * *'
-    - cron: '3 18 * * *'
+    - cron: '20,40 17 * * *'
+    - cron: '0,20,40 18 * * *'
     # ── Morning block, 12 hours earlier ─────────────────────────────────
     # Same shape as the evening: one real attempt plus four retry slots ten
     # minutes apart, so a bad proxy window in the morning costs minutes
     # rather than half a day.
-    - cron: '23,33,43,53 5 * * *'
-    - cron: '3 6 * * *'
+    - cron: '20,40 5 * * *'
+    - cron: '0,20,40 6 * * *'
   workflow_dispatch:        # manual trigger, unchanged
 
 concurrency:
@@ -82,7 +82,7 @@ jobs:
           SUPABASE_URL:                ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY:                ${{ secrets.SUPABASE_KEY }}
           SUPABASE_DB_URL:             ${{ secrets.SUPABASE_DB_URL }}
-          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
+          KHABAR_DB_URL:               ${{ secrets.PLANETSCALE_DB_URL }}
           TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
           DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
