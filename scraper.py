@@ -880,7 +880,7 @@ BRANDS = [
     {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
-#    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
+    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
 
@@ -905,7 +905,7 @@ BRAND_DISPLAY = {
     "dalydress":  "Dalydress",
     "esla":       "Esla",
     "mobaco":     "Mobaco",
-#    "rojada":     "Rojada",
+    "rojada":     "Rojada",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
     "arafa":      "Arafa Stores",
@@ -3131,6 +3131,10 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # rest of the job for nothing. Next scheduled run tries again fresh.
     consecutive_failures  = [0]
     CIRCUIT_BREAKER_LIMIT = env_int("LCW_CIRCUIT_BREAKER", 6)
+    total_failures        = [0]
+    MAX_TOTAL_FAILURES    = env_int("LCW_MAX_FAILURES", 25)      # bail if the whole run racks up this many failed fetches
+    LCW_TIME_BUDGET_SEC   = env_int("LCW_TIME_BUDGET_MIN", 15) * 60  # hard wall-clock cap (healthy run ≈ 12 min)
+    lcw_start             = time.time()
 
     # v14.41: skip categories already completed today by an earlier run.
     LCW_CHECKPOINT = env_str("LCW_CHECKPOINT", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -3178,12 +3182,13 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
             rotation_budget=rotation_budget, current_country=lcw_country)
         if not first_data:
             consecutive_failures[0] += 1
+            total_failures[0] += 1
             print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
             if LCW_CHECKPOINT:
                 mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
                                   pages_done=0, pages_total=0, pages_failed=1)
-            if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT:
-                print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive page "
+            if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
+                print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive / {total_failures[0]} total page "
                       f"failures — DataImpulse route looks broadly unhealthy "
                       f"right now, not one bad peer. Aborting LCW run early; "
                       f"will retry on the next scheduled run.")
@@ -3210,6 +3215,16 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
         MAX_PAGE_ATTEMPTS = env_int("LCW_PAGE_ATTEMPTS", 3)
 
         while pending:
+            if time.time() - lcw_start > LCW_TIME_BUDGET_SEC:
+                print(f"  🛑 [LCW] time budget exceeded "
+                      f"(~{int((time.time()-lcw_start)/60)} min) — route too slow "
+                      f"right now; aborting early, will retry next run.")
+                if LCW_CHECKPOINT:
+                    mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                      cat_pages_done, page_count, cat_pages_failed)
+                return _lcw_finalise(supabase, session, brand_name, domain, today,
+                                     lcw_model_records, lcw_model_info, prev_prices,
+                                     existing_snapshot_ids, products_seen, price_changes)
             page_idx = pending.pop(0)
             data = first_data if page_idx == 1 else None
             if page_idx > 1:
@@ -3220,6 +3235,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                     rotation_budget=rotation_budget, current_country=lcw_country)
                 if not data:
                     consecutive_failures[0] += 1
+                    total_failures[0] += 1
                     page_attempts[page_idx] = page_attempts.get(page_idx, 0) + 1
                     if page_attempts[page_idx] < MAX_PAGE_ATTEMPTS:
                         pending.append(page_idx)   # retry later, fresh peer
@@ -3231,8 +3247,8 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                         cat_failed_pages.append(page_idx)
                         print(f"  ⚠️ [{cat_name}] Page {page_idx} failed "
                               f"{MAX_PAGE_ATTEMPTS}x. Giving up on this page.")
-                    if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT:
-                        print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive page "
+                    if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
+                        print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive / {total_failures[0]} total page "
                               f"failures — DataImpulse route looks broadly unhealthy "
                               f"right now, not one bad peer. Aborting LCW run early; "
                               f"will retry on the next scheduled run.")
