@@ -979,6 +979,14 @@ ORDER BY a.last_depth_pct DESC
     # LC Waikiki/Mobaco/Just SBR (their engines don't capture compare_at_
     # price at all — output correctly shows nothing for them, not a bug),
     # thin for dott_jeans/esla/khotwh (33-66% populated).
+    #
+    # SOURCE FIX 2026-08-08: was sourced from price_events_raw, which only
+    # holds a row when the ACTUAL price changes. An anchor rise on a flat
+    # selling price emits no price event, so this signal was structurally
+    # blind — 2 rows in 90 days, last write 2026-07-27, tripping the staleness
+    # check. Re-sourced from `snapshots` (one row per product-variant per DAY),
+    # where the anchor rise is always observable. Verified live: 7 write-days
+    # and 85 events across 6 brands in the trailing 10 days.
     # -------------------------------------------------------------------
     {
         "id": "l1_04",
@@ -991,53 +999,51 @@ ORDER BY a.last_depth_pct DESC
         "enabled": True,
         "requires": [],
         "sql": """
-            WITH ordered AS (
+            WITH daily AS (
+                -- Collapse variants to one row per product per DAY. snapshots is
+                -- variant-level; the anchor (compare_at) and the real price are
+                -- product-level facts, so take the day's MAX anchor and MIN real
+                -- price. One row per (product_id, snapshot_date) means the PK is
+                -- satisfied without a later dedup pass.
                 SELECT
-                    product_id, brand, recorded_at, price_after, compare_at_price,
-                    LAG(compare_at_price) OVER (
-                        PARTITION BY product_id ORDER BY recorded_at
-                    ) AS prev_compare_at,
-                    LAG(price_after) OVER (
-                        PARTITION BY product_id ORDER BY recorded_at
-                    ) AS prev_price
-                FROM price_events_raw
+                    product_id, brand, snapshot_date,
+                    MAX(compare_at_price) AS compare_at_price,
+                    MIN(price)            AS price
+                FROM snapshots
                 WHERE compare_at_price IS NOT NULL
-                  AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+                  AND price IS NOT NULL AND price > 0
+                  AND snapshot_date >= CURRENT_DATE - INTERVAL '{window_days} days'
+                GROUP BY product_id, brand, snapshot_date
             ),
-            ranked AS (
-                -- FIXED 2026-07-21: a product can have more than one qualifying
-                -- inflation event on the same calendar day (confirmed live: 46
-                -- product-days). snapshot_date is a day, not an instant, so the
-                -- PK (product_id, snapshot_date) needs exactly one row per day.
-                -- Keep the largest inflation of the day; drop the rest.
+            ordered AS (
                 SELECT
-                    o.product_id,
-                    o.brand,
-                    pd.name              AS product_name,
-                    pd.department,
-                    pd.category_normalized,
-                    pd.subcategory,
-                    o.prev_compare_at,
-                    o.compare_at_price   AS new_compare_at,
-                    o.price_after        AS actual_price,
-                    ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
-                          / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
-                    CAST(o.recorded_at AS DATE) AS snapshot_date,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY o.product_id, CAST(o.recorded_at AS DATE)
-                        ORDER BY (o.compare_at_price - o.prev_compare_at) DESC
-                    ) AS rn
-                FROM ordered o
-                JOIN products_dim pd ON pd.product_id = o.product_id
-                WHERE o.prev_compare_at IS NOT NULL
-                  AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
-                  AND o.price_after = o.prev_price             -- actual price UNCHANGED
+                    product_id, brand, snapshot_date, compare_at_price, price,
+                    LAG(compare_at_price) OVER (
+                        PARTITION BY product_id ORDER BY snapshot_date
+                    ) AS prev_compare_at,
+                    LAG(price) OVER (
+                        PARTITION BY product_id ORDER BY snapshot_date
+                    ) AS prev_price
+                FROM daily
             )
-            SELECT product_id, brand, product_name, department, category_normalized,
-                   subcategory, prev_compare_at, new_compare_at, actual_price,
-                   anchor_inflation_pct, snapshot_date
-            FROM ranked
-            WHERE rn = 1
+            SELECT
+                o.product_id,
+                o.brand,
+                pd.name              AS product_name,
+                pd.department,
+                pd.category_normalized,
+                pd.subcategory,
+                o.prev_compare_at,
+                o.compare_at_price   AS new_compare_at,
+                o.price              AS actual_price,
+                ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
+                      / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
+                o.snapshot_date
+            FROM ordered o
+            JOIN products_dim pd ON pd.product_id = o.product_id
+            WHERE o.prev_compare_at IS NOT NULL
+              AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
+              AND o.price = o.prev_price                   -- actual price UNCHANGED
         """,
     },
 
