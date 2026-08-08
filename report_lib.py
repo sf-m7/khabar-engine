@@ -39,15 +39,51 @@ import matplotlib.pyplot as plt
 
 REPORTS_ROOT = Path(os.environ.get("REPORTS_ROOT", "reports"))
 
-# Brands to keep OUT of client-facing reports: phantom / contaminated data still
-# pending cleanup. Featuring them would put junk in front of a buyer.
-EXCLUDE_BRANDS = {"tree", "dalydress"}
+# Brands kept OUT of client-facing reports. SINGLE SOURCE OF TRUTH is the
+# ref_excluded_brands table (scope 'all' = phantom; 'stock' = fabricated stock).
+# The hardcoded sets below are ONLY a crash-proof fallback if that table can't be
+# read (older branch / not yet migrated), so a report never dies and never
+# silently shows junk.
+_FALLBACK_ALL   = {"tree", "dalydress"}
+_FALLBACK_STOCK = {"lc_waikiki", "defacto", "mobaco"}
+
+# Populated by refresh_exclusions(); start at fallback so imports never crash.
+EXCLUDE_BRANDS       = set(_FALLBACK_ALL)                         # scope 'all'
+EXCLUDE_STOCK_BRANDS = set(_FALLBACK_ALL) | set(_FALLBACK_STOCK)  # 'all' + 'stock'
+
+
+def refresh_exclusions(conn):
+    """Load exclusion sets from ref_excluded_brands (single source). Falls back
+    to the hardcoded defaults if the table is unavailable. Called once by
+    connect() so every report run uses the current table with no extra wiring."""
+    global EXCLUDE_BRANDS, EXCLUDE_STOCK_BRANDS
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT brand, scope FROM ref_excluded_brands")
+            rows = cur.fetchall()
+        drop_all   = {b for b, s in rows if s == "all"}
+        drop_stock = {b for b, s in rows if s == "stock"}
+        EXCLUDE_BRANDS       = drop_all
+        EXCLUDE_STOCK_BRANDS = drop_all | drop_stock
+    except Exception:
+        conn.rollback()
+        EXCLUDE_BRANDS       = set(_FALLBACK_ALL)
+        EXCLUDE_STOCK_BRANDS = set(_FALLBACK_ALL) | set(_FALLBACK_STOCK)
+    return EXCLUDE_BRANDS, EXCLUDE_STOCK_BRANDS
 
 
 def drop_excluded(df, col="brand"):
+    """Drop phantom brands (scope 'all'). For PRICE-based reports."""
     if df is None or df.empty or col not in df.columns:
         return df
     return df[~df[col].isin(EXCLUDE_BRANDS)]
+
+
+def drop_excluded_stock(df, col="brand"):
+    """Drop phantom + fabricated-stock brands. For STOCK/size-based reports."""
+    if df is None or df.empty or col not in df.columns:
+        return df
+    return df[~df[col].isin(EXCLUDE_STOCK_BRANDS)]
 
 # Palette (from the Khabar playbook) — kept muted and consistent across charts.
 INK   = "#1a2b2b"
@@ -68,7 +104,9 @@ def connect():
     dsn = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ.get("SUPABASE_DB_URL")
     if not dsn:
         raise SystemExit("FATAL: SUPABASE_DB_URL not set.")
-    return psycopg2.connect(dsn, sslrootcert=CA_BUNDLE)
+    conn = psycopg2.connect(dsn, sslrootcert=CA_BUNDLE)
+    refresh_exclusions(conn)          # load ref_excluded_brands (fallback-safe)
+    return conn
 
 
 def df_sql(conn, sql):
@@ -180,6 +218,47 @@ def confidence(brands=None, days=None, events=None, cycles=None):
     if events is not None:  bits.append(f"{events:,} events")
     if cycles is not None:  bits.append(f"{cycles:,} cycles")
     return tier, f"[{tier} · {', '.join(bits)}]" if bits else f"[{tier}]"
+
+
+# ------------------------------------------------------------ freshness / floor
+def stale_brands(conn, signal_table, date_col="snapshot_date", max_lag_days=2):
+    """Brands whose newest row in `signal_table` lags the table's own max date by
+    more than `max_lag_days`. Catches silent per-brand stalls — e.g. LC Waikiki
+    froze in signal_l1_01_genuine_price_drop on 2026-07-31 while its inputs
+    stayed fresh. Nothing else detects this. `signal_table` must be a trusted
+    literal from report code (not user input). Returns {brand: days_stale};
+    empty means all current."""
+    q = f"""
+        WITH per_brand AS (
+            SELECT brand, max({date_col}) AS last_date
+            FROM {signal_table} GROUP BY brand
+        ), mx AS (SELECT max(last_date) AS m FROM per_brand)
+        SELECT brand, (mx.m - last_date) AS days_stale
+        FROM per_brand, mx
+        WHERE (mx.m - last_date) > %s
+        ORDER BY days_stale DESC
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (max_lag_days,))
+        return {b: int(d) for b, d in cur.fetchall()}
+
+
+def pct_reliable(events, floor=5):
+    """A percentage is shown only when it rests on >= `floor` observations.
+    Below the floor a '100%' from 2 events is noise, not signal."""
+    return (events or 0) >= floor
+
+
+def cell_tier(events):
+    """Per-CELL maturity, mirroring confidence()'s vocabulary but for one cell's
+    own sample size. Keeps one shared vocabulary: confirmed / directional /
+    maturing."""
+    n = events or 0
+    if n >= 10:
+        return "confirmed"
+    if n >= 5:
+        return "directional"
+    return "maturing"
 
 
 # ------------------------------------------------------------------ folders
