@@ -1813,6 +1813,98 @@ ORDER BY a.last_depth_pct DESC
             WHERE f.brands >= 3 AND f.stockouts >= 20   -- cross-brand + real volume
         """,
     },
+
+    # -------------------------------------------------------------------------
+    # L2 · CLEAR-RATE BY DISCOUNT DEPTH
+    #
+    # "At what discount depth do items in a category actually clear — and does
+    #  going deeper help?"
+    #
+    # For each product, take the DEEPEST honest discount it reached in the window
+    # (depth vs first_observed_price, the manipulation-resistant baseline — NEVER
+    # compare_at_price). Bucket products by that max depth, per category x gender,
+    # and measure what fraction had a WITNESSED on-discount stockout ("cleared").
+    #
+    # INTERPRETATION (state this in client output — it is association, not cause):
+    # a product only reaches a deep bucket if shallower discounts did NOT clear it
+    # first. So a falling clear-rate at deeper buckets is the honest signature of
+    # the unsellable tail — deep markdowns do not rescue stock that already failed
+    # to move. Verified live 2026-08-08 on the hot window: trousers clear 48.8% at
+    # 0-10% depth but only ~4% past 30%.
+    #
+    # Brand is aggregated away here, so ALL excluded brands must be filtered IN
+    # this SQL (a downstream report cannot re-filter by brand): phantom (tree,
+    # dalydress) AND fabricated-stock (lc_waikiki, defacto, mobaco). This mirrors
+    # the inline convention of the other aggregate signals; when the exclusion
+    # list migrates to ref_excluded_brands, these literals migrate with them.
+    # -------------------------------------------------------------------------
+    {
+        "id": "l2_clear_rate_by_depth", "name": "Clear-Rate by Discount Depth",
+        "level": "L2",
+        "table": "signal_l2_clear_rate_by_depth",
+        "unique_on": ["category_normalized", "gender", "depth_bucket", "snapshot_date"],
+        "window_days": 60,
+        "min_days": 14,
+        "enabled": True,
+        "requires": [],
+        "sql": """
+            WITH baseline AS (
+                SELECT product_id,
+                       MIN(CAST(first_observed_price AS DOUBLE)) AS baseline
+                FROM variants_raw
+                WHERE first_observed_price IS NOT NULL
+                  AND first_observed_price > 0
+                GROUP BY product_id
+            ),
+            disc AS (
+                -- Per product: deepest honest discount reached in the window,
+                -- carrying its category and gender.
+                SELECT s.product_id,
+                       s.category_normalized,
+                       s.gender,
+                       MAX((b.baseline - s.price) / b.baseline) AS max_depth
+                FROM snapshots s
+                JOIN baseline b ON b.product_id = s.product_id
+                WHERE s.price > 0
+                  AND s.price < b.baseline
+                  AND s.brand NOT IN ('tree', 'dalydress',
+                                      'lc_waikiki', 'defacto', 'mobaco')
+                GROUP BY s.product_id, s.category_normalized, s.gender
+            ),
+            cleared AS (
+                -- Witnessed on-discount stockouts. stock_events is already
+                -- witnessed-only (khabar_lake filters it), so no filter needed.
+                SELECT DISTINCT product_id
+                FROM stock_events
+                WHERE event_type = 'stockout' AND was_on_discount
+            ),
+            bucketed AS (
+                SELECT
+                    d.category_normalized,
+                    d.gender,
+                    CASE WHEN d.max_depth < 0.10 THEN '00-10'
+                         WHEN d.max_depth < 0.20 THEN '10-20'
+                         WHEN d.max_depth < 0.30 THEN '20-30'
+                         WHEN d.max_depth < 0.40 THEN '30-40'
+                         ELSE '40+' END              AS depth_bucket,
+                    count(*)                          AS products,
+                    count(c.product_id)               AS cleared
+                FROM disc d
+                LEFT JOIN cleared c ON c.product_id = d.product_id
+                GROUP BY 1, 2, 3
+            )
+            SELECT
+                category_normalized,
+                gender,
+                depth_bucket,
+                products,
+                cleared,
+                ROUND(100.0 * cleared / products, 1) AS clear_rate_pct,
+                CURRENT_DATE                         AS snapshot_date
+            FROM bucketed
+            WHERE products >= 10   -- per-bucket sample floor; below this, a rate is noise
+        """,
+    },
 ]
 
 
