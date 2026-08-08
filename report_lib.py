@@ -261,6 +261,57 @@ def cell_tier(events):
     return "maturing"
 
 
+# ------------------------------------------------------------- market rollup
+def market_undersupply(conn):
+    """Market-level under-supply by category x size, cross-brand — the read no
+    single brand's own data can produce. Fuses revealed_demand (demand pressure)
+    with production_blueprint (per-brand 'increase production' verdict).
+
+    Columns: category_normalized, stocked_out_size, brands (distinct brands
+    stocking out), market_stockouts (demand pressure — brand-weighted, so always
+    read it next to `brands`), products (breadth), brands_increase (brands the
+    blueprint flags 'increase production' for this cell), confidence (per-cell
+    tier). Sorted by demand pressure, strongest first.
+
+    Exclusions come from P0's drop_excluded_stock() — the single source — applied
+    BEFORE aggregation. Deliberately does NOT use pct_size_specific_demand
+    (degenerate: == 100%% on every row; upstream fix pending)."""
+    rd = df_sql(conn, """
+        SELECT brand, category_normalized, stocked_out_size,
+               stockout_count, products_affected
+        FROM product_l2_09_revealed_demand
+        WHERE report_date = (SELECT max(report_date) FROM product_l2_09_revealed_demand)
+          AND stocked_out_size IS NOT NULL
+          AND stocked_out_size NOT IN ('one_size', 'kids_age', '')
+    """)
+    bp = df_sql(conn, """
+        SELECT brand, category_normalized, stocked_out_size, production_signal
+        FROM product_l2_02_production_blueprint
+        WHERE report_date = (SELECT max(report_date) FROM product_l2_02_production_blueprint)
+    """)
+
+    rd = drop_excluded_stock(rd)
+    bp = drop_excluded_stock(bp)
+    if rd is None or rd.empty:
+        return rd
+
+    g = (rd.groupby(["category_normalized", "stocked_out_size"])
+            .agg(brands=("brand", "nunique"),
+                 market_stockouts=("stockout_count", "sum"),
+                 products=("products_affected", "sum"))
+            .reset_index())
+
+    inc = (bp[bp["production_signal"].str.startswith("increase production", na=False)]
+             .groupby(["category_normalized", "stocked_out_size"])["brand"]
+             .nunique().reset_index(name="brands_increase"))
+
+    g = g.merge(inc, on=["category_normalized", "stocked_out_size"], how="left")
+    g["brands_increase"] = g["brands_increase"].fillna(0).astype(int)
+    g["confidence"] = g["market_stockouts"].apply(cell_tier)
+
+    return g.sort_values("market_stockouts", ascending=False).reset_index(drop=True)
+
+
 # ------------------------------------------------------------------ folders
 def build_run_dir(slug, cadence):
     """cadence: 'weekly' -> YYYY-MM-DD, 'monthly' -> YYYY-MM."""
