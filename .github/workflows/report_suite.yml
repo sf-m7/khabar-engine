@@ -1,0 +1,53 @@
+name: Khabar Weekly Report Suite
+
+on:
+  schedule:
+    # Mondays 12:00 UTC — AFTER the daily signals (~06:00) and L2 products
+    # (~10:00) have refreshed, so the reports always read Monday-fresh data.
+    # Self-healing like the other jobs: a missed Monday just means the next
+    # run reads slightly newer tables; nothing is lost.
+    - cron: "0 12 * * 1"
+  workflow_dispatch: {}   # manual "Run workflow" button for on-demand rebuilds
+
+permissions:
+  contents: write         # needed to commit the generated report files back
+
+jobs:
+  reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate the four reports
+        env:
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: |
+          python -u report_order.py
+          python -u report_price.py
+          python -u report_marketing.py
+          python -u report_discount.py
+
+      - name: Commit the reports
+        run: |
+          git config user.name  "khabar-report-bot"
+          git config user.email "bot@khabar.local"
+          git add reports/
+          if git diff --cached --quiet; then
+            echo "No report changes this run."
+          else
+            git commit -m "Weekly report suite — $(date -u +%F)"
+            git push
+          fi
