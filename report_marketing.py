@@ -67,13 +67,27 @@ def run():
     else:
         s2 = H.section("02", "Discount timing", H.why("first-mover signal empty."))
 
-    # --- 3 · granular warming (maturing) ------------------------------------
-    s3 = H.section("03", "Warming & cooling by category × colour", H.maturing(
-        "Coming as per-category velocity lands.",
-        "The rich version — which category and colour is heating or cooling, confirmed by "
-        "price direction — needs a per-category velocity signal (today’s is market-wide only) "
-        "and the colour dimension. Both are planned; this fills in without changing the "
-        "temperature read above."), badge="MATURING")
+    # --- 3 · warming/cooling by category × colour (young, directional) ------
+    tr = R.demand_trend(conn, ["category_normalized", "color"], weeks=8)
+    if tr is not None and not tr.empty:
+        tcol = {"warming": "#B45309", "cooling": "#B0413A", "steady": "#9A978F"}
+        rows = [[
+            H.esc(r["category_normalized"]), H.esc(r["color"]),
+            f'<span class="m">{int(r["total"])}</span>',
+            f'<span class="m" style="color:{tcol.get(r["trend"], "#6C6A64")};font-weight:600">'
+            f'{r["trend"].upper()}</span>',
+        ] for r in tr.head(12).to_dict("records")]
+        tbl = H.table([("Category", False), ("Colour", False),
+                       ("Sell-outs", True), ("Trend", False)], rows)
+        s3 = H.section("03", "Warming & cooling by category × colour", tbl + H.why(
+            "Direction of weekly sell-out pressure per category × colour over recent weeks. "
+            "Young — treat as directional; it sharpens as history accumulates. Warming + you "
+            "hold stock = the promotion window."), badge="DIRECTIONAL")
+    else:
+        s3 = H.section("03", "Warming & cooling by category × colour", H.maturing(
+            "Accumulating.",
+            "Needs a few more weeks of witnessed history before per-colour trends stabilise."),
+            badge="MATURING")
 
     # --- 4 · coverage --------------------------------------------------------
     s4 = H.section("04", "Coverage & confidence", H.coverage([

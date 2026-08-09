@@ -388,6 +388,69 @@ def demand_grid(conn, group_cols, min_stockouts=10):
     return g.sort_values("stockouts", ascending=False).reset_index(drop=True)
 
 
+def color_price(conn, min_n=25):
+    """Median product price by category x canonical colour — the colour price
+    lever. Dedupes to one price per (product, colour). Returns category, color,
+    n, med. Price-based, so only phantom brands (scope 'all') are dropped."""
+    df = df_sql(conn, """
+        SELECT p.category_normalized, ps.product_id, ps.price,
+               lower(trim(pv.color)) AS color_raw
+        FROM price_snapshots ps
+        JOIN products p  ON p.id = ps.product_id
+        JOIN product_variants pv ON pv.product_id = ps.product_id
+        WHERE ps.snapshot_date = (SELECT max(snapshot_date) FROM price_snapshots)
+          AND ps.price > 0 AND pv.color IS NOT NULL AND pv.color <> ''
+          AND ps.brand NOT IN ('tree','dalydress')
+    """)
+    if df is None or df.empty:
+        return df
+    df["color"] = df["color_raw"].map(canonical_color)
+    df = df[df["color"] != "other"].drop_duplicates(["product_id", "color"])
+    g = (df.groupby(["category_normalized", "color"])
+           .agg(n=("price", "size"), med=("price", "median")).reset_index())
+    return g[g["n"] >= min_n].reset_index(drop=True)
+
+
+def demand_trend(conn, group_cols, weeks=8, min_total=20):
+    """Warming/cooling per cell from weekly witnessed stockouts. group_cols is any
+    subset of the grid dims (colour normalised). Returns each cell with total,
+    first-half vs last-half, and a trend label. Young now (~weeks of history) —
+    directional; it sharpens as history accumulates. Reads 60-day stockout_events."""
+    df = df_sql(conn, f"""
+        SELECT date_trunc('week', se.recorded_at)::date AS wk,
+               p.category_normalized, p.subcategory, p.gender,
+               lower(trim(se.color)) AS color_raw, se.product_id
+        FROM stockout_events se
+        JOIN products p ON p.id = se.product_id
+        WHERE se.witnessed AND se.event_type = 'stockout'
+          AND se.brand NOT IN ('tree','dalydress','lc_waikiki','defacto','mobaco')
+          AND se.recorded_at >= CURRENT_DATE - {int(weeks) * 7}
+    """)
+    if df is None or df.empty:
+        return df
+    if "color" in group_cols:
+        df["color"] = df["color_raw"].map(canonical_color)
+    wc = df.groupby(group_cols + ["wk"]).size().reset_index(name="stockouts")
+
+    out = []
+    for key, sub in wc.groupby(group_cols):
+        s = sub.sort_values("wk")["stockouts"].tolist()
+        total = sum(s)
+        if total < min_total or len(s) < 3:
+            continue
+        h = len(s) // 2
+        first, last = sum(s[:h]) or 1, sum(s[h:])
+        ratio = last / first
+        trend = "warming" if ratio >= 1.15 else "cooling" if ratio <= 0.85 else "steady"
+        row = dict(zip(group_cols if isinstance(key, tuple) else [group_cols[0]],
+                       key if isinstance(key, tuple) else [key]))
+        row.update(total=total, trend=trend, weeks=len(s))
+        out.append(row)
+    import pandas as _pd
+    res = _pd.DataFrame(out)
+    return res.sort_values("total", ascending=False).reset_index(drop=True) if not res.empty else res
+
+
 # ------------------------------------------------------------------ folders
 def build_run_dir(slug, cadence):
     """cadence: 'weekly' -> YYYY-MM-DD, 'monthly' -> YYYY-MM."""

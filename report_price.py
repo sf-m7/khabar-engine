@@ -73,12 +73,27 @@ def run():
                        "A wide bar = lots of pricing latitude in that category; a tight bar = "
                        "commoditised. Prices are live market prices, honest (not discount-inflated)."))
 
-    # --- 2 · colour & size price levers (maturing) --------------------------
-    s2 = H.section("02", "Does colour or size move price here?", H.maturing(
-        "Coming as the colour dimension lands.",
-        "Whether beige commands more than black, or XL more than M, is a real pricing lever — "
-        "but colour isn’t carried in the price layer yet (planned). Size rarely moves price in "
-        "this market. This panel fills in without changing the ladder above."), badge="MATURING")
+    # --- 2 · colour price lever ---------------------------------------------
+    cp = R.color_price(conn)
+    if cp is not None and not cp.empty:
+        top_cat = cp.groupby("category_normalized")["n"].sum().idxmax()
+        cc = cp[cp["category_normalized"] == top_cat].sort_values("med", ascending=False)
+        items = [{"color": r["color"], "med": int(r["med"])} for r in cc.to_dict("records")]
+        bars = H.hbars(items, "med", "color", unit=" EGP",
+                       caption=f"median market price by colour within {top_cat}")
+        hi, lo = cc.iloc[0], cc.iloc[-1]
+        spread = round((hi["med"] - lo["med"]) / lo["med"] * 100)
+        vline = (f"<b>Verdict:</b> colour moves price here — <b>{H.esc(hi['color'])}</b> runs "
+                 f"~{spread}% above <b>{H.esc(lo['color'])}</b>." if spread >= 8
+                 else "<b>Verdict:</b> colour barely moves price here (&lt;8% spread).")
+        s2 = H.section("02", f"Does colour move price? — {H.esc(top_cat)}",
+                       f'<p style="font-size:13.5px;margin:0 0 10px">{vline}</p>' + bars + H.why(
+                           "Median market price by colour, in the category with the most priced items. "
+                           "Earthy tones (brown, olive) tend to command more than brights. Size rarely "
+                           "moves price in this market, so it's not shown."))
+    else:
+        s2 = H.section("02", "Does colour move price?",
+                       H.why("Not enough colour-tagged prices to compare this week."))
 
     # --- 3 · coverage + Phase-2 nudge ---------------------------------------
     s3 = H.section("03", "Coverage & confidence", H.coverage([
