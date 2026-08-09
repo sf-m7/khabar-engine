@@ -263,52 +263,33 @@ def cell_tier(events):
 
 # ------------------------------------------------------------- market rollup
 def market_undersupply(conn):
-    """Market-level under-supply by category x size, cross-brand — the read no
-    single brand's own data can produce. Fuses revealed_demand (demand pressure)
-    with production_blueprint (per-brand 'increase production' verdict).
+    """Cross-brand under-supply by category x size, from raw witnessed
+    stockout_events (covers all ~20 stock-usable brands, not the 15-brand
+    revealed_demand product table). Joins the blueprint 'increase production'
+    flag where available (partial coverage).
 
-    Columns: category_normalized, stocked_out_size, brands (distinct brands
-    stocking out), market_stockouts (demand pressure — brand-weighted, so always
-    read it next to `brands`), products (breadth), brands_increase (brands the
-    blueprint flags 'increase production' for this cell), confidence (per-cell
-    tier). Sorted by demand pressure, strongest first.
+    Columns: category_normalized, stocked_out_size, brands, market_stockouts
+    (brand-weighted — read beside brands), products, brands_increase, confidence.
+    Exclusions come from the demand_grid SQL (single source)."""
+    g = demand_grid(conn, ["category_normalized", "size"], min_stockouts=5)
+    if g is None or g.empty:
+        return g
+    g = g[g["size"].notna() & ~g["size"].isin(["one_size", "kids_age", ""])].copy()
+    g = g.rename(columns={"size": "stocked_out_size", "stockouts": "market_stockouts"})
 
-    Exclusions come from P0's drop_excluded_stock() — the single source — applied
-    BEFORE aggregation. Deliberately does NOT use pct_size_specific_demand
-    (degenerate: == 100%% on every row; upstream fix pending)."""
-    rd = df_sql(conn, """
-        SELECT brand, category_normalized, stocked_out_size,
-               stockout_count, products_affected
-        FROM product_l2_09_revealed_demand
-        WHERE report_date = (SELECT max(report_date) FROM product_l2_09_revealed_demand)
-          AND stocked_out_size IS NOT NULL
-          AND stocked_out_size NOT IN ('one_size', 'kids_age', '')
-    """)
     bp = df_sql(conn, """
-        SELECT brand, category_normalized, stocked_out_size, production_signal
+        SELECT category_normalized, stocked_out_size,
+               count(*) FILTER (WHERE production_signal LIKE 'increase production%') AS brands_increase
         FROM product_l2_02_production_blueprint
         WHERE report_date = (SELECT max(report_date) FROM product_l2_02_production_blueprint)
+          AND brand NOT IN ('tree','dalydress')
+        GROUP BY 1, 2
     """)
-
-    rd = drop_excluded_stock(rd)
-    bp = drop_excluded_stock(bp)
-    if rd is None or rd.empty:
-        return rd
-
-    g = (rd.groupby(["category_normalized", "stocked_out_size"])
-            .agg(brands=("brand", "nunique"),
-                 market_stockouts=("stockout_count", "sum"),
-                 products=("products_affected", "sum"))
-            .reset_index())
-
-    inc = (bp[bp["production_signal"].str.startswith("increase production", na=False)]
-             .groupby(["category_normalized", "stocked_out_size"])["brand"]
-             .nunique().reset_index(name="brands_increase"))
-
-    g = g.merge(inc, on=["category_normalized", "stocked_out_size"], how="left")
+    if bp is not None and not bp.empty:
+        g = g.merge(bp, on=["category_normalized", "stocked_out_size"], how="left")
+    else:
+        g["brands_increase"] = 0
     g["brands_increase"] = g["brands_increase"].fillna(0).astype(int)
-    g["confidence"] = g["market_stockouts"].apply(cell_tier)
-
     return g.sort_values("market_stockouts", ascending=False).reset_index(drop=True)
 
 
@@ -369,7 +350,7 @@ def demand_grid(conn, group_cols, min_stockouts=10):
     retained stockout_events."""
     df = df_sql(conn, """
         SELECT p.category_normalized, p.subcategory, p.gender,
-               se.size, lower(trim(se.color)) AS color_raw, se.product_id
+               se.size, lower(trim(se.color)) AS color_raw, se.product_id, se.brand
         FROM stockout_events se
         JOIN products p ON p.id = se.product_id
         WHERE se.witnessed AND se.event_type = 'stockout'
@@ -380,7 +361,8 @@ def demand_grid(conn, group_cols, min_stockouts=10):
     if "color" in group_cols:
         df["color"] = df["color_raw"].map(canonical_color)
     g = (df.groupby(group_cols)
-           .agg(products=("product_id", "nunique"),
+           .agg(brands=("brand", "nunique"),
+                products=("product_id", "nunique"),
                 stockouts=("product_id", "size"))
            .reset_index())
     g = g[g["stockouts"] >= min_stockouts].copy()
@@ -449,6 +431,30 @@ def demand_trend(conn, group_cols, weeks=8, min_total=20):
     import pandas as _pd
     res = _pd.DataFrame(out)
     return res.sort_values("total", ascending=False).reset_index(drop=True) if not res.empty else res
+
+
+def bestsellers(conn, group_cols, rank_max=30, min_count=5):
+    """Market best-sellers = products on brands' own best-seller lists (latest
+    week, best rank <= rank_max), aggregated to a chosen grain. Proven demand,
+    complements under-supply; the overlap of the two is 'low-hanging fruit'.
+    group_cols is any subset of ['category_normalized','subcategory','gender'].
+    Phantom brands + uncategorized dropped."""
+    df = df_sql(conn, f"""
+        SELECT wbs.product_id, p.category_normalized, p.subcategory, p.gender
+        FROM weekly_bestseller_summary wbs
+        JOIN products p ON p.id = wbs.product_id
+        WHERE wbs.week_start = (SELECT max(week_start) FROM weekly_bestseller_summary)
+          AND wbs.rank_best <= {int(rank_max)}
+          AND wbs.brand NOT IN ('tree','dalydress')
+          AND p.category_normalized IS NOT NULL
+          AND p.category_normalized NOT IN ('uncategorized','')
+    """)
+    if df is None or df.empty:
+        return df
+    g = (df.groupby(group_cols)["product_id"].nunique()
+           .reset_index(name="bestsellers"))
+    return g[g["bestsellers"] >= min_count].sort_values(
+        "bestsellers", ascending=False).reset_index(drop=True)
 
 
 # ------------------------------------------------------------------ folders
