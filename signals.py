@@ -979,14 +979,6 @@ ORDER BY a.last_depth_pct DESC
     # LC Waikiki/Mobaco/Just SBR (their engines don't capture compare_at_
     # price at all — output correctly shows nothing for them, not a bug),
     # thin for dott_jeans/esla/khotwh (33-66% populated).
-    #
-    # SOURCE FIX 2026-08-08: was sourced from price_events_raw, which only
-    # holds a row when the ACTUAL price changes. An anchor rise on a flat
-    # selling price emits no price event, so this signal was structurally
-    # blind — 2 rows in 90 days, last write 2026-07-27, tripping the staleness
-    # check. Re-sourced from `snapshots` (one row per product-variant per DAY),
-    # where the anchor rise is always observable. Verified live: 7 write-days
-    # and 85 events across 6 brands in the trailing 10 days.
     # -------------------------------------------------------------------
     {
         "id": "l1_04",
@@ -999,51 +991,53 @@ ORDER BY a.last_depth_pct DESC
         "enabled": True,
         "requires": [],
         "sql": """
-            WITH daily AS (
-                -- Collapse variants to one row per product per DAY. snapshots is
-                -- variant-level; the anchor (compare_at) and the real price are
-                -- product-level facts, so take the day's MAX anchor and MIN real
-                -- price. One row per (product_id, snapshot_date) means the PK is
-                -- satisfied without a later dedup pass.
+            WITH ordered AS (
                 SELECT
-                    product_id, brand, snapshot_date,
-                    MAX(compare_at_price) AS compare_at_price,
-                    MIN(price)            AS price
-                FROM snapshots
-                WHERE compare_at_price IS NOT NULL
-                  AND price IS NOT NULL AND price > 0
-                  AND snapshot_date >= CURRENT_DATE - INTERVAL '{window_days} days'
-                GROUP BY product_id, brand, snapshot_date
-            ),
-            ordered AS (
-                SELECT
-                    product_id, brand, snapshot_date, compare_at_price, price,
+                    product_id, brand, recorded_at, price_after, compare_at_price,
                     LAG(compare_at_price) OVER (
-                        PARTITION BY product_id ORDER BY snapshot_date
+                        PARTITION BY product_id ORDER BY recorded_at
                     ) AS prev_compare_at,
-                    LAG(price) OVER (
-                        PARTITION BY product_id ORDER BY snapshot_date
+                    LAG(price_after) OVER (
+                        PARTITION BY product_id ORDER BY recorded_at
                     ) AS prev_price
-                FROM daily
+                FROM price_events_raw
+                WHERE compare_at_price IS NOT NULL
+                  AND CAST(recorded_at AS DATE) >= CURRENT_DATE - INTERVAL '{window_days} days'
+            ),
+            ranked AS (
+                -- FIXED 2026-07-21: a product can have more than one qualifying
+                -- inflation event on the same calendar day (confirmed live: 46
+                -- product-days). snapshot_date is a day, not an instant, so the
+                -- PK (product_id, snapshot_date) needs exactly one row per day.
+                -- Keep the largest inflation of the day; drop the rest.
+                SELECT
+                    o.product_id,
+                    o.brand,
+                    pd.name              AS product_name,
+                    pd.department,
+                    pd.category_normalized,
+                    pd.subcategory,
+                    o.prev_compare_at,
+                    o.compare_at_price   AS new_compare_at,
+                    o.price_after        AS actual_price,
+                    ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
+                          / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
+                    CAST(o.recorded_at AS DATE) AS snapshot_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY o.product_id, CAST(o.recorded_at AS DATE)
+                        ORDER BY (o.compare_at_price - o.prev_compare_at) DESC
+                    ) AS rn
+                FROM ordered o
+                JOIN products_dim pd ON pd.product_id = o.product_id
+                WHERE o.prev_compare_at IS NOT NULL
+                  AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
+                  AND o.price_after = o.prev_price             -- actual price UNCHANGED
             )
-            SELECT
-                o.product_id,
-                o.brand,
-                pd.name              AS product_name,
-                pd.department,
-                pd.category_normalized,
-                pd.subcategory,
-                o.prev_compare_at,
-                o.compare_at_price   AS new_compare_at,
-                o.price              AS actual_price,
-                ROUND(100.0 * (o.compare_at_price - o.prev_compare_at)
-                      / NULLIF(o.prev_compare_at, 0), 2) AS anchor_inflation_pct,
-                o.snapshot_date
-            FROM ordered o
-            JOIN products_dim pd ON pd.product_id = o.product_id
-            WHERE o.prev_compare_at IS NOT NULL
-              AND o.compare_at_price > o.prev_compare_at   -- anchor moved UP
-              AND o.price = o.prev_price                   -- actual price UNCHANGED
+            SELECT product_id, brand, product_name, department, category_normalized,
+                   subcategory, prev_compare_at, new_compare_at, actual_price,
+                   anchor_inflation_pct, snapshot_date
+            FROM ranked
+            WHERE rn = 1
         """,
     },
 
@@ -1821,28 +1815,33 @@ ORDER BY a.last_depth_pct DESC
     },
 
     # -------------------------------------------------------------------------
-    # L2 · CLEAR-RATE BY DISCOUNT DEPTH
+    # L2 · CLEAR-RATE BY DISCOUNT DEPTH  (episode-aligned, censored)
     #
-    # "At what discount depth do items in a category actually clear — and does
-    #  going deeper help?"
+    # "Of items discounted to depth B that had a fair chance to sell, what share
+    #  actually cleared within a fixed horizon of reaching that depth?"
     #
-    # For each product, take the DEEPEST honest discount it reached in the window
-    # (depth vs first_observed_price, the manipulation-resistant baseline — NEVER
-    # compare_at_price). Bucket products by that max depth, per category x gender,
-    # and measure what fraction had a WITNESSED on-discount stockout ("cleared").
+    # Per product: the DEEPEST honest discount reached in the window (vs
+    # first_observed_price — NEVER compare_at_price) and the DATE it was reached.
+    # "Cleared" = a WITNESSED on-discount stockout within HORIZON days of that
+    # date — so the clearance is tied to the same discount episode, not any
+    # stockout the product ever had.
     #
-    # INTERPRETATION (state this in client output — it is association, not cause):
-    # a product only reaches a deep bucket if shallower discounts did NOT clear it
-    # first. So a falling clear-rate at deeper buckets is the honest signature of
-    # the unsellable tail — deep markdowns do not rescue stock that already failed
-    # to move. Verified live 2026-08-08 on the hot window: trousers clear 48.8% at
-    # 0-10% depth but only ~4% past 30%.
+    # CENSORING (the reason this is trustworthy): a product only counts if it
+    # reached its depth at least HORIZON days before the window end — i.e. it had
+    # a full chance to clear. Without this, freshly-discounted items look like
+    # failures purely because we stopped watching, biasing every rate downward
+    # and worst for the newest data.
     #
-    # Brand is aggregated away here, so ALL excluded brands must be filtered IN
-    # this SQL (a downstream report cannot re-filter by brand): phantom (tree,
-    # dalydress) AND fabricated-stock (lc_waikiki, defacto, mobaco). This mirrors
-    # the inline convention of the other aggregate signals; when the exclusion
-    # list migrates to ref_excluded_brands, these literals migrate with them.
+    # This replaces an earlier "ever cleared" version whose deep buckets were
+    # inflated by time-exposure (older items had longer to sell) and could pair a
+    # depth with a stockout from a different episode. The corrected reading is
+    # CATEGORY x GENDER SPECIFIC — there is no single universal curve; some cells
+    # (women's dresses) fall with depth, others (men's shirts) do not.
+    #
+    # Brand is aggregated away, so ALL excluded brands are filtered INLINE
+    # (phantom: tree, dalydress; fabricated-stock: lc_waikiki, defacto, mobaco) —
+    # same convention as the other aggregate signals; migrate together when
+    # ref_excluded_brands lands. HORIZON = 21 days.
     # -------------------------------------------------------------------------
     {
         "id": "l2_clear_rate_by_depth", "name": "Clear-Rate by Discount Depth",
@@ -1850,7 +1849,7 @@ ORDER BY a.last_depth_pct DESC
         "table": "signal_l2_clear_rate_by_depth",
         "unique_on": ["category_normalized", "gender", "depth_bucket", "snapshot_date"],
         "window_days": 60,
-        "min_days": 14,
+        "min_days": 28,   # need history for a 60-day depth window + a 21-day horizon
         "enabled": True,
         "requires": [],
         "sql": """
@@ -1862,41 +1861,61 @@ ORDER BY a.last_depth_pct DESC
                   AND first_observed_price > 0
                 GROUP BY product_id
             ),
-            disc AS (
-                -- Per product: deepest honest discount reached in the window,
-                -- carrying its category and gender.
-                SELECT s.product_id,
-                       s.category_normalized,
-                       s.gender,
-                       MAX((b.baseline - s.price) / b.baseline) AS max_depth
+            depth_days AS (
+                SELECT s.product_id, s.category_normalized, s.gender,
+                       s.snapshot_date,
+                       (b.baseline - s.price) / b.baseline AS depth
                 FROM snapshots s
                 JOIN baseline b ON b.product_id = s.product_id
                 WHERE s.price > 0
                   AND s.price < b.baseline
                   AND s.brand NOT IN ('tree', 'dalydress',
                                       'lc_waikiki', 'defacto', 'mobaco')
-                GROUP BY s.product_id, s.category_normalized, s.gender
+            ),
+            peak AS (
+                -- Deepest discount each product reached, and WHEN it reached it.
+                SELECT product_id, category_normalized, gender,
+                       max_depth, reached_date
+                FROM (
+                    SELECT product_id, category_normalized, gender,
+                           depth AS max_depth, snapshot_date AS reached_date,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY product_id
+                               ORDER BY depth DESC, snapshot_date ASC
+                           ) AS rn
+                    FROM depth_days
+                ) WHERE rn = 1
+            ),
+            win AS (SELECT max(snapshot_date) AS window_end FROM snapshots),
+            eligible AS (
+                -- CENSORING: only products with a full 21-day chance to clear.
+                SELECT p.product_id, p.category_normalized, p.gender,
+                       p.max_depth, p.reached_date
+                FROM peak p, win w
+                WHERE p.reached_date <= w.window_end - 21
             ),
             cleared AS (
-                -- Witnessed on-discount stockouts. stock_events is already
-                -- witnessed-only (khabar_lake filters it), so no filter needed.
-                SELECT DISTINCT product_id
-                FROM stock_events
-                WHERE event_type = 'stockout' AND was_on_discount
+                -- Witnessed on-discount stockout within 21 days of reaching depth.
+                SELECT DISTINCT e.product_id
+                FROM eligible e
+                JOIN stock_events se
+                  ON se.product_id = e.product_id
+                 AND se.event_type = 'stockout'
+                 AND se.was_on_discount
+                 AND CAST(se.recorded_at AS DATE)
+                     BETWEEN e.reached_date AND e.reached_date + 21
             ),
             bucketed AS (
-                SELECT
-                    d.category_normalized,
-                    d.gender,
-                    CASE WHEN d.max_depth < 0.10 THEN '00-10'
-                         WHEN d.max_depth < 0.20 THEN '10-20'
-                         WHEN d.max_depth < 0.30 THEN '20-30'
-                         WHEN d.max_depth < 0.40 THEN '30-40'
-                         ELSE '40+' END              AS depth_bucket,
-                    count(*)                          AS products,
-                    count(c.product_id)               AS cleared
-                FROM disc d
-                LEFT JOIN cleared c ON c.product_id = d.product_id
+                SELECT e.category_normalized, e.gender,
+                    CASE WHEN e.max_depth < 0.10 THEN '00-10'
+                         WHEN e.max_depth < 0.20 THEN '10-20'
+                         WHEN e.max_depth < 0.30 THEN '20-30'
+                         WHEN e.max_depth < 0.40 THEN '30-40'
+                         ELSE '40+' END               AS depth_bucket,
+                    count(*)                           AS products,
+                    count(c.product_id)                AS cleared
+                FROM eligible e
+                LEFT JOIN cleared c ON c.product_id = e.product_id
                 GROUP BY 1, 2, 3
             )
             SELECT
@@ -1908,7 +1927,7 @@ ORDER BY a.last_depth_pct DESC
                 ROUND(100.0 * cleared / products, 1) AS clear_rate_pct,
                 CURRENT_DATE                         AS snapshot_date
             FROM bucketed
-            WHERE products >= 10   -- per-bucket sample floor; below this, a rate is noise
+            WHERE products >= 10   -- per-bucket sample floor
         """,
     },
 ]
