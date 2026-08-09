@@ -312,6 +312,82 @@ def market_undersupply(conn):
     return g.sort_values("market_stockouts", ascending=False).reset_index(drop=True)
 
 
+# ------------------------------------------------------------- P3: colour + grid
+# canonical_color(): raw colour strings are free-text (~3,800 distinct, incl.
+# Arabic and SKU codes). Collapses them to ~18 canonical colours by keyword,
+# FIRST match wins (specific before base). One place; any report/chatbot calls
+# it. Unmatched -> 'other' (shown as its own bucket, never hidden).
+_COLOR_RULES = [
+    ("اسود", "black"), ("black", "black"),
+    ("off white", "white"), ("offwhite", "white"), ("ecru", "white"),
+    ("cream", "white"), ("ivory", "white"), ("white", "white"),
+    ("navy", "navy"),
+    ("denim", "blue"), ("indigo", "blue"), ("turquoise", "blue"),
+    ("petrol", "blue"), ("blue", "blue"),
+    ("vison", "beige"), ("nude", "beige"), ("sand", "beige"), ("tan", "beige"),
+    ("stone", "beige"), ("biscuit", "beige"), ("beige", "beige"),
+    ("anthracite", "grey"), ("charcoal", "grey"), ("grey", "grey"),
+    ("gray", "grey"), ("silver", "grey"),
+    ("coffee", "brown"), ("camel", "brown"), ("chocolate", "brown"),
+    ("mink", "brown"), ("taupe", "brown"), ("brown", "brown"),
+    ("khaki", "olive"), ("olive", "olive"),
+    ("mint", "green"), ("teal", "green"), ("emerald", "green"), ("green", "green"),
+    ("rose", "pink"), ("fuchsia", "pink"), ("fuschia", "pink"),
+    ("magenta", "pink"), ("salmon", "pink"), ("pink", "pink"),
+    ("burgundy", "red"), ("maroon", "red"), ("wine", "red"),
+    ("crimson", "red"), ("bordeaux", "red"), ("red", "red"),
+    ("mustard", "yellow"), ("gold", "yellow"), ("yellow", "yellow"),
+    ("peach", "orange"), ("coral", "orange"), ("apricot", "orange"),
+    ("orange", "orange"),
+    ("lilac", "purple"), ("lavender", "purple"), ("mauve", "purple"),
+    ("violet", "purple"), ("plum", "purple"), ("purple", "purple"),
+    ("multi", "multi"), ("colored", "multi"), ("colour", "multi"),
+    ("print", "multi"), ("floral", "multi"), ("striped", "multi"),
+]
+
+
+def canonical_color(raw):
+    if not raw:
+        return "other"
+    c = str(raw).strip().lower()
+    if not c:
+        return "other"
+    for kw, canon in _COLOR_RULES:
+        if kw in c:
+            return canon
+    return "other"
+
+
+def demand_grid(conn, group_cols, min_stockouts=10):
+    """Cross-brand witnessed demand at a chosen grain. group_cols is any subset of
+    ['category_normalized','subcategory','gender','color','size']. Returns that
+    grain with products (distinct), stockouts (events), confidence (per cell).
+
+    Colour normalised via canonical_color(); brand aggregated away so the five
+    stock-excluded brands are filtered in SQL. subcategory is ~49% populated
+    upstream, so a report using it must disclose coverage. Reads the 60-day
+    retained stockout_events."""
+    df = df_sql(conn, """
+        SELECT p.category_normalized, p.subcategory, p.gender,
+               se.size, lower(trim(se.color)) AS color_raw, se.product_id
+        FROM stockout_events se
+        JOIN products p ON p.id = se.product_id
+        WHERE se.witnessed AND se.event_type = 'stockout'
+          AND se.brand NOT IN ('tree','dalydress','lc_waikiki','defacto','mobaco')
+    """)
+    if df is None or df.empty:
+        return df
+    if "color" in group_cols:
+        df["color"] = df["color_raw"].map(canonical_color)
+    g = (df.groupby(group_cols)
+           .agg(products=("product_id", "nunique"),
+                stockouts=("product_id", "size"))
+           .reset_index())
+    g = g[g["stockouts"] >= min_stockouts].copy()
+    g["confidence"] = g["stockouts"].apply(cell_tier)
+    return g.sort_values("stockouts", ascending=False).reset_index(drop=True)
+
+
 # ------------------------------------------------------------------ folders
 def build_run_dir(slug, cadence):
     """cadence: 'weekly' -> YYYY-MM-DD, 'monthly' -> YYYY-MM."""
