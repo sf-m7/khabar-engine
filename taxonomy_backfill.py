@@ -8,23 +8,18 @@ then audits the results. Designed to be:
   - IDEMPOTENT: safe to run repeatedly; only touches rows still unresolved.
   - DICTIONARY-DRIVEN: every AI answer is written into color_map /
     category_map so the daily scraper inherits the knowledge for free.
-  - CONSTRAINED: Gemini may ONLY pick from the frozen taxonomy. Any
     invented label is rejected and the row stays unclassified.
-  - BUDGET-GUARDED: hard cap on API calls per run (MAX_GEMINI_CALLS).
 
 Passes (run in this order):
-  colors         Gemini reads the 1,633 unclassified color names -> color_map -> stamps variants
+  colors         deterministic keyword rules -> color_map -> stamps variants
   subcat-rules   FREE deterministic title-keyword rules -> subcategories (no AI)
-  subcat-text    Gemini reads title+category for products still NULL (cheap)
-  subcat-vision  Gemini LOOKS at product images for the final holdouts (CV)
+  subcat-text    deterministic title-keyword rules for remaining NULLs
   audit          Random sample per category, vision-verified accuracy report
   all            Everything above, in order
 
 Usage:  python taxonomy_backfill.py --pass colors
-Env:    SUPABASE_DB_URL              (Postgres connection string)
+Env:    KHABAR_DB_URL                (Postgres connection string)
         GOOGLE_SERVICE_ACCOUNT_KEY   (preferred: Vertex AI, uses $300 credits)
-        GEMINI_API_KEY               (fallback: free tier, small daily quota)
-        MAX_GEMINI_CALLS             (optional, default 5000)
 """
 
 import argparse
@@ -43,26 +38,7 @@ import requests
 # Configuration
 # ----------------------------------------------------------------------
 DB_URL = os.environ.get("KHABAR_DB_URL", "").strip() or os.environ.get("SUPABASE_DB_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SERVICE_ACCOUNT_KEY = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
-MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "5000"))
-
-GEMINI_MODEL = "gemini-2.5-flash"
-VERTEX_REGION = "global"  # 'global' endpoint has better shared capacity than us-central1
-
-CALLS_MADE = 0
-_LAST_CALL_AT = 0.0
-_PRINTED_429_BODY = False  # print Google's full explanation once
-
-# Backend state (set by _init_backend at startup)
-_BACKEND = None          # "vertex" or "apikey"
-_ACCESS_TOKEN = None
-_TOKEN_EXPIRY = 0.0
-_PROJECT_ID = None
-
-# Pacing between calls. Vertex paid tier is generous; free tier is not.
-MIN_CALL_INTERVAL_VERTEX = 1.0
-MIN_CALL_INTERVAL_APIKEY = 5.0
 
 # ---------------- FROZEN COLOR TAXONOMY (approved by Mohammed) --------
 COLOR_FAMILIES = [
@@ -350,190 +326,9 @@ def db():
     return psycopg2.connect(DB_URL, sslrootcert=CA_BUNDLE)
 
 
-def _init_backend():
-    """Pick the best available lane, once, at startup.
-    Vertex AI (the $300 credits) if the service account key exists;
-    otherwise fall back to the free-tier API key."""
-    global _BACKEND
-    if SERVICE_ACCOUNT_KEY:
-        _refresh_vertex_token()
-        _BACKEND = "vertex"
-        print(f"  backend: Vertex AI / paid credits (project: {_PROJECT_ID})")
-    elif GEMINI_API_KEY:
-        _BACKEND = "apikey"
-        print("  backend: API key / free tier (small daily quota — "
-              "expect slow progress and possible daily cutoffs)")
-    else:
-        sys.exit(
-            "ERROR: no Google credentials found. Add either "
-            "GOOGLE_SERVICE_ACCOUNT_KEY (preferred) or GEMINI_API_KEY "
-            "as a repository secret."
-        )
-
-
-def _refresh_vertex_token():
-    """Log in as the service account and get a fresh access token."""
-    global _ACCESS_TOKEN, _TOKEN_EXPIRY, _PROJECT_ID
-    from google.oauth2 import service_account
-    from google.auth.transport.requests import Request
-
-    info = json.loads(SERVICE_ACCOUNT_KEY)
-    _PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT") or info.get("project_id")
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    creds.refresh(Request())
-    _ACCESS_TOKEN = creds.token
-    _TOKEN_EXPIRY = time.monotonic() + 3000  # refresh well before the 1h expiry
-
-
 def _request_target():
     """Return (url, headers, params) for whichever lane we're on."""
-    if _BACKEND == "vertex":
-        global _ACCESS_TOKEN
-        if time.monotonic() > _TOKEN_EXPIRY:
-            print("  refreshing Vertex AI token ...")
-            _refresh_vertex_token()
-        url = (
-            f"https://aiplatform.googleapis.com/v1/"
-            f"projects/{_PROJECT_ID}/locations/global/"
-            f"publishers/google/models/{GEMINI_MODEL}:generateContent"
-        ) if VERTEX_REGION == "global" else (
-            f"https://{VERTEX_REGION}-aiplatform.googleapis.com/v1/"
-            f"projects/{_PROJECT_ID}/locations/{VERTEX_REGION}/"
-            f"publishers/google/models/{GEMINI_MODEL}:generateContent"
-        )
-        return url, {"Authorization": f"Bearer {_ACCESS_TOKEN}",
-                     "Content-Type": "application/json"}, None
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
-    return url, {"Content-Type": "application/json"}, {"key": GEMINI_API_KEY}
-
-
-def gemini(prompt_parts, expect_json=True, retries=6):
-    """One Gemini call: budget guard, pacing, backoff, verbose errors."""
-    global CALLS_MADE, _LAST_CALL_AT, _PRINTED_429_BODY
-    if CALLS_MADE >= MAX_GEMINI_CALLS:
-        raise RuntimeError(
-            f"Budget guard: reached MAX_GEMINI_CALLS={MAX_GEMINI_CALLS}. "
-            "Re-run later to continue (the script resumes where it stopped)."
-        )
-
-    interval = (MIN_CALL_INTERVAL_VERTEX if _BACKEND == "vertex"
-                else MIN_CALL_INTERVAL_APIKEY)
-    elapsed = time.monotonic() - _LAST_CALL_AT
-    if elapsed < interval:
-        time.sleep(interval - elapsed)
-
-    body = {"contents": [{"role": "user", "parts": prompt_parts}]}
-    for attempt in range(retries):
-        _LAST_CALL_AT = time.monotonic()
-        url, headers, params = _request_target()
-        try:
-            resp = requests.post(url, headers=headers, params=params,
-                                 json=body, timeout=120)
-        except requests.exceptions.RequestException as e:
-            wait = 20 * (attempt + 1)
-            print(f"  network error ({e.__class__.__name__}), waiting {wait}s ...")
-            time.sleep(wait)
-            continue
-
-        if resp.status_code == 403:
-            # Permission problem: retrying won't help. Print Google's own
-            # explanation and stop with clear guidance.
-            print("\n  === GOOGLE'S FULL EXPLANATION (403) ===")
-            print(f"  {resp.text[:1200]}")
-            print("  =======================================\n")
-            raise RuntimeError(
-                "Google refused for permission reasons (403). The message "
-                "above says exactly why. Most common fix: in Google Cloud "
-                "Console -> IAM, confirm the khabar-backfill service "
-                "account has the Editor role, save, wait 3 minutes, re-run."
-            )
-
-        if resp.status_code == 429 or resp.status_code >= 500:
-            if resp.status_code == 429 and not _PRINTED_429_BODY:
-                _PRINTED_429_BODY = True
-                print("\n  === GOOGLE'S FULL EXPLANATION (429, printed once) ===")
-                print(f"  {resp.text[:1200]}")
-                print("  =====================================================\n")
-            wait = min(20 * (attempt + 1), 90)
-            print(f"  Gemini busy (HTTP {resp.status_code}), waiting {wait}s ...")
-            time.sleep(wait)
-            continue
-
-        if resp.status_code != 200:
-            print(f"  ERROR {resp.status_code}: {resp.text[:500]}")
-            resp.raise_for_status()
-
-        CALLS_MADE += 1
-        data = resp.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            return None
-        if not expect_json:
-            return text
-        cleaned = re.sub(r"```json|```", "", text).strip()
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            return None
-    raise RuntimeError(
-        "Gemini stayed unavailable after 6 patient retries. If the printed "
-        "explanation above mentions a DAILY limit, waiting within the run "
-        "cannot help — re-run tomorrow, or switch to the Vertex lane. "
-        "Nothing is lost; the script resumes where it stopped."
-    )
-
-
-def fetch_image_b64(url):
-    """Download a product image, downscale it, return (base64, mime) or None.
-    Smaller images = smaller requests = less likely to hit Vertex quota."""
-    import base64
-    import io
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        try:
-            from PIL import Image
-            im = Image.open(io.BytesIO(r.content))
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            im.thumbnail((512, 512))  # long edge max 512px — plenty for classification
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=80)
-            return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
-        except Exception:
-            # If PIL isn't available or image is odd, fall back to raw bytes
-            mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
-            if not mime.startswith("image/"):
-                mime = "image/jpeg"
-            return base64.b64encode(r.content).decode(), mime
-    except Exception:
-        return None
-
-
-# ----------------------------------------------------------------------
-# PASS 1: colors — clear the color_map queue with Gemini (text only)
-# ----------------------------------------------------------------------
-def pass_colors():
-    print("== PASS colors: classifying unclassified color names ==")
-    conn = db()
-    cur = conn.cursor()
-
-    # v14.22 fix: previously, a brand's raw colour strings only entered
-    # color_map if someone manually inserted them — there was no automatic
-    # path from "new colour appears in product_variants" to "queued for
-    # classification". This silently stranded every new brand's colours
-    # (found live: premoda and tie_house both had classified matches
-    # sitting unused in color_map, plus colour names color_map had never
-    # even seen). This step closes that gap for good: any raw colour
-    # currently on a variant that color_map doesn't know about yet gets
-    # queued as 'unclassified'. Idempotent — ON CONFLICT DO NOTHING means
-    # re-running this is always safe and touches only genuinely new names.
+    # Seed any new raw colours from variants into color_map
     cur.execute(
         """INSERT INTO color_map (color_raw, status, source, created_at, updated_at)
            SELECT DISTINCT LOWER(TRIM(pv.color)), 'unclassified', 'auto_seed', now(), now()
@@ -545,92 +340,112 @@ def pass_colors():
     conn.commit()
 
     cur.execute(
-        "SELECT color_raw FROM color_map WHERE status = 'unclassified' "
-        "ORDER BY color_raw"
+        "SELECT color_raw FROM color_map WHERE status = 'unclassified' ORDER BY color_raw"
     )
     queue = [r[0] for r in cur.fetchall()]
     print(f"  queue size: {len(queue)} names")
 
-    BATCH = 80
-    resolved = 0
-    for i in range(0, len(queue), BATCH):
-        batch = queue[i : i + BATCH]
-        prompt = f"""You classify fashion color names from Egyptian clothing
-brands (names may be English, Arabic, misspelled, or transliterated).
+    # Keyword rules aligned to COLOR_FAMILIES. Order matters: specific before
+    # generic (e.g. "off white" before "white", "navy" before general blue).
+    RULES = [
+        # Arabic
+        ("\u0627\u0633\u0648\u062f", "black"), ("\u0627\u0628\u064a\u0636", "white"),
+        # blacks
+        ("black", "black"),
+        # whites (off-white, ecru, cream, ivory before "white")
+        ("off white", "white"), ("offwhite", "white"), ("ecru", "white"),
+        ("cream", "white"), ("ivory", "white"), ("white", "white"),
+        # greys
+        ("anthracite", "grey"), ("charcoal", "grey"), ("silver", "grey"),
+        ("grey", "grey"), ("gray", "grey"),
+        # beiges
+        ("vison", "beige"), ("nude", "beige"), ("sand", "beige"), ("tan", "beige"),
+        ("stone", "beige"), ("biscuit", "beige"), ("caramel", "beige"), ("beige", "beige"),
+        # browns
+        ("coffee", "brown"), ("camel", "brown"), ("chocolate", "brown"),
+        ("mink", "brown"), ("taupe", "brown"), ("mocha", "brown"), ("brown", "brown"),
+        # blues (teal separate in COLOR_FAMILIES)
+        ("teal", "teal"), ("turquoise", "teal"),
+        ("navy", "blue"), ("denim", "blue"), ("indigo", "blue"),
+        ("cobalt", "blue"), ("petrol", "blue"), ("sky", "blue"), ("blue", "blue"),
+        # greens
+        ("khaki", "green"), ("olive", "green"), ("mint", "green"),
+        ("emerald", "green"), ("sage", "green"), ("green", "green"),
+        # yellows
+        ("mustard", "yellow"), ("gold", "yellow"), ("lemon", "yellow"), ("yellow", "yellow"),
+        # oranges
+        ("peach", "orange"), ("coral", "orange"), ("apricot", "orange"),
+        ("rust", "orange"), ("terracotta", "orange"), ("orange", "orange"),
+        # reds (burgundy separate in COLOR_FAMILIES)
+        ("burgundy", "burgundy"), ("maroon", "burgundy"), ("wine", "burgundy"),
+        ("bordeaux", "burgundy"),
+        ("crimson", "red"), ("red", "red"),
+        # pinks
+        ("rose", "pink"), ("fuchsia", "pink"), ("fuschia", "pink"),
+        ("magenta", "pink"), ("salmon", "pink"), ("blush", "pink"), ("pink", "pink"),
+        # purples
+        ("lilac", "purple"), ("lavender", "purple"), ("mauve", "purple"),
+        ("violet", "purple"), ("plum", "purple"), ("purple", "purple"),
+        # metallics
+        ("metallic", "metallic"), ("chrome", "metallic"), ("copper", "metallic"),
+        ("bronze", "metallic"),
+        # multi
+        ("multi", "multi"), ("colored", "multi"), ("colour", "multi"),
+        ("print", "multi"), ("floral", "multi"), ("striped", "multi"),
+        ("pattern", "multi"), ("tie dye", "multi"), ("camo", "multi"),
+    ]
 
-Allowed families (you MUST pick from this list, nothing else):
-{json.dumps(COLOR_FAMILIES)}
-
-Rules:
-- "shade" is a short child name (e.g. "baby blue", "olive", "mustard") or null.
-- If the name lists TWO colors (e.g. "white/navy", "أبيض * أسود"): the FIRST
-  listed color is the family, set is_compound=true and secondary_family to
-  the second color's family.
-- If it is a size, a product code, or meaningless: status="junk".
-- If genuinely a color but you are not confident of the family:
-  status="unclassified".
-- Otherwise status="classified".
-
-Respond ONLY with a JSON array, no markdown, one object per input name:
-[{{"raw": "...", "family": "...", "shade": "... or null",
-   "is_compound": false, "secondary_family": null, "status": "classified"}}]
-
-Names to classify:
-{json.dumps(batch, ensure_ascii=False)}"""
-
-        result = gemini([{"text": prompt}])
-        if not isinstance(result, list):
-            print(f"  batch {i//BATCH+1}: bad response, skipping (will retry next run)")
+    classified = 0
+    junk_markers = ["size", "cm", "ml", "kg", "pcs", "/", "x ", "0x"]
+    for raw in queue:
+        c = raw.strip().lower()
+        if not c or len(c) <= 1:
+            cur.execute(
+                "UPDATE color_map SET status='junk', source='keyword', updated_at=now() "
+                "WHERE color_raw=%s AND status='unclassified'", (raw,))
             continue
-
-        for item in result:
-            raw = (item.get("raw") or "").strip().lower()
-            fam = item.get("family")
-            status = item.get("status", "unclassified")
-            # HARD VALIDATION: invented family => stays unclassified
-            if status == "classified" and fam not in COLOR_FAMILIES:
-                status, fam = "unclassified", None
-            if status not in ("classified", "junk", "unclassified"):
-                status = "unclassified"
-            sec = item.get("secondary_family")
-            if sec not in COLOR_FAMILIES:
-                sec = None
+        # Junk detection (size codes, SKUs)
+        if any(m in c for m in junk_markers) or c.replace(".", "").replace("-", "").isdigit():
+            cur.execute(
+                "UPDATE color_map SET status='junk', source='keyword', updated_at=now() "
+                "WHERE color_raw=%s AND status='unclassified'", (raw,))
+            continue
+        # Keyword match
+        family = None
+        for kw, fam in RULES:
+            if kw in c:
+                family = fam
+                break
+        if family and family in COLOR_FAMILIES:
+            # Shade = the raw name itself (compact)
             cur.execute(
                 """UPDATE color_map
-                   SET color_family=%s, color_shade=%s, is_compound=%s,
-                       secondary_family=%s, status=%s,
-                       source='gemini_text', updated_at=now()
+                   SET color_family=%s, color_shade=%s, is_compound=false,
+                       secondary_family=NULL, status='classified',
+                       source='keyword', updated_at=now()
                    WHERE color_raw=%s AND status='unclassified'""",
-                (fam if status == "classified" else None,
-                 item.get("shade") if status == "classified" else None,
-                 bool(item.get("is_compound")), sec, status, raw),
-            )
-            resolved += cur.rowcount
-        conn.commit()
-        print(f"  batch {i//BATCH+1}: done ({resolved} rows updated so far)")
-        time.sleep(1)
+                (family, raw, raw))
+            classified += cur.rowcount
+        # else: stays unclassified — will be visible in audit
 
-    # Stamp variants from every newly classified name (direct connection:
-    # no 8-second API timeout applies here).
+    conn.commit()
+    print(f"  keyword-classified: {classified}")
+
+    # Stamp variants from the updated dictionary
     print("  stamping variants from the updated dictionary ...")
     cur.execute(
         """UPDATE product_variants v
            SET color_family=m.color_family, color_shade=m.color_shade
            FROM color_map m
            WHERE m.status='classified'
-             AND v.color_family IS NULL
-             AND LOWER(TRIM(v.color))=m.color_raw"""
+             AND LOWER(TRIM(v.color)) = m.color_raw
+             AND (v.color_family IS NULL OR v.color_family <> m.color_family)"""
     )
-    print(f"  variants newly stamped: {cur.rowcount}")
+    print(f"  variants updated: {cur.rowcount}")
     conn.commit()
-
-    cur.execute("SELECT status, COUNT(*) FROM color_map GROUP BY status")
-    print("  color_map now:", dict(cur.fetchall()))
     conn.close()
 
 
-# ----------------------------------------------------------------------
-# PASS 2: subcat-rules — FREE deterministic title rules (no AI)
 # ----------------------------------------------------------------------
 def pass_subcat_rules():
     print("== PASS subcat-rules: free keyword rules on titles ==")
@@ -668,16 +483,17 @@ def pass_subcat_rules():
 
 
 # ----------------------------------------------------------------------
-# PASS 3: subcat-text — Gemini reads title + raw category (cheap)
+# PASS 3: subcat-text — deterministic title rules (no AI)
 # ----------------------------------------------------------------------
 def pass_subcat_text():
-    print("== PASS subcat-text: Gemini on titles for remaining NULLs ==")
+    """Deterministic title-keyword subcategory classifier — replaces Gemini.
+    Applies TITLE_RULES to products with no subcategory, per category. Same
+    approach as pass_subcat_rules but runs AFTER it to catch any new products."""
+    print("== PASS subcat-text: deterministic title rules (no AI) ==")
     conn = db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    import re as _re
 
-    # Process ONE CATEGORY at a time. This lets us state the allowed
-    # subcategories once and send only compact "id|title" pairs — cutting
-    # tokens per call by ~10x compared to the old approach.
     for cat, allowed in SUBCATS.items():
         cur.execute(
             """SELECT id, name FROM products
@@ -689,207 +505,33 @@ def pass_subcat_text():
         rows = cur.fetchall()
         if not rows:
             continue
-        print(f"  {cat}: {len(rows)} products to classify")
-
-        BATCH = 60  # just "id|title" per line = very compact
+        # Build category-specific rules from TITLE_RULES
+        cat_rules = [(regex, subcat, prio) for (c, regex, subcat, prio)
+                     in TITLE_RULES if c == cat]
+        cat_rules.sort(key=lambda x: x[2])
         done = 0
-        for i in range(0, len(rows), BATCH):
-            batch = rows[i : i + BATCH]
-            # Ultra-compact format: one line per product, just id|title
-            lines = "\n".join(f'{r["id"]}|{r["name"]}' for r in batch)
-            prompt = (
-                f'Category: {cat}. Pick ONE subcategory from: '
-                f'{json.dumps(allowed)}. '
-                f'For each line (id|title), return JSON: '
-                f'[{{"id":N,"s":"value-or-null"}}]. '
-                f'No markdown.\n{lines}'
-            )
-
-            result = gemini([{"text": prompt}])
-            if not isinstance(result, list):
-                print(f"    batch {i//BATCH+1}: bad response, skipping")
-                continue
-            ok = set(allowed)
-            for item in result:
-                pid = item.get("id")
-                sub = item.get("s")
-                if pid and sub in ok:
+        for r in rows:
+            title = (r["name"] or "").lower()
+            for regex, subcat, _ in cat_rules:
+                if _re.search(regex, title):
                     cur.execute(
-                        "UPDATE products SET subcategory=%s "
-                        "WHERE id=%s AND subcategory IS NULL",
-                        (sub, pid),
-                    )
+                        "UPDATE products SET subcategory=%s WHERE id=%s AND subcategory IS NULL",
+                        (subcat, r["id"]))
                     done += cur.rowcount
-            conn.commit()
-            print(f"    batch {i//BATCH+1}/{(len(rows)-1)//BATCH+1}: "
-                  f"classified {done} so far")
+                    break
+        conn.commit()
+        if done:
+            print(f"  {cat}: classified {done} of {len(rows)}")
     _subcat_progress(cur)
     conn.close()
 
 
-# ----------------------------------------------------------------------
-# PASS 4: subcat-vision — Gemini LOOKS at the product image (CV)
-# ----------------------------------------------------------------------
-def pass_subcat_vision(limit=4000):
-    print("== PASS subcat-vision: computer vision on remaining NULLs ==")
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cats = list(SUBCATS.keys())
-    cur.execute(
-        """SELECT id, name, image_url, LOWER(TRIM(category_normalized)) AS cat
-           FROM products
-           WHERE subcategory IS NULL AND is_active = true
-             AND image_url IS NOT NULL
-             AND LOWER(TRIM(category_normalized)) = ANY(%s)
-           ORDER BY id LIMIT %s""",
-        (cats, limit),
-    )
-    rows = cur.fetchall()
-    print(f"  products going to vision this run: {len(rows)}")
-
-    done = 0
-    for r in rows:
-        img = fetch_image_b64(r["image_url"])
-        if not img:
-            continue
-        b64, mime = img
-        allowed = SUBCATS[r["cat"]]
-        prompt = (
-            f'This is a product photo of a "{r["cat"]}" item titled '
-            f'"{r["name"]}" from an Egyptian fashion store. Look at the image '
-            f"and pick exactly ONE subcategory from this list: "
-            f"{json.dumps(allowed)}. If the image does not clearly answer, "
-            'respond null. Respond ONLY with JSON: {"subcategory": "..."} '
-            'or {"subcategory": null}. No markdown.'
-        )
-        result = gemini([
-            {"inline_data": {"mime_type": mime, "data": b64}},
-            {"text": prompt},
-        ])
-        sub = result.get("subcategory") if isinstance(result, dict) else None
-        if sub in allowed:
-            cur.execute(
-                "UPDATE products SET subcategory=%s "
-                "WHERE id=%s AND subcategory IS NULL",
-                (sub, r["id"]),
-            )
-            done += cur.rowcount
-            conn.commit()
-        if done and done % 200 == 0:
-            print(f"  vision-classified so far: {done}")
-        time.sleep(0.6)
-    print(f"  vision-classified total: {done}")
-    _subcat_progress(cur)
-    conn.close()
 
 
-# ----------------------------------------------------------------------
-# PASS 5: audit — sample every category, vision-verify the CATEGORY label
-# ----------------------------------------------------------------------
-def pass_audit(sample_per_cat=40):
-    print("== PASS audit: vision spot-check of category labels ==")
-    conn = db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS taxonomy_audit (
-             id bigserial PRIMARY KEY,
-             product_id bigint,
-             category_label text,
-             vision_verdict text,
-             agrees boolean,
-             audited_at timestamptz DEFAULT now())"""
-    )
-    conn.commit()
-
-    cur.execute(
-        """SELECT DISTINCT LOWER(TRIM(category_normalized)) AS cat
-           FROM products WHERE category_normalized IS NOT NULL
-             AND LOWER(TRIM(category_normalized)) NOT IN ('uncategorized','other')"""
-    )
-    cats = [r["cat"] for r in cur.fetchall()]
-    all_cats_json = json.dumps(cats)
-
-    report = {}
-    for cat in cats:
-        cur.execute(
-            """SELECT id, name, image_url FROM products
-               WHERE LOWER(TRIM(category_normalized))=%s AND is_active=true
-                 AND image_url IS NOT NULL
-               ORDER BY random() LIMIT %s""",
-            (cat, sample_per_cat),
-        )
-        sample = cur.fetchall()
-        agree = checked = 0
-        for r in sample:
-            img = fetch_image_b64(r["image_url"])
-            if not img:
-                continue
-            b64, mime = img
-            prompt = (
-                f"Product photo from an Egyptian fashion store, titled "
-                f'"{r["name"]}". Which single category from this list best '
-                f"matches what you SEE: {all_cats_json}? Respond ONLY with "
-                'JSON: {"category": "..."}. No markdown.'
-            )
-            result = gemini([
-                {"inline_data": {"mime_type": mime, "data": b64}},
-                {"text": prompt},
-            ])
-            verdict = result.get("category") if isinstance(result, dict) else None
-            if verdict is None:
-                continue
-            checked += 1
-            ok = verdict == cat
-            agree += int(ok)
-            cur.execute(
-                """INSERT INTO taxonomy_audit
-                   (product_id, category_label, vision_verdict, agrees)
-                   VALUES (%s,%s,%s,%s)""",
-                (r["id"], cat, verdict, ok),
-            )
-            conn.commit()
-            time.sleep(0.6)
-        pct = round(agree / checked * 100, 1) if checked else None
-        report[cat] = {"checked": checked, "agree_pct": pct}
-        print(f"  {cat}: {agree}/{checked} agree ({pct}%)")
-
-    print("\n== AUDIT SUMMARY (full detail in taxonomy_audit table) ==")
-    flagged = {c: v for c, v in report.items()
-               if v["agree_pct"] is not None and v["agree_pct"] < 90}
-    if flagged:
-        print("  CATEGORIES NEEDING ATTENTION (<90% agreement):")
-        for c, v in flagged.items():
-            print(f"   - {c}: {v['agree_pct']}%")
-    else:
-        print("  All sampled categories >= 90% agreement.")
-    conn.close()
-
-
-# ----------------------------------------------------------------------
-def _subcat_progress(cur):
-    cur.execute(
-        """SELECT LOWER(TRIM(category_normalized)) AS cat,
-                  COUNT(*) AS total,
-                  COUNT(subcategory) AS filled
-           FROM products
-           WHERE LOWER(TRIM(category_normalized)) = ANY(%s) AND is_active=true
-           GROUP BY 1 ORDER BY total DESC""",
-        (list(SUBCATS.keys()),),
-    )
-    print("  subcategory progress:")
-    for cat, total, filled in cur.fetchall():
-        pct = round(filled / total * 100, 1) if total else 0
-        print(f"   {cat:<12} {filled}/{total} ({pct}%)")
-
-
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--pass", dest="which", required=True,
-                    choices=["colors", "sizes", "subcat-rules", "subcat-text",
-                             "subcat-vision", "audit", "all"])
-    ap.add_argument("--vision-limit", type=int, default=4000)
-    ap.add_argument("--audit-sample", type=int, default=40)
+                    choices=["colors", "sizes", "subcat-rules", "subcat-text", "all"])
     args = ap.parse_args()
 
     steps = {
@@ -897,16 +539,10 @@ if __name__ == "__main__":
         "sizes": pass_sizes,
         "subcat-rules": pass_subcat_rules,
         "subcat-text": pass_subcat_text,
-        "subcat-vision": lambda: pass_subcat_vision(args.vision_limit),
-        "audit": lambda: pass_audit(args.audit_sample),
     }
-    order = (["colors", "sizes", "subcat-rules", "subcat-text", "subcat-vision",
-              "audit"] if args.which == "all" else [args.which])
-
-    # Pick the Google lane (skip for the no-AI deterministic passes)
-    if any(p not in ("subcat-rules", "sizes") for p in order):
-        _init_backend()
+    order = (["colors", "sizes", "subcat-rules", "subcat-text"]
+             if args.which == "all" else [args.which])
 
     for name in order:
         steps[name]()
-    print(f"\nDone. Gemini calls used this run: {CALLS_MADE}")
+    print("\nDone (zero AI calls — fully deterministic).")

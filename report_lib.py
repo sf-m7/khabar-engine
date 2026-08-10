@@ -350,8 +350,10 @@ def demand_grid(conn, group_cols, min_stockouts=10):
     retained stockout_events."""
     df = df_sql(conn, """
         SELECT p.category_normalized, p.subcategory, p.gender,
-               se.size, lower(trim(se.color)) AS color_raw, se.product_id, se.brand
+               se.size, lower(trim(se.color)) AS color_raw,
+               pv.color_family, se.product_id, se.brand
         FROM stockout_events se
+        LEFT JOIN product_variants pv ON pv.id = se.variant_id
         JOIN products p ON p.id = se.product_id
         WHERE se.witnessed AND se.event_type = 'stockout'
           AND se.brand NOT IN ('tree','dalydress','lc_waikiki','defacto','mobaco')
@@ -359,7 +361,8 @@ def demand_grid(conn, group_cols, min_stockouts=10):
     if df is None or df.empty:
         return df
     if "color" in group_cols:
-        df["color"] = df["color_raw"].map(canonical_color)
+        df["color"] = df["color_family"].fillna(df["color_raw"].map(canonical_color))
+        df["color"] = df["color"].fillna("other")
     g = (df.groupby(group_cols)
            .agg(brands=("brand", "nunique"),
                 products=("product_id", "nunique"),
@@ -376,7 +379,7 @@ def color_price(conn, min_n=25):
     n, med. Price-based, so only phantom brands (scope 'all') are dropped."""
     df = df_sql(conn, """
         SELECT p.category_normalized, ps.product_id, ps.price,
-               lower(trim(pv.color)) AS color_raw
+               pv.color_family, lower(trim(pv.color)) AS color_raw
         FROM price_snapshots ps
         JOIN products p  ON p.id = ps.product_id
         JOIN product_variants pv ON pv.product_id = ps.product_id
@@ -386,8 +389,8 @@ def color_price(conn, min_n=25):
     """)
     if df is None or df.empty:
         return df
-    df["color"] = df["color_raw"].map(canonical_color)
-    df = df[df["color"] != "other"].drop_duplicates(["product_id", "color"])
+    df["color"] = df["color_family"].fillna(df["color_raw"].map(canonical_color))
+    df = df[df["color"].notna() & (df["color"] != "other")].drop_duplicates(["product_id", "color"])
     g = (df.groupby(["category_normalized", "color"])
            .agg(n=("price", "size"), med=("price", "median")).reset_index())
     return g[g["n"] >= min_n].reset_index(drop=True)
@@ -455,6 +458,154 @@ def bestsellers(conn, group_cols, rank_max=30, min_count=5):
            .reset_index(name="bestsellers"))
     return g[g["bestsellers"] >= min_count].sort_values(
         "bestsellers", ascending=False).reset_index(drop=True)
+
+
+def order_verdicts(conn, min_stockouts=30, min_coverage=0.5):
+    """P4 fusion for the buy decision. Combines, at category x subcategory:
+    under-supply (demand_grid), proven demand (bestsellers), and timing
+    (demand_trend). Produces a ranked board with a VERDICT, the reasons (why),
+    and the timing (when). Catches the trap a naive under-supply read misses:
+    under-supplied BUT cooling = the market retreating, not an opportunity.
+
+    Distress from liquidation is category-level only, too coarse to penalise a
+    hot subcategory, so timing (subcategory-level) is the anti-signal instead.
+    Returns columns incl. verdict, why (list), trend, score, plus the inputs."""
+    d = demand_grid(conn, ["category_normalized", "subcategory"], min_stockouts)
+    if d is None or d.empty:
+        return d
+    d = d[d["subcategory"].notna() & (d["subcategory"] != "")].copy()
+
+    # Coverage guard: subcategory tagging is ~80% for core apparel but 0% for
+    # accessories/footwear. Only trust the subcategory board where a category's
+    # demand is mostly tagged; low-coverage categories stay in the size view.
+    cov = df_sql(conn, """
+        SELECT p.category_normalized,
+               avg((p.subcategory IS NOT NULL AND p.subcategory <> '')::int)::float AS coverage
+        FROM stockout_events se JOIN products p ON p.id = se.product_id
+        WHERE se.witnessed AND se.event_type = 'stockout'
+          AND se.brand NOT IN ('tree','dalydress','lc_waikiki','defacto','mobaco')
+          AND p.category_normalized NOT IN ('uncategorized','')
+        GROUP BY 1
+    """)
+    if cov is not None and not cov.empty:
+        keep = set(cov[cov["coverage"] >= min_coverage]["category_normalized"])
+        d = d[d["category_normalized"].isin(keep)].copy()
+        d = d.merge(cov, on="category_normalized", how="left")
+    if d.empty:
+        return d
+
+    key = ["category_normalized", "subcategory"]
+    b = bestsellers(conn, key, min_count=1)
+    if b is not None and not b.empty:
+        d = d.merge(b, on=key, how="left")
+    if "bestsellers" not in d.columns:
+        d["bestsellers"] = 0
+    d["bestsellers"] = d["bestsellers"].fillna(0).astype(int)
+
+    t = demand_trend(conn, key, weeks=8, min_total=20)
+    if t is not None and not t.empty:
+        d = d.merge(t[key + ["trend"]], on=key, how="left")
+    if "trend" not in d.columns:
+        d["trend"] = "steady"
+    d["trend"] = d["trend"].fillna("steady")
+
+    d["proven"] = d["bestsellers"] >= 3
+
+    def _verdict(r):
+        proven, tr = r["proven"], r["trend"]
+        if proven and tr != "cooling":
+            return "STRONG BUY"
+        if (proven and tr == "cooling") or (not proven and tr == "warming"):
+            return "BUY"
+        return "WATCH"
+
+    def _why(r):
+        tags = ["under-supplied"]
+        if r["proven"]:
+            tags.append(f"proven seller ({int(r['bestsellers'])})")
+        tags.append({"warming": "warming", "cooling": "cooling",
+                     "steady": "steady demand"}[r["trend"]])
+        return tags
+
+    _boost = {"warming": 1.25, "steady": 1.0, "cooling": 0.7}
+    d["verdict"] = d.apply(_verdict, axis=1)
+    d["why"] = d.apply(_why, axis=1)
+    d["score"] = (d["stockouts"]
+                  * d["proven"].map({True: 1.6, False: 1.0})
+                  * d["trend"].map(_boost).fillna(1.0))
+    return d.sort_values("score", ascending=False).reset_index(drop=True)
+
+
+def discount_verdicts(conn, min_events=20):
+    """P4 fusion for the discount decision, per category. Fuses discount depth +
+    clearance effectiveness (l2_01) with distress (l2_12) into a market read:
+      ACTIVE CLEARANCE  - discounting hard AND it's moving (expect competitor cuts)
+      STICKY DISTRESS   - deep discounts NOT clearing, dead stock rising (don't chase)
+      HEALTHY MARKDOWN  - discounts clear efficiently, market calm
+      FIRM              - little clearing via discount; sells near full price
+    Category-level, so subcategory coverage is not a factor. Phantom brands out."""
+    el = df_sql(conn, """
+        SELECT brand, category_normalized, products_with_drops, stockout_events,
+               avg_drop_pct, pct_stockouts_while_discounted
+        FROM product_l2_01_price_elasticity
+        WHERE report_date = (SELECT max(report_date) FROM product_l2_01_price_elasticity)
+    """)
+    di = df_sql(conn, """
+        SELECT brand, category_normalized, escalating_products, dead_stock_products,
+               distress_level
+        FROM product_l2_12_liquidation_calendar
+        WHERE report_date = (SELECT max(report_date) FROM product_l2_12_liquidation_calendar)
+    """)
+    el = drop_excluded(el)
+    di = drop_excluded(di)
+    if el is None or el.empty:
+        return el
+
+    el["_num"] = el["pct_stockouts_while_discounted"].fillna(0) / 100.0 * el["stockout_events"].fillna(0)
+    g = el.groupby("category_normalized").agg(
+        events=("stockout_events", "sum"),
+        avg_depth=("avg_drop_pct", "mean"),
+        _num=("_num", "sum")).reset_index()
+    g["clear"] = (100.0 * g["_num"] / g["events"].replace(0, 1)).round(1)
+    g["avg_depth"] = g["avg_depth"].round(1)
+
+    def _drank(s):
+        s = str(s)
+        return 3 if s.startswith("urgent") else 2 if s == "watch" else 1
+    di["_r"] = di["distress_level"].map(_drank)
+    d = di.groupby("category_normalized").agg(
+        esc=("escalating_products", "sum"),
+        dead=("dead_stock_products", "sum"),
+        rank=("_r", "max")).reset_index()
+
+    m = g.merge(d, on="category_normalized", how="left").fillna({"esc": 0, "dead": 0, "rank": 1})
+    m = m[m["events"] >= min_events].copy()
+    if m.empty:
+        return m
+
+    def _verdict(r):
+        clears = r["clear"] >= 15
+        urgent = r["rank"] == 3
+        if urgent and clears:
+            return "ACTIVE CLEARANCE"
+        if urgent and not clears:
+            return "STICKY DISTRESS"
+        if clears:
+            return "HEALTHY MARKDOWN"
+        return "FIRM"
+
+    def _why(r):
+        t = [f"depth {r['avg_depth']:.0f}%", f"clears {r['clear']:.0f}%"]
+        if r["esc"]:
+            t.append(f"{int(r['esc'])} escalating")
+        if r["dead"]:
+            t.append(f"{int(r['dead'])} dead stock")
+        return t
+
+    m["verdict"] = m.apply(_verdict, axis=1)
+    m["why"] = m.apply(_why, axis=1)
+    m["distress"] = m["rank"].map({3: "urgent", 2: "watch", 1: "normal"})
+    return m.sort_values("events", ascending=False).reset_index(drop=True)
 
 
 # ------------------------------------------------------------------ folders
