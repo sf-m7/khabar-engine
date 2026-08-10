@@ -1,34 +1,28 @@
 name: Taxonomy Backfill
 
 on:
+  schedule:
+    # Tuesdays 05:00 UTC — after Monday scraping completes, before Monday
+    # report suite (12:00 UTC). Classifies any new products scraped that week.
+    - cron: "0 5 * * 2"
   workflow_dispatch:
     inputs:
       pass:
         description: "Which pass to run"
         required: true
-        default: "colors"
+        default: "all"
         type: choice
         options:
           - colors
           - sizes
           - subcat-rules
           - subcat-text
-          - subcat-vision
-          - audit
           - all
-      vision_limit:
-        description: "Max images for the vision pass (budget guard)"
-        required: false
-        default: "4000"
-      audit_sample:
-        description: "Sample size per category for the audit"
-        required: false
-        default: "40"
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -39,18 +33,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install psycopg2-binary requests google-auth Pillow
+        run: pip install psycopg2-binary
 
       - name: Run backfill pass
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
-          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          MAX_GEMINI_CALLS: "5000"
           PYTHONUNBUFFERED: "1"
         run: |
-          python taxonomy_backfill.py \
-            --pass "${{ github.event.inputs.pass }}" \
-            --vision-limit "${{ github.event.inputs.vision_limit }}" \
-            --audit-sample "${{ github.event.inputs.audit_sample }}"
+          python taxonomy_backfill.py --pass "${{ github.event.inputs.pass || 'all' }}"
