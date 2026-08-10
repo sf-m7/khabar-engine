@@ -23,11 +23,9 @@ Env:    KHABAR_DB_URL                (Postgres connection string)
 """
 
 import argparse
-import json
 import os
 import re
 import sys
-import time
 
 import psycopg2
 from khabar_db import CA_BUNDLE
@@ -325,8 +323,14 @@ def db():
     return psycopg2.connect(DB_URL, sslrootcert=CA_BUNDLE)
 
 
-def _request_target():
-    """Return (url, headers, params) for whichever lane we're on."""
+def pass_colors():
+    """Deterministic keyword classifier — replaces Gemini. Seeds new raw colours
+    into color_map, classifies unclassified entries via keyword rules aligned to
+    COLOR_FAMILIES, then stamps product_variants. Zero API calls."""
+    print("== PASS colors: deterministic keyword classification ==")
+    conn = db()
+    cur = conn.cursor()
+
     # Seed any new raw colours from variants into color_map
     cur.execute(
         """INSERT INTO color_map (color_raw, status, source, created_at, updated_at)
@@ -525,6 +529,24 @@ def pass_subcat_text():
     conn.close()
 
 
+
+
+
+
+def _subcat_progress(cur):
+    cur.execute(
+        """SELECT LOWER(TRIM(category_normalized)) AS cat,
+                  COUNT(*) AS total,
+                  COUNT(subcategory) AS filled
+           FROM products
+           WHERE LOWER(TRIM(category_normalized)) = ANY(%s) AND is_active=true
+           GROUP BY 1 ORDER BY total DESC""",
+        (list(SUBCATS.keys()),),
+    )
+    print("  subcategory progress:")
+    for cat, total, filled in cur.fetchall():
+        pct = round(filled / total * 100, 1) if total else 0
+        print(f"   {cat:<12} {filled}/{total} ({pct}%)")
 
 
 if __name__ == "__main__":
