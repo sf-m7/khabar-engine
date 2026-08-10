@@ -263,6 +263,60 @@ def classify_size(raw, category_normalized):
     return None, None, "review", "unrecognized_pattern"
 
 
+# ----------------------------------------------------------------------
+# PASS 0: category — rescue 'uncategorized' via evidence-based keyword rules
+# ----------------------------------------------------------------------
+# Rules INFERRED from how already-categorized products with the same style
+# word were classified (dominant category, only where agreement was strong).
+# Ambiguous fit-words (polo, oversize, crop <55% agreement) are deliberately
+# omitted — better uncategorized than misfiled. Ordered specific-first.
+CATEGORY_RULES = [
+    ("cardigan", "cardigans"),     # 95%
+    ("pullover", "sweaters"),      # 93%
+    ("sweatshirt", "shirts"),      # 98%
+    ("blouse", "shirts"),          # 99%
+    ("tunic", "shirts"),           # 100%
+    ("henley", "t-shirts"),        # 61%
+    ("tank", "tank-tops"),         # 90%
+    ("vest", "vests"),             # 80%
+    ("long-sleeve", "shirts"),     # 55%
+    ("long sleeve", "shirts"),     # 73%
+]
+
+
+def pass_category():
+    """Rescue products stuck at category_normalized='uncategorized' using
+    evidence-based keyword rules (see CATEGORY_RULES). Matches on category_raw
+    OR name. Deterministic, conservative — unmatched stays uncategorized. Runs
+    BEFORE the subcategory passes, which need a category to work."""
+    print("== PASS category: rescue uncategorized (evidence-based rules) ==")
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT count(*) FROM products
+           WHERE is_active AND LOWER(TRIM(category_normalized)) = 'uncategorized'""")
+    before = cur.fetchone()[0]
+    total = 0
+    for kw, cat in CATEGORY_RULES:
+        cur.execute(
+            """UPDATE products
+               SET category_normalized = %s
+               WHERE is_active
+                 AND LOWER(TRIM(category_normalized)) = 'uncategorized'
+                 AND (name ILIKE %s OR category_raw ILIKE %s)""",
+            (cat, f"%{kw}%", f"%{kw}%"))
+        if cur.rowcount:
+            print(f"  {kw:<14} -> {cat:<12} : {cur.rowcount}")
+            total += cur.rowcount
+    conn.commit()
+    cur.execute(
+        """SELECT count(*) FROM products
+           WHERE is_active AND LOWER(TRIM(category_normalized)) = 'uncategorized'""")
+    after = cur.fetchone()[0]
+    print(f"  rescued {total} | uncategorized {before} -> {after}")
+    conn.close()
+
+
 def pass_sizes():
     print("== PASS sizes: deterministic size normalization (no AI) ==")
     conn = db()
@@ -552,16 +606,17 @@ def _subcat_progress(cur):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--pass", dest="which", required=True,
-                    choices=["colors", "sizes", "subcat-rules", "subcat-text", "all"])
+                    choices=["category", "colors", "sizes", "subcat-rules", "subcat-text", "all"])
     args = ap.parse_args()
 
     steps = {
+        "category": pass_category,
         "colors": pass_colors,
         "sizes": pass_sizes,
         "subcat-rules": pass_subcat_rules,
         "subcat-text": pass_subcat_text,
     }
-    order = (["colors", "sizes", "subcat-rules", "subcat-text"]
+    order = (["category", "colors", "sizes", "subcat-rules", "subcat-text"]
              if args.which == "all" else [args.which])
 
     for name in order:
