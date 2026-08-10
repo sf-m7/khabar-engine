@@ -32,7 +32,6 @@ import time
 import psycopg2
 from khabar_db import CA_BUNDLE
 import psycopg2.extras
-import requests
 
 # ----------------------------------------------------------------------
 # Configuration
