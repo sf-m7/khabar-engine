@@ -33,6 +33,8 @@ import psycopg2
 from khabar_db import CA_BUNDLE
 import pandas as pd
 
+import warnings
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy")
 import matplotlib
 matplotlib.use("Agg")            # headless: no display in CI
 import matplotlib.pyplot as plt

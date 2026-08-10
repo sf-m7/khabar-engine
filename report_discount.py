@@ -53,10 +53,11 @@ def run():
     brows = []
     for r in rows[:14]:
         vc = vmap.get(r["verdict"], "#6C6A64")
+        why_str = " \u00b7 ".join(r["why"])
         brows.append([
             H.esc(r["category_normalized"]),
             f'<span class="m" style="color:{vc};font-weight:700">{r["verdict"]}</span>',
-            f'<span style="font-size:12px">{H.esc(" \u00b7 ".join(r["why"]))}</span>',
+            f'<span style="font-size:12px">{H.esc(why_str)}</span>',
             f'<span class="dist {r["distress"]}">{r["distress"].upper()}</span>',
         ])
     btbl = H.table([("Category", False), ("Verdict", False), ("Why", False),
