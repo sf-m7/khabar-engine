@@ -33,6 +33,18 @@ jobs:
           KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
         run: python report_bestseller.py
 
+      - name: Master — What to Make & At What Price
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: python report_master_order.py
+
+      - name: Master — What to Do With Your Stock
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: python report_master_stock.py
+
       - name: Data Integrity report
         env:
           SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
