@@ -22,22 +22,22 @@
 | signal_l1_11_size_asymmetry | L1 signal | 11416 | 26 | 17 | 2026-08-17 | 94 |
 | signal_l2_share_of_launch | L2 signal | 4309 | 17 | 23 | 2026-08-17 | 94 |
 | signal_l1_07_price_anomaly | L1 signal | 918 | 33 | 13 | 2026-08-17 | 93 |
-| product_l2_12_liquidation_calendar | L2 product | 8950 | 27 | 22 | 2026-08-16 | 92 |
-| product_l2_10_market_entry | L2 product | 9813 | 27 | 23 | 2026-08-16 | 92 |
+| product_l2_10_market_entry | L2 product | 10213 | 28 | 23 | 2026-08-17 | 93 |
+| product_l2_12_liquidation_calendar | L2 product | 9307 | 28 | 22 | 2026-08-17 | 92 |
 | signal_l1_17_depth_escalation | L1 signal | 40049 | 34 | 11 | 2026-08-17 | 92 |
 | signal_l2_trained_customer | L2 signal | 298 | 25 | 14 | 2026-08-17 | 92 |
 | signal_l2_pricing_discipline | L2 signal | 2846 | 25 | 15 | 2026-08-17 | 92 |
 | product_l2_01_price_elasticity | L2 product | 3913 | 27 | 20 | 2026-08-16 | 91 |
 | signal_l2_replenishment_benchmark | L2 signal | 317 | 17 | 19 | 2026-08-17 | 91 |
-| product_l2_08_brand_health | L2 product | 6339 | 25 | 22 | 2026-08-16 | 91 |
+| product_l2_08_brand_health | L2 product | 6595 | 26 | 22 | 2026-08-17 | 91 |
 | signal_l1_06_discount_recovery | L1 signal | 1498 | 34 | 8 | 2026-08-16 | 90 |
 | signal_l2_discount_honesty | L2 signal | 2565 | 21 | 15 | 2026-08-17 | 90 |
-| product_l2_09_revealed_demand | L2 product | 10069 | 27 | 17 | 2026-08-16 | 89 |
-| product_l2_02_production_blueprint | L2 product | 10069 | 27 | 17 | 2026-08-16 | 89 |
-| signal_l1_03_price_staircase | L1 signal | 3754 | 34 | 6 | 2026-08-17 | 89 |
+| product_l2_09_revealed_demand | L2 product | 10730 | 28 | 17 | 2026-08-17 | 89 |
 | signal_l1_10_dead_stock | L1 signal | 4230 | 27 | 8 | 2026-08-17 | 89 |
+| signal_l1_03_price_staircase | L1 signal | 3754 | 34 | 6 | 2026-08-17 | 89 |
+| product_l2_13_wallet_allocator | L2 product | 10730 | 28 | 17 | 2026-08-17 | 89 |
+| product_l2_02_production_blueprint | L2 product | 10730 | 28 | 17 | 2026-08-17 | 89 |
 | signal_l1_04_anchor_inflation | L1 signal | 375 | 23 | 10 | 2026-08-09 | 88 |
-| product_l2_13_wallet_allocator | L2 product | 10069 | 27 | 17 | 2026-08-16 | 88 |
 | signal_l2_clear_rate_by_depth | L2 signal | 573 | 8 | 0 | 2026-08-17 | 82 |
 | signal_l1_22_discount_velocity | L1 signal | 411 | 44 | 14 | 2026-08-15 | 79 |
 
@@ -46,7 +46,7 @@
 
 - price_snapshots.discount_pct non-null (expect 0): **0**
 
-- product_variants delisted_at set but in_stock (known bug): **3557**
+- product_variants delisted_at set but in_stock (known bug): **3555**
 
 - product_variants missing first_observed_price: **0**
 
