@@ -83,6 +83,25 @@ PRICE_BANDS = [
 EXCLUDED_SELL = "('tree','dalydress','defacto')"
 EXCLUDED_ALL  = "('tree','dalydress')"
 
+# Taxonomy stopgap (Aug 2026): the scraper's CATEGORY_MAP checks "shirts"
+# (keyword "shirt") before "sweatshirts" (keyword "sweatshirt") and before
+# "hoodies" — since "sweatshirt" contains "shirt" as a substring, sweatshirts
+# and hoodies get misclassified into the shirts category. Verified live: 26%
+# of "shirts · long-sleeve" is contaminated this way, and it flips the price
+# recommendation — genuine long-sleeve shirts sell best at 1,000+ EGP (27.7%),
+# but mixing in the contaminated units drags that band down and makes
+# under-300 falsely look like the winner (23.7%). Every other shirts
+# subcategory is clean (<2% contaminated) so this is scoped narrowly.
+# The real fix belongs in scraper.py's CATEGORY_MAP (check sweatshirts/hoodies
+# before shirts) plus a reclassification backfill for the ~2,000 affected
+# historical rows. This filter keeps the reports honest at query time in the
+# meantime.
+SHIRT_TAXONOMY_FILTER = (
+    "AND NOT (p.category_normalized='shirts' AND "
+    "(LOWER(p.name) LIKE '%sweatshirt%' OR LOWER(p.name) LIKE '%hoodie%' "
+    "OR LOWER(p.name) LIKE '%hoody%'))"
+)
+
 
 def esc(s):
     return _html.escape(str(s))
@@ -101,6 +120,24 @@ def conf_level(brands, products, sellouts):
     if brands >= 8 and products >= 200 and sellouts >= 50:
         return "md"
     return "lo"
+
+
+# Colour name -> hex, for size/colour spec bar fills (§05). Falls back to a
+# neutral grey for anything not in the map rather than rendering invisible.
+COLOR_MAP = {
+    "black": "#1B1B19", "white": "#F5F3ED", "grey": "#9A978F", "gray": "#9A978F",
+    "beige": "#C8B590", "brown": "#8B6F4E", "blue": "#4A6FA5", "navy": "#2C3E5C",
+    "green": "#4A7C59", "olive": "#6B7048", "khaki": "#B5A47A", "red": "#B0413A",
+    "maroon": "#6E2C2C", "pink": "#D9A0B0", "purple": "#7A5C8E", "yellow": "#D9C05A",
+    "orange": "#C87A3D", "ivory": "#EDE6D6", "cream": "#EDE6D6", "tan": "#C8A876",
+    "burgundy": "#5E2029", "mustard": "#C9A227", "teal": "#3F7A78", "denim": "#4E6E8E",
+    "silver": "#B8B8B8", "gold": "#C9A544", "multicolor": "#9A978F", "multi": "#9A978F",
+}
+DEFAULT_COLOR = "#B8B4A8"
+
+
+def color_hex(name):
+    return COLOR_MAP.get(str(name).strip().lower(), DEFAULT_COLOR)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +161,7 @@ def q_action_board(conn):
       AND se.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     HAVING COUNT(CASE WHEN se.event_type='stockout' THEN 1 END) > 20
     ORDER BY sellouts DESC
@@ -150,6 +188,7 @@ def q_bestseller_persistence(conn):
     ) sub ON sub.product_id = br.product_id
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND br.brand NOT IN {EXCLUDED_ALL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized || ' · ' || p.subcategory,
              p.category_normalized, p.subcategory
     HAVING COUNT(DISTINCT br.product_id) > 5
@@ -168,6 +207,7 @@ def q_bestseller_trend(conn):
     JOIN products p ON p.id = br.product_id
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND br.brand NOT IN {EXCLUDED_ALL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY DATE_TRUNC('week', br.snapshot_date)::date,
              p.category_normalized, p.subcategory
     ORDER BY cat, sub, week
@@ -201,6 +241,7 @@ def q_price_band_sellthrough(conn):
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.category_normalized NOT IN ('uncategorized')
       AND lp.brand NOT IN {EXCLUDED_SELL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory,
              CASE {bands_sql} END
     HAVING COUNT(DISTINCT lp.product_id) > 15
@@ -227,6 +268,7 @@ def q_speed_to_sell(conn):
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.brand NOT IN {EXCLUDED_SELL}
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     HAVING COUNT(DISTINCT p.id) > 15
     """
@@ -255,6 +297,7 @@ def q_demand_index(conn):
     ) se_in ON se_in.product_id = se_out.product_id
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     """
     return R.df_sql(conn, sql)
@@ -272,6 +315,7 @@ def q_brand_stockouts(conn):
       AND se.recorded_at > NOW() - INTERVAL '21 days'
       AND se.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory, se.brand
     ORDER BY cat, sub, stockouts DESC
     """
@@ -299,6 +343,7 @@ def q_confidence_inputs(conn):
     WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     """
     return R.df_sql(conn, sql)
@@ -320,6 +365,7 @@ def q_brand_prices(conn):
     JOIN products p ON p.id = lp.product_id
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND lp.brand NOT IN {EXCLUDED_ALL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory, lp.brand
     HAVING COUNT(DISTINCT lp.product_id) > 5
     """
@@ -362,6 +408,7 @@ def q_price_movements(conn):
     WHERE pe.recorded_at > NOW() - INTERVAL '7 days'
       AND pe.brand NOT IN {EXCLUDED_ALL}
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY pe.brand, p.category_normalized
     HAVING COUNT(*) > 50
     ORDER BY changes DESC
@@ -380,6 +427,7 @@ def q_size_ratios(conn, cat, sub):
       AND p.category_normalized = '{cat}' AND p.subcategory = '{sub}'
       AND se.brand NOT IN {EXCLUDED_SELL}
       AND se.size IS NOT NULL
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY se.size
     ORDER BY stockouts DESC
     LIMIT 6
@@ -398,6 +446,7 @@ def q_color_ratios(conn, cat, sub):
       AND se.recorded_at > NOW() - INTERVAL '21 days'
       AND p.category_normalized = '{cat}' AND p.subcategory = '{sub}'
       AND se.brand NOT IN {EXCLUDED_SELL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY COALESCE(pv.color_family, pv.color)
     ORDER BY stockouts DESC
     LIMIT 5
@@ -418,6 +467,7 @@ def q_distress(conn):
     WHERE de.snapshot_date >= CURRENT_DATE - 21
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
       AND de.brand NOT IN {EXCLUDED_ALL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory, de.brand
     HAVING COUNT(*) > 5
     """
@@ -772,10 +822,16 @@ def render_weekly_diff(conn):
 
 
 def render_specs(conn, top_rows):
-    """§05 — production specs: size/colour tabs for top board opportunities."""
+    """§05 — production specs: size/colour tabs for EVERY go/buy board row.
+
+    FIXED: was capped at top_rows[:6], silently dropping most recommended
+    categories (verified: 17 go+buy rows in a real run, only 6 got tabs).
+    Every category recommended on the board now gets a tab — the tab bar
+    wraps to multiple lines rather than truncating.
+    """
     tabs_nav = ""
     tabs_body = ""
-    for i, row in enumerate(top_rows[:6]):
+    for i, row in enumerate(top_rows):
         cat, sub = row["cat"], row["sub"]
         tab_id = f"spec{i}"
         active = " active" if i == 0 else ""
@@ -799,14 +855,19 @@ def render_specs(conn, top_rows):
         else:
             size_rows = '<div style="font-size:12px;color:var(--faint);">No size data available.</div>'
 
+        # FIXED: was a flat var(--box) neutral for every colour, so bars
+        # rendered with no visible fill at all. Now maps the real colour
+        # name to its hex value (COLOR_MAP), falling back to a visible
+        # grey rather than blending into the page background.
         color_rows = ""
         if color_total > 0:
             mx = int(colors["stockouts"].max())
             for _, c in colors.iterrows():
                 pct = round(100 * int(c["stockouts"]) / color_total)
                 width = round(100 * int(c["stockouts"]) / mx)
+                hexval = color_hex(c["color"])
                 color_rows += (f'<div class="bar-row"><span class="bar-lbl">{esc(c["color"])}</span>'
-                               f'<div class="bar-track"><div class="bar-fill" style="width:{width}%;background:var(--box);border:1px solid var(--grid);"></div>'
+                               f'<div class="bar-track"><div class="bar-fill" style="width:{width}%;background:{hexval};border:1px solid var(--grid);"></div>'
                                f'<span class="bar-val">{pct}%</span></div></div>')
         else:
             color_rows = '<div style="font-size:12px;color:var(--faint);">No colour data available.</div>'
@@ -1031,15 +1092,15 @@ def render(conn):
 
     gap_html = f"""<section class="blk">
   <div class="hd"><span class="n">04</span>
-    <span class="t">Are you early or late? — sell-outs vs restocks</span></div>
+    <span class="t">Are you early or late? — sell-outs vs restocks (last 21 days)</span></div>
   <div class="bd">
-    <p class="intro">Ratio above 2× = gap wide open. 1-2× = narrowing.</p>
+    <p class="intro">Ratio above 2× = gap wide open. 1-2× = narrowing. Counts are witnessed events over the last 21 days — small categories will naturally show small counts.</p>
     <div class="table-wrap"><table><thead><tr>
-      <th>Opportunity</th><th>Sell-outs</th><th>Restocks</th><th>Gap</th>
+      <th>Opportunity</th><th>Sell-outs<br><span style="font-weight:400;text-transform:none;">21 days</span></th><th>Restocks<br><span style="font-weight:400;text-transform:none;">21 days</span></th><th>Gap</th>
       <th>Demand index</th><th>Top restockers</th>
     </tr></thead><tbody>{gap_rows}</tbody></table></div>
     <div class="note"><b>Demand index:</b> "sold out" + "still out of stock" = estimated total demand
-      including what couldn't be sold because it was already gone.</div>
+      including what couldn't be sold because it was already gone. All figures cover the last 21 days only.</div>
   </div>
 </section>"""
 
@@ -1057,6 +1118,7 @@ def render(conn):
     <span><b>Prices:</b> each product's latest snapshot within the last 8 days (not a single fixed date)</span>
     <span class="x">All price-band findings are <b>observed associations</b> — premium brands may sell more because of brand strength, not price</span>
     <span class="x">Excludes DeFacto (stock unreliable), Tree, Dalydress. Under-tagged: Carina 17%, Mlameh 33%, Activ 40%</span>
+    <span class="x">Excludes sweatshirts/hoodies mistagged as "shirts" by a known classifier bug (~15% of the category) — fix pending a taxonomy backfill</span>
   </div></div>
 </section>"""
 

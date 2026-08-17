@@ -48,6 +48,18 @@ LATEST_PRICE_CTE = f"""
     )
 """
 
+# Taxonomy stopgap (Aug 2026) — see report_master_order.py for full writeup.
+# Scraper's CATEGORY_MAP checks "shirts" before "sweatshirts"/"hoodies", and
+# since "sweatshirt" contains "shirt" as a substring, those get misclassified
+# into the shirts category (~15% of it, up to 26% within "long-sleeve").
+# Excluded at query time here too so the stock report stays consistent with
+# the order report until the scraper/taxonomy fix + backfill lands.
+SHIRT_TAXONOMY_FILTER = (
+    "AND NOT (p.category_normalized='shirts' AND "
+    "(LOWER(p.name) LIKE '%sweatshirt%' OR LOWER(p.name) LIKE '%hoodie%' "
+    "OR LOWER(p.name) LIKE '%hoody%'))"
+)
+
 
 def esc(s):
     return _html.escape(str(s))
@@ -98,6 +110,7 @@ def q_sell_through_by_depth(conn):
     WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory,
              CASE
                  WHEN p.first_observed_price IS NULL OR p.first_observed_price <= 0
@@ -142,6 +155,7 @@ def q_age_discount_matrix(conn):
         AND se.recorded_at > NOW() - INTERVAL '21 days'
     WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY 1, 2
     """
     return R.df_sql(conn, sql)
@@ -163,6 +177,7 @@ def q_speed_to_sell(conn):
     ) se ON se.product_id = p.id
     WHERE p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.brand NOT IN {EXCLUDED_SELL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     HAVING COUNT(DISTINCT p.id) > 15
     """
@@ -186,6 +201,7 @@ def q_confidence_inputs(conn):
         AND se.recorded_at > NOW() - INTERVAL '21 days'
     WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     """
     return R.df_sql(conn, sql)
@@ -261,6 +277,7 @@ def q_bestseller_persistence(conn):
         FROM bestseller_rank GROUP BY product_id
     ) sub ON sub.product_id = br.product_id
     WHERE p.subcategory IS NOT NULL AND br.brand NOT IN {EXCLUDED_ALL}
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory
     """
     return R.df_sql(conn, sql)
@@ -300,6 +317,7 @@ def q_price_movements(conn):
     WHERE pe.recorded_at > NOW() - INTERVAL '7 days'
       AND pe.brand NOT IN {EXCLUDED_ALL}
       AND p.category_normalized NOT IN ('uncategorized')
+      {SHIRT_TAXONOMY_FILTER}
     GROUP BY pe.brand, p.category_normalized
     HAVING COUNT(*) > 50
     ORDER BY changes DESC
@@ -761,6 +779,7 @@ def render(conn):
     <span><b>Market temperature:</b> last 4 complete calendar weeks, current in-progress week excluded</span>
     <span class="x">All findings are <b>observed associations</b>, not causal estimates</span>
     <span class="x">Excludes DeFacto sell-outs (stock unreliable), Tree, Dalydress (phantom data)</span>
+    <span class="x">Excludes sweatshirts/hoodies mistagged as "shirts" by a known classifier bug (~15% of the category) — fix pending a taxonomy backfill</span>
   </div></div>
 </section>"""
 
