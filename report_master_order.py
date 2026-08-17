@@ -510,19 +510,45 @@ def build_board(conn):
 
 
 def assign_verdict(row):
+    """Verdict logic — FIXED (Aug 2026).
+
+    Bug found in production: the old "go" fallback path only checked
+    bestseller persistence + sell-out/restock gap ratio, with no re-check
+    of how strong the actual sell-through evidence was (just a near-useless
+    best_rate < 10 floor at the top) and no confidence check at all. That
+    let thin, off-season, niche subcategories reach "Make now" purely
+    because a small bestseller pool inflated persistence and near-zero
+    restocking inflated the gap ratio — even when every price band showed
+    6-14% sell-through with confidence intervals nearly touching zero.
+    Verified live: jackets·puffer sells 6-14% at EVERY price band (n=48 at
+    its "best" band) yet reached "go" under the old logic. The stock report
+    correctly flagged the same category STOP, because its verdict logic
+    requires all available depth-rates to clear a real floor.
+
+    Fix: persistence and gap ratio are now supporting evidence, not a
+    substitute for actual sell-through evidence. "Go" requires a materially
+    higher rate (>=20%) AND confidence that isn't "lo". "Buy" requires
+    >=15% AND confidence that isn't "lo". The initial avoid floor is raised
+    from 10% to 15% to match the level where genuinely weak categories
+    cluster (6-14%) vs where legitimate ones sit (18%+).
+    """
     cat, sub = row["cat"], row["sub"]
     if (cat, sub) in AVOID_CATS:
         return "avoid", "Don't make"
-    if row["best_rate"] < 10:
+    if row["best_rate"] < 15:
         return "avoid", "Don't make"
-    if (row["avg_weeks"] >= 6.5 and row["trend_pct"] >= 15
+
+    strong_evidence = row["best_rate"] >= 20 and row["conf"] != "lo"
+    ok_evidence = row["best_rate"] >= 15 and row["conf"] != "lo"
+
+    if (strong_evidence and row["avg_weeks"] >= 6.5 and row["trend_pct"] >= 15
             and row["gap_ratio"] >= 2.0 and row["conf"] == "hi"):
         return "go", "Make now"
-    if row["avg_weeks"] >= 6.5 and row["gap_ratio"] >= 2.0:
+    if strong_evidence and row["avg_weeks"] >= 6.5 and row["gap_ratio"] >= 2.0:
         return "go", "Make now"
-    if row["avg_weeks"] >= 5.0 and row["trend_pct"] >= -10 and row["gap_ratio"] >= 1.5:
+    if ok_evidence and row["avg_weeks"] >= 5.0 and row["trend_pct"] >= -10 and row["gap_ratio"] >= 1.5:
         return "buy", "Make — mid vol"
-    if row["avg_weeks"] >= 4.0 and row["gap_ratio"] >= 1.2:
+    if ok_evidence and row["avg_weeks"] >= 4.0 and row["gap_ratio"] >= 1.2:
         return "buy", "Make — mid vol"
     if row["avg_weeks"] >= 3.0:
         return "watch", "Watch"
