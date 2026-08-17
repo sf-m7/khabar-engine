@@ -1,10 +1,20 @@
 """
 report_master_stock.py — MASTER REPORT: What to Do With Your Stock
 ================================================================================
-Synthesises the Discount + Market reports into one action plan. Each row tells
-you what to do with stock you already have: hold, discount to X%, go deep,
-stop, or raise price — backed by sell-out rates at each depth, speed to sell,
-confidence intervals, and competitor context.
+Synthesises the Discount + Market reports into one action plan.
+
+v3 fixes (Aug 2026):
+  - CRITICAL: same price-snapshot bug as report_master_order.py. Queries
+    required snapshot_date = today, which silently broke whenever the day's
+    scrape was incomplete (today's example: 16k products vs the normal ~57k).
+    Fixed by pulling each product's latest snapshot within the live 8-day
+    window (DISTINCT ON) instead of a fixed calendar date.
+  - Market temperature (§05) was including the current, still-forming week
+    in its trend — since the report runs early Monday, that week's bucket
+    only has a few hours of data and always looked like "supply catching up"
+    regardless of the real picture. Now shows the last 4 COMPLETE weeks only.
+  - Added §01 weekly diff (brand launch deltas + price-move patterns) —
+    designed but never wired into render().
 
 Enhancements:
   1. Confidence badges (brand count × product count × sell-outs)
@@ -14,7 +24,7 @@ Enhancements:
   5. "Observed association" labeling
   6. Restock-adjusted demand index
   7. Competitor activity radar with posture labels
-  8. First-mover discount timing
+  8. Weekly diff (market signals — see note in render_weekly_diff)
 """
 
 import math
@@ -27,12 +37,16 @@ import report_html as H
 EXCLUDED_SELL = "('tree','dalydress','defacto')"
 EXCLUDED_ALL  = "('tree','dalydress')"
 
-DEPTH_BANDS = [
-    ("full_price", "full price"),
-    ("1_24",       "1-24%"),
-    ("25_39",      "25-39%"),
-    ("40p",        "40%+"),
-]
+LIVE_WINDOW_DAYS = 8
+
+LATEST_PRICE_CTE = f"""
+    latest_price AS (
+        SELECT DISTINCT ON (product_id) product_id, brand, price, snapshot_date
+        FROM price_snapshots
+        WHERE snapshot_date > CURRENT_DATE - INTERVAL '{LIVE_WINDOW_DAYS} days'
+        ORDER BY product_id, snapshot_date DESC
+    )
+"""
 
 
 def esc(s):
@@ -58,44 +72,52 @@ def conf_level(brands, products, sellouts):
 # ---------------------------------------------------------------------------
 
 def q_sell_through_by_depth(conn):
-    """Sell-through rate by discount depth per subcategory."""
+    """Sell-through rate by discount depth per subcategory.
+
+    FIXED: was `ps.snapshot_date = MAX(snapshot_date)`. Now per-product
+    latest snapshot within the live 8-day window.
+    """
     sql = f"""
+    WITH {LATEST_PRICE_CTE}
     SELECT
         p.category_normalized as cat, p.subcategory as sub,
         CASE
             WHEN p.first_observed_price IS NULL OR p.first_observed_price <= 0
-                 OR ps.price >= p.first_observed_price THEN 'full_price'
-            WHEN 100.0*(1 - ps.price/p.first_observed_price) < 25 THEN '1_24'
-            WHEN 100.0*(1 - ps.price/p.first_observed_price) < 40 THEN '25_39'
+                 OR lp.price >= p.first_observed_price THEN 'full_price'
+            WHEN 100.0*(1 - lp.price/p.first_observed_price) < 25 THEN '1_24'
+            WHEN 100.0*(1 - lp.price/p.first_observed_price) < 40 THEN '25_39'
             ELSE '40p'
         END as depth,
-        COUNT(DISTINCT ps.product_id) as products,
+        COUNT(DISTINCT lp.product_id) as products,
         COUNT(DISTINCT se.product_id) as with_sellout
-    FROM price_snapshots ps
-    JOIN products p ON p.id = ps.product_id
-    LEFT JOIN stockout_events se ON se.product_id = ps.product_id
+    FROM latest_price lp
+    JOIN products p ON p.id = lp.product_id
+    LEFT JOIN stockout_events se ON se.product_id = lp.product_id
         AND se.event_type = 'stockout' AND se.witnessed = true
         AND se.recorded_at > NOW() - INTERVAL '21 days'
-    WHERE ps.snapshot_date = (SELECT MAX(snapshot_date) FROM price_snapshots)
-      AND ps.brand NOT IN {EXCLUDED_SELL}
+    WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
       AND p.category_normalized NOT IN ('uncategorized')
     GROUP BY p.category_normalized, p.subcategory,
              CASE
                  WHEN p.first_observed_price IS NULL OR p.first_observed_price <= 0
-                      OR ps.price >= p.first_observed_price THEN 'full_price'
-                 WHEN 100.0*(1 - ps.price/p.first_observed_price) < 25 THEN '1_24'
-                 WHEN 100.0*(1 - ps.price/p.first_observed_price) < 40 THEN '25_39'
+                      OR lp.price >= p.first_observed_price THEN 'full_price'
+                 WHEN 100.0*(1 - lp.price/p.first_observed_price) < 25 THEN '1_24'
+                 WHEN 100.0*(1 - lp.price/p.first_observed_price) < 40 THEN '25_39'
                  ELSE '40p'
              END
-    HAVING COUNT(DISTINCT ps.product_id) > 10
+    HAVING COUNT(DISTINCT lp.product_id) > 10
     """
     return R.df_sql(conn, sql)
 
 
 def q_age_discount_matrix(conn):
-    """Age × discount cross-tab for the heatmap."""
+    """Age × discount cross-tab for the heatmap.
+
+    FIXED: same latest-snapshot bug.
+    """
     sql = f"""
+    WITH {LATEST_PRICE_CTE}
     SELECT
         CASE
             WHEN EXTRACT(DAY FROM NOW() - p.first_seen_at) <= 14 THEN '0-14d'
@@ -105,21 +127,20 @@ def q_age_discount_matrix(conn):
         END as age_band,
         CASE
             WHEN p.first_observed_price IS NULL OR p.first_observed_price <= 0
-                 OR ps.price >= p.first_observed_price THEN 'full_price'
-            WHEN 100.0*(1 - ps.price/p.first_observed_price) < 20 THEN '1_19'
-            WHEN 100.0*(1 - ps.price/p.first_observed_price) < 30 THEN '20_29'
-            WHEN 100.0*(1 - ps.price/p.first_observed_price) < 40 THEN '30_39'
+                 OR lp.price >= p.first_observed_price THEN 'full_price'
+            WHEN 100.0*(1 - lp.price/p.first_observed_price) < 20 THEN '1_19'
+            WHEN 100.0*(1 - lp.price/p.first_observed_price) < 30 THEN '20_29'
+            WHEN 100.0*(1 - lp.price/p.first_observed_price) < 40 THEN '30_39'
             ELSE '40p'
         END as depth,
-        COUNT(DISTINCT ps.product_id) as products,
+        COUNT(DISTINCT lp.product_id) as products,
         COUNT(DISTINCT se.product_id) as with_sellout
-    FROM price_snapshots ps
-    JOIN products p ON p.id = ps.product_id
-    LEFT JOIN stockout_events se ON se.product_id = ps.product_id
+    FROM latest_price lp
+    JOIN products p ON p.id = lp.product_id
+    LEFT JOIN stockout_events se ON se.product_id = lp.product_id
         AND se.event_type = 'stockout' AND se.witnessed = true
         AND se.recorded_at > NOW() - INTERVAL '21 days'
-    WHERE ps.snapshot_date = (SELECT MAX(snapshot_date) FROM price_snapshots)
-      AND ps.brand NOT IN {EXCLUDED_SELL}
+    WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.category_normalized NOT IN ('uncategorized')
     GROUP BY 1, 2
     """
@@ -149,20 +170,21 @@ def q_speed_to_sell(conn):
 
 
 def q_confidence_inputs(conn):
+    """FIXED: same latest-snapshot bug."""
     sql = f"""
+    WITH {LATEST_PRICE_CTE}
     SELECT
         p.category_normalized as cat, p.subcategory as sub,
-        COUNT(DISTINCT ps.brand) as brands,
-        COUNT(DISTINCT ps.product_id) as products,
+        COUNT(DISTINCT lp.brand) as brands,
+        COUNT(DISTINCT lp.product_id) as products,
         COUNT(DISTINCT se.product_id) FILTER (
             WHERE se.event_type='stockout' AND se.witnessed=true
         ) as with_sellout
-    FROM price_snapshots ps
-    JOIN products p ON p.id = ps.product_id
-    LEFT JOIN stockout_events se ON se.product_id = ps.product_id
+    FROM latest_price lp
+    JOIN products p ON p.id = lp.product_id
+    LEFT JOIN stockout_events se ON se.product_id = lp.product_id
         AND se.recorded_at > NOW() - INTERVAL '21 days'
-    WHERE ps.snapshot_date = (SELECT MAX(snapshot_date) FROM price_snapshots)
-      AND ps.brand NOT IN {EXCLUDED_SELL}
+    WHERE lp.brand NOT IN {EXCLUDED_SELL}
       AND p.subcategory IS NOT NULL AND p.subcategory != ''
     GROUP BY p.category_normalized, p.subcategory
     """
@@ -178,6 +200,10 @@ def q_brand_activity(conn):
         COUNT(DISTINCT CASE WHEN p.first_seen_at >= NOW()-INTERVAL '14 days'
               AND p.first_seen_at < NOW()-INTERVAL '7 days' THEN p.id END) as prev_launches,
         COUNT(DISTINCT CASE WHEN pe.recorded_at >= NOW()-INTERVAL '7 days' THEN pe.id END) as price_chg,
+        COUNT(DISTINCT CASE WHEN pe.recorded_at >= NOW()-INTERVAL '7 days'
+              AND pe.direction='up' THEN pe.id END) as price_up,
+        COUNT(DISTINCT CASE WHEN pe.recorded_at >= NOW()-INTERVAL '7 days'
+              AND pe.direction='down' THEN pe.id END) as price_down,
         COUNT(DISTINCT CASE WHEN se.event_type='stockout' AND se.witnessed=true
               AND se.recorded_at >= NOW()-INTERVAL '7 days' THEN se.id END) as sellouts,
         COUNT(DISTINCT CASE WHEN se.event_type='restock' AND se.witnessed=true
@@ -198,7 +224,13 @@ def q_brand_activity(conn):
 
 
 def q_market_temp(conn):
-    """Weekly sell-out vs restock ratio."""
+    """Weekly sell-out vs restock ratio.
+
+    FIXED: excludes the current, still-forming week. The report runs early
+    Monday, so "this week" would otherwise only contain a few hours of data
+    and always show a misleadingly low ratio ("supply catching up") no
+    matter what the real market looks like. Shows the last 4 COMPLETE weeks.
+    """
     sql = f"""
     SELECT
         DATE_TRUNC('week', recorded_at)::date as week,
@@ -209,7 +241,8 @@ def q_market_temp(conn):
         ) as ratio
     FROM stockout_events
     WHERE brand NOT IN {EXCLUDED_ALL}
-      AND recorded_at > NOW() - INTERVAL '28 days'
+      AND recorded_at >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '28 days'
+      AND recorded_at <  DATE_TRUNC('week', CURRENT_DATE)
     GROUP BY DATE_TRUNC('week', recorded_at)::date
     ORDER BY week
     """
@@ -217,7 +250,6 @@ def q_market_temp(conn):
 
 
 def q_bestseller_persistence(conn):
-    """Product-level persistence for trend context."""
     sql = f"""
     SELECT
         p.category_normalized as cat, p.subcategory as sub,
@@ -234,18 +266,57 @@ def q_bestseller_persistence(conn):
     return R.df_sql(conn, sql)
 
 
+def q_launches_by_brand(conn):
+    sql = f"""
+    SELECT
+        brand,
+        COUNT(CASE WHEN first_seen_at >= NOW() - INTERVAL '7 days' THEN 1 END) as this_week,
+        COUNT(CASE WHEN first_seen_at >= NOW() - INTERVAL '14 days'
+                    AND first_seen_at < NOW() - INTERVAL '7 days' THEN 1 END) as last_week
+    FROM products
+    WHERE brand NOT IN {EXCLUDED_ALL}
+      AND first_seen_at >= NOW() - INTERVAL '14 days'
+    GROUP BY brand
+    HAVING COUNT(CASE WHEN first_seen_at >= NOW() - INTERVAL '7 days' THEN 1 END) > 10
+        OR COUNT(CASE WHEN first_seen_at >= NOW() - INTERVAL '14 days'
+                       AND first_seen_at < NOW() - INTERVAL '7 days' THEN 1 END) > 10
+    ORDER BY this_week DESC
+    """
+    return R.df_sql(conn, sql)
+
+
+def q_price_movements(conn):
+    sql = f"""
+    SELECT
+        pe.brand,
+        p.category_normalized as cat,
+        COUNT(*) as changes,
+        COUNT(*) FILTER (WHERE pe.direction = 'up') as increases,
+        COUNT(*) FILTER (WHERE pe.direction = 'down') as decreases,
+        ROUND(AVG(CASE WHEN pe.direction='down'
+              THEN 100.0*(1 - pe.price_after/pe.price_before) END), 1) as avg_cut_pct
+    FROM price_events pe
+    JOIN products p ON p.id = pe.product_id
+    WHERE pe.recorded_at > NOW() - INTERVAL '7 days'
+      AND pe.brand NOT IN {EXCLUDED_ALL}
+      AND p.category_normalized NOT IN ('uncategorized')
+    GROUP BY pe.brand, p.category_normalized
+    HAVING COUNT(*) > 50
+    ORDER BY changes DESC
+    """
+    return R.df_sql(conn, sql)
+
+
 # ---------------------------------------------------------------------------
 #  Board assembly
 # ---------------------------------------------------------------------------
 
 def build_stock_board(conn):
-    """Assemble the stock action board."""
     st = q_sell_through_by_depth(conn)
     sp = q_speed_to_sell(conn)
     ci_data = q_confidence_inputs(conn)
     pers = q_bestseller_persistence(conn)
 
-    # Pivot sell-through by depth
     items = {}
     for _, r in st.iterrows():
         key = (r["cat"], r["sub"])
@@ -254,9 +325,7 @@ def build_stock_board(conn):
         n = int(r["products"])
         so = int(r["with_sellout"])
         rate = round(100 * so / n, 1) if n > 0 else 0
-        items[key]["depths"][r["depth"]] = {
-            "rate": rate, "n": n, "ci": ci95(rate/100, n)
-        }
+        items[key]["depths"][r["depth"]] = {"rate": rate, "n": n, "ci": ci95(rate/100, n)}
 
     rows = []
     for key, item in items.items():
@@ -265,33 +334,25 @@ def build_stock_board(conn):
         if not depths:
             continue
 
-        # Confidence
         cir = ci_data[(ci_data["cat"] == cat) & (ci_data["sub"] == sub)]
         if not cir.empty:
-            n_br = int(cir.iloc[0]["brands"])
-            n_pr = int(cir.iloc[0]["products"])
-            n_se = int(cir.iloc[0]["with_sellout"])
+            n_br, n_pr, n_se = int(cir.iloc[0]["brands"]), int(cir.iloc[0]["products"]), int(cir.iloc[0]["with_sellout"])
         else:
             n_br, n_pr, n_se = 0, 0, 0
         conf = conf_level(n_br, n_pr, n_se)
 
-        # Speed
         spd = sp[(sp["cat"] == cat) & (sp["sub"] == sub)]
         med_days = int(spd.iloc[0]["median_days"]) if not spd.empty else None
 
-        # Persistence
         pr = pers[(pers["cat"] == cat) & (pers["sub"] == sub)]
         avg_wk = float(pr.iloc[0]["avg_weeks"]) if not pr.empty else 0
 
-        # Find best depth
         best_depth = max(depths, key=lambda d: depths[d]["rate"])
         fp = depths.get("full_price", {}).get("rate", 0)
 
         rows.append({
-            "cat": cat, "sub": sub,
-            "brands": n_br, "products": n_pr, "conf": conf,
-            "depths": depths, "best_depth": best_depth,
-            "full_price_rate": fp,
+            "cat": cat, "sub": sub, "brands": n_br, "products": n_pr, "conf": conf,
+            "depths": depths, "best_depth": best_depth, "full_price_rate": fp,
             "med_days": med_days, "avg_weeks": avg_wk,
         })
 
@@ -299,37 +360,24 @@ def build_stock_board(conn):
 
 
 def assign_stock_verdict(row):
-    """Assign stock action verdict."""
     depths = row["depths"]
     fp = depths.get("full_price", {}).get("rate", 0)
     light = depths.get("1_24", {}).get("rate", 0)
     mid = depths.get("25_39", {}).get("rate", 0)
     deep = depths.get("40p", {}).get("rate", 0)
 
-    # All depths below 12% — nothing works
     if all(d.get("rate", 0) < 12 for d in depths.values()):
         return "stop", "Stop — outlet"
-
-    # Full price is best and discounting hurts
     if fp > light and fp > mid and fp >= deep * 0.8 and fp >= 20:
         return "raise", "Test price increase"
-
-    # Light discount is clearly best
     if light > fp * 1.3 and light > mid and light > deep:
-        return "light", f"Reduce to ~20%"
-
-    # Deep discount is clearly best and mid is worse
+        return "light", "Reduce to ~20%"
     if deep > fp and deep > light and deep > mid:
         return "deep", "Hold or go 40%+"
-
-    # Mid range works
     if mid > fp * 1.3 and mid >= deep * 0.8:
-        return "light", f"Start at ~25%"
-
-    # Working fine at full/light
+        return "light", "Start at ~25%"
     if fp >= 15 or light >= 25:
         return "hold", "Hold price"
-
     return "hold", "Hold price"
 
 
@@ -398,67 +446,109 @@ td.m{font-family:var(--mono);font-size:12px}tr:last-child td{border-bottom:none}
 .hm .hot{background:#daf1dc;font-weight:700;color:var(--good)}
 .hm .warm{background:#fef9e7;color:var(--warn)}
 .hm .cold{background:#fce8e6;color:var(--bad)}
+.hm .neut{background:var(--paper);color:var(--faint)}
 .hm .sub-ci{display:block;font-size:8.5px;color:var(--faint);font-weight:400}
 .cov{font-family:var(--mono);font-size:11px;color:var(--muted);line-height:2}
 .cov b{color:var(--ink);font-weight:600}.cov .x{color:var(--bad)}.cov span{display:inline-block;margin-right:18px}
+.diff-box{background:var(--blue-bg);border:1px solid #C7D9F7;border-radius:6px;padding:14px 16px}
+.diff-hd{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
+.diff-row{display:flex;gap:8px;align-items:flex-start;padding:5px 0}
+.diff-row+.diff-row{border-top:1px solid #dde6f7}
+.diff-arrow{font-family:var(--mono);font-size:13px;width:18px;text-align:center;flex-shrink:0}
+.diff-txt{font-size:13.5px;line-height:1.5}
 @media(max-width:700px){body{font-size:14px}.wrap{padding:0 14px 60px}.verdict{padding:14px 16px}.verdict .v{font-size:15.5px}.blk>.bd{padding:14px}.table-wrap{margin:0 -14px;padding:0 14px}.note{font-size:12.5px}.cov span{display:block;margin-right:0}.temp-read{display:none}}
 @media(max-width:450px){.bar .date{margin-left:0;flex-basis:100%}.verdict .v{font-size:14.5px}table{font-size:12px}th,td{padding:7px 6px}}
 """
 
 
 def render_depth_cell(depths, band_key, best_depth):
-    """Render a single depth cell with proof dot and CI."""
     d = depths.get(band_key)
     if not d or d["n"] < 5:
-        return '<span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span>'
-
+        return '<td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>'
     dot_cls = "best" if band_key == best_depth else "ok" if d["rate"] >= 20 else "bad"
     style = ' style="color:var(--good);"' if band_key == best_depth else ""
     ci_txt = f'<br><span class="ci">±{d["ci"]}</span>' if d["ci"] > 0 else ""
-    return (f'<span class="proof"><span class="proof-dot {dot_cls}"></span>'
-            f'<span class="proof-pct"{style}>{d["rate"]}%</span></span>{ci_txt}')
+    return (f'<td><span class="proof"><span class="proof-dot {dot_cls}"></span>'
+            f'<span class="proof-pct"{style}>{d["rate"]}%</span></span>{ci_txt}</td>')
 
 
-def render_stock_row(row):
-    """Render a single stock action board row."""
-    verdict, label = assign_stock_verdict(row)
-    depths = row["depths"]
-    speed_txt = f'{row["med_days"]} days to sell' if row["med_days"] else "—"
+def render_weekly_diff(conn):
+    """§01 — data-driven weekly diff. Same scope note as report_master_order.py:
+    tracks market signals (launches, price moves), not board-state changes."""
+    launches = q_launches_by_brand(conn)
+    moves = q_price_movements(conn)
+    mt = q_market_temp(conn)
 
-    return f"""<tr>
-  <td>{esc(row['cat'])} · <b>{esc(row['sub'])}</b><br>
-    <span class="speed"><span class="conf {row['conf']}"></span> {row['brands']} brands · {row['products']:,} products</span></td>
-  <td><span class="pill {verdict}">{esc(label)}</span></td>
-  {render_depth_cell(depths, 'full_price', row['best_depth'])}
-  {render_depth_cell(depths, '1_24', row['best_depth'])}
-  {render_depth_cell(depths, '25_39', row['best_depth'])}
-  {render_depth_cell(depths, '40p', row['best_depth'])}
-  <td><span class="speed">{speed_txt}</span></td>
-</tr>"""
+    rows_html = ""
+    count = 0
 
-    # Fixed: render_depth_cell returns <td>-less content, need to wrap
-    fp = render_depth_cell(depths, 'full_price', row['best_depth'])
-    l = render_depth_cell(depths, '1_24', row['best_depth'])
-    m = render_depth_cell(depths, '25_39', row['best_depth'])
-    d = render_depth_cell(depths, '40p', row['best_depth'])
+    if len(mt) >= 2:
+        last_two = mt.tail(2)
+        prev_ratio = float(last_two.iloc[0]["ratio"] or 0)
+        curr_ratio = float(last_two.iloc[1]["ratio"] or 0)
+        if prev_ratio > 0 and abs(curr_ratio - prev_ratio) / prev_ratio > 0.25:
+            direction = "up" if curr_ratio > prev_ratio else "down"
+            arrow_color = "var(--bad)" if direction == "up" else "var(--good)"
+            reading = "demand pulling ahead of supply" if direction == "up" else "supply catching up to demand"
+            rows_html += (f'<div class="diff-row"><span class="diff-arrow" style="color:{arrow_color};">'
+                          f'{"▲" if direction=="up" else "▼"}</span>'
+                          f'<div class="diff-txt"><b>Market temperature shifted</b> — sell-out/restock ratio '
+                          f'moved from {prev_ratio}× to {curr_ratio}×. {reading.capitalize()}.</div></div>')
+            count += 1
 
-    return f"""<tr>
-  <td>{esc(row['cat'])} · <b>{esc(row['sub'])}</b><br>
-    <span class="speed"><span class="conf {row['conf']}"></span> {row['brands']} brands · {row['products']:,} products</span></td>
-  <td><span class="pill {verdict}">{esc(label)}</span></td>
-  <td>{fp}</td><td>{l}</td><td>{m}</td><td>{d}</td>
-  <td><span class="speed">{speed_txt}</span></td>
-</tr>"""
+    for _, r in launches.iterrows():
+        if count >= 4: break
+        tw, lw = int(r["this_week"]), int(r["last_week"])
+        if lw == 0 and tw >= 30:
+            rows_html += (f'<div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span>'
+                          f'<div class="diff-txt"><b>{esc(r["brand"])} returned to launching</b> — '
+                          f'{tw:,} new products after little to no activity last week.</div></div>')
+            count += 1
+        elif lw > 0 and tw >= lw * 2 and tw >= 30:
+            rows_html += (f'<div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span>'
+                          f'<div class="diff-txt"><b>{esc(r["brand"])} ramped up launches</b> — '
+                          f'{tw:,} new products this week, up from {lw:,}.</div></div>')
+            count += 1
+
+    for _, r in moves.iterrows():
+        if count >= 6: break
+        inc, dec, chg = int(r["increases"]), int(r["decreases"]), int(r["changes"])
+        if inc >= chg * 0.9 and inc >= 50:
+            rows_html += (f'<div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span>'
+                          f'<div class="diff-txt"><b>{esc(r["brand"])} raised {esc(r["cat"])} prices</b> — '
+                          f'{inc} increases, {dec} cuts. Confidence signal.</div></div>')
+            count += 1
+        elif dec >= chg * 0.9 and dec >= 50:
+            cut_pct = r["avg_cut_pct"]
+            cut_txt = f" (avg −{cut_pct}%)" if cut_pct == cut_pct else ""
+            rows_html += (f'<div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span>'
+                          f'<div class="diff-txt"><b>{esc(r["brand"])} cut {esc(r["cat"])} prices broadly</b> — '
+                          f'{dec} cuts{cut_txt}, {inc} increases.</div></div>')
+            count += 1
+
+    if not rows_html:
+        rows_html = '<div class="diff-row"><div class="diff-txt">No major market moves detected this week.</div></div>'
+
+    return f"""<section class="blk">
+  <div class="hd"><span class="n">01</span><span class="t">What changed since last week</span>
+    <span class="badge new">WEEKLY DIFF</span></div>
+  <div class="bd"><div class="diff-box">
+    <div class="diff-hd">Market moves &amp; price shifts</div>
+    {rows_html}
+  </div>
+  <div class="note">Tracks brand launch volume, price-move patterns, and market temperature
+    week over week. Doesn't yet track board-position changes (e.g. a category moving from
+    HOLD to STOP) — that needs a stored snapshot of last week's board, planned as a follow-up.</div>
+  </div>
+</section>"""
 
 
 def render(conn):
-    """Generate the full master stock report HTML."""
     rows = build_stock_board(conn)
     adm = q_age_discount_matrix(conn)
     ba = q_brand_activity(conn)
     mt = q_market_temp(conn)
 
-    # Tier rows
     tiers = {"stop": [], "light": [], "deep": [], "raise": [], "hold": []}
     for r in rows:
         v, _ = assign_stock_verdict(r)
@@ -473,7 +563,6 @@ def render(conn):
     }
     tier_order = ["stop", "light", "deep", "raise", "hold"]
 
-    # Top verdict
     top_actions = []
     if tiers["stop"]:
         names = ", ".join(f'{r["cat"]} · {r["sub"]}' for r in tiers["stop"][:2])
@@ -498,29 +587,31 @@ def render(conn):
     Sell-through figures show margins of error. All findings are observed associations — not controlled experiments.</div>
 </div>"""
 
-    # Board
+    diff_html = render_weekly_diff(conn)
+
     board_rows = ""
     for tier in tier_order:
         if not tiers[tier]:
             continue
         board_rows += f'<tr><td colspan="7" class="tier">{esc(tier_labels[tier])}</td></tr>'
-        for r in tiers[tier][:5]:  # cap at 5 per tier
+        for r in tiers[tier][:5]:
             depths = r["depths"]
             v, label = assign_stock_verdict(r)
             speed_txt = f'{r["med_days"]} days to sell' if r["med_days"] else "—"
-
             fp = render_depth_cell(depths, 'full_price', r['best_depth'])
             l_cell = render_depth_cell(depths, '1_24', r['best_depth'])
             m_cell = render_depth_cell(depths, '25_39', r['best_depth'])
             d_cell = render_depth_cell(depths, '40p', r['best_depth'])
-
             board_rows += f"""<tr>
   <td>{esc(r['cat'])} · <b>{esc(r['sub'])}</b><br>
     <span class="speed"><span class="conf {r['conf']}"></span> {r['brands']} brands · {r['products']:,} products</span></td>
   <td><span class="pill {v}">{esc(label)}</span></td>
-  <td>{fp}</td><td>{l_cell}</td><td>{m_cell}</td><td>{d_cell}</td>
+  {fp}{l_cell}{m_cell}{d_cell}
   <td><span class="speed">{speed_txt}</span></td>
 </tr>"""
+
+    if not board_rows:
+        board_rows = '<tr><td colspan="7" style="text-align:center;color:var(--faint);padding:20px;">No qualifying categories this week.</td></tr>'
 
     board_html = f"""<section class="blk">
   <div class="hd"><span class="n">02</span>
@@ -546,11 +637,9 @@ def render(conn):
   </div>
 </section>"""
 
-    # Age × Discount heatmap
     age_order = ["0-14d", "15-30d", "31-60d", "60d+"]
     depth_order = ["full_price", "1_19", "20_29", "30_39", "40p"]
-    depth_labels = {"full_price": "Full price", "1_19": "1-19%", "20_29": "20-29%",
-                    "30_39": "30-39%", "40p": "40%+"}
+    depth_labels = {"full_price": "Full price", "1_19": "1-19%", "20_29": "20-29%", "30_39": "30-39%", "40p": "40%+"}
 
     hm_rows = ""
     for age in age_order:
@@ -585,42 +674,31 @@ def render(conn):
   </div>
 </section>"""
 
-    # Competitor radar
     brand_rows = ""
     for _, b in ba.head(12).iterrows():
-        launches = int(b["launches"])
-        prev = int(b["prev_launches"])
-        pc = int(b["price_chg"])
-        so = int(b["sellouts"])
+        launches, prev, pc = int(b["launches"]), int(b["prev_launches"]), int(b["price_chg"])
+        p_up, p_down, so = int(b["price_up"]), int(b["price_down"]), int(b["sellouts"])
 
         if prev > 0:
-            if launches > prev * 1.5:
-                delta_html = f'<span class="delta up">▲ {prev}</span>'
-            elif launches < prev * 0.5:
-                delta_html = f'<span class="delta down">▼ {prev}</span>'
-            else:
-                delta_html = f'<span class="delta flat">≈</span>'
+            if launches > prev * 1.5: delta_html = f'<span class="delta up">▲ {prev}</span>'
+            elif launches < prev * 0.5: delta_html = f'<span class="delta down">▼ {prev}</span>'
+            else: delta_html = '<span class="delta flat">≈</span>'
         else:
-            delta_html = f'<span class="delta up">▲ 0</span>' if launches > 0 else '<span class="delta flat">=</span>'
+            delta_html = '<span class="delta up">▲ 0</span>' if launches > 0 else '<span class="delta flat">=</span>'
 
-        # Posture
-        if launches > 50 and so > launches:
-            posture = "attack"
-        elif pc > launches * 2:
-            posture = "manage"
-        elif pc > 100 and launches < 30:
-            posture = "defend"
-        elif launches < 10 and pc < 20:
-            posture = "sleep"
-        else:
-            posture = "manage"
-        posture_labels = {"attack": "Attacking", "manage": "Managing",
-                         "defend": "Defending", "sleep": "Quiet"}
+        arrow = " ↑" if pc > 0 and p_up >= pc * 0.9 else " ↓" if pc > 0 and p_down >= pc * 0.9 else " ↕" if pc > 0 else ""
+
+        if launches > 50 and so > launches: posture = "attack"
+        elif pc > launches * 2: posture = "manage"
+        elif pc > 100 and launches < 30: posture = "defend"
+        elif launches < 10 and pc < 20: posture = "sleep"
+        else: posture = "manage"
+        posture_labels = {"attack": "Attacking", "manage": "Managing", "defend": "Defending", "sleep": "Quiet"}
 
         brand_rows += f"""<tr>
   <td><b>{esc(b['brand'])}</b></td>
   <td class="m">{launches:,}</td><td>{delta_html}</td>
-  <td class="m">{pc:,}</td><td class="m">{so:,}</td>
+  <td class="m">{pc:,}{arrow}</td><td class="m">{so:,}</td>
   <td><span class="posture {posture}">{posture_labels[posture]}</span></td>
 </tr>"""
 
@@ -634,25 +712,25 @@ def render(conn):
       <th>Price chg</th><th>Sell-outs</th><th>Posture</th>
     </tr></thead><tbody>{brand_rows}</tbody></table></div>
     <div class="note"><b>Attacking</b> = launching + growing. <b>Managing</b> = adjusting existing.
-      <b>Defending</b> = cutting prices. <b>Quiet</b> = minimal activity.</div>
+      <b>Defending</b> = cutting prices. <b>Quiet</b> = minimal activity.
+      Arrows: ↑ mostly increases, ↓ mostly cuts, ↕ mixed.</div>
   </div>
 </section>"""
 
-    # Market temperature
     temp_rows_html = ""
-    for _, t in mt.iterrows():
-        so = int(t["sellouts"])
-        rs = int(t["restocks"])
-        total = so + rs or 1
-        so_pct = so / total * 100
-        rs_pct = rs / total * 100
-        ratio = float(t["ratio"]) if t["ratio"] else 0
-        color = "var(--good)" if ratio < 1 else "var(--bad)" if ratio > 3 else "var(--act)"
-        label = "Supply catching up" if ratio < 1 else "Peak demand" if ratio > 3 else "Demand ahead"
-        week_str = str(t["week"])[:10]
-
-        temp_rows_html += f"""<div class="temp-row">
-  <span class="temp-week">{esc(week_str[5:])}</span>
+    if mt.empty:
+        temp_rows_html = '<div style="color:var(--faint);font-size:13px;">Not enough complete weeks of data yet.</div>'
+    else:
+        for _, t in mt.iterrows():
+            so, rs = int(t["sellouts"]), int(t["restocks"])
+            total = so + rs or 1
+            so_pct, rs_pct = so/total*100, rs/total*100
+            ratio = float(t["ratio"]) if t["ratio"] else 0
+            color = "var(--good)" if ratio < 1 else "var(--bad)" if ratio > 3 else "var(--act)"
+            label = "Supply catching up" if ratio < 1 else "Peak demand" if ratio > 3 else "Demand ahead"
+            week_str = str(t["week"])[5:10]
+            temp_rows_html += f"""<div class="temp-row">
+  <span class="temp-week">{esc(week_str)}</span>
   <div class="temp-bar"><div class="temp-seg so" style="width:{so_pct:.0f}%;"></div>
     <div class="temp-seg rs" style="width:{rs_pct:.0f}%;"></div></div>
   <span class="temp-ratio" style="color:{color};">{ratio}×</span>
@@ -664,28 +742,30 @@ def render(conn):
     <span class="t">Market temperature — is the window closing?</span></div>
   <div class="bd">{temp_rows_html}
     <div class="note"><b>What this means:</b> Above 1× = demand ahead of supply.
-      Below 1× = supply catching up. Categories where you're holding price
-      still have room. Categories where everyone's discounting won't recover.</div>
+      Below 1× = supply catching up. Shows the last 4 <b>complete</b> weeks —
+      the current in-progress week is excluded since it's always partial when this report runs.
+      Categories where you're holding price still have room. Categories where everyone's
+      discounting won't recover.</div>
   </div>
 </section>"""
 
-    # Coverage
     coverage_html = """<section class="blk">
   <div class="hd"><span class="n">06</span><span class="t">Methodology & reliability</span></div>
   <div class="bd"><div class="cov">
     <span><b>Sell-through by depth:</b> witnessed sell-outs cross-referenced with current discount, 21 days</span>
+    <span><b>Prices:</b> each product's latest snapshot within the last 8 days (not a single fixed date)</span>
     <span><b>Discount depth:</b> uses first-observed price (not brand's compare-at, which brands inflate)</span>
     <span><b>Confidence intervals:</b> approximate 95% binomial CI — within-brand correlation means true uncertainty is wider</span>
     <span><b>Speed to sell:</b> median days from launch to first witnessed sell-out</span>
     <span><b>Age × discount:</b> all categories combined — patterns may differ within subcategories</span>
+    <span><b>Market temperature:</b> last 4 complete calendar weeks, current in-progress week excluded</span>
     <span class="x">All findings are <b>observed associations</b>, not causal estimates</span>
     <span class="x">Excludes DeFacto sell-outs (stock unreliable), Tree, Dalydress (phantom data)</span>
   </div></div>
 </section>"""
 
-    # Assemble
     today = date.today().isoformat()
-    body = verdict_html + board_html + heatmap_html + radar_html + temp_html + coverage_html
+    body = verdict_html + diff_html + board_html + heatmap_html + radar_html + temp_html + coverage_html
 
     page = f"""<!doctype html>
 <html lang="en"><head>
