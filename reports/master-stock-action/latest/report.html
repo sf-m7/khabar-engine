@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Khabar — What to Do With Your Stock</title>
+<style>
+:root{--paper:#FAFAF8;--ink:#1B1B19;--muted:#6C6A64;--faint:#9A978F;
+--line:#DAD7CF;--box:#EFEDE7;--grid:#E6E3DB;
+--act:#B45309;--act-bg:#FBF1E3;--good:#3F7A4B;--good-bg:#EDF5EE;
+--warn:#B4820A;--warn-bg:#FDF6E3;--bad:#B0413A;--bad-bg:#FBEEED;
+--blue:#2563EB;--blue-bg:#EFF4FF;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+*{box-sizing:border-box;margin:0}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1020px;margin:0 auto;padding:0 20px 80px}
+header{border-bottom:1px solid var(--line);background:var(--paper);position:sticky;top:0;z-index:10}
+.bar{max-width:1020px;margin:0 auto;padding:12px 20px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.bar h1{font-size:16px;font-weight:700}.bar .tag{font-family:var(--mono);font-size:10px;color:#fff;background:var(--bad);border-radius:3px;padding:2px 6px;font-weight:600}
+.bar .date{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.verdict{border:1px solid var(--bad);background:var(--bad-bg);border-radius:8px;padding:18px 20px;margin:20px 0 8px}
+.verdict .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--bad);text-transform:uppercase;font-weight:700}
+.verdict .v{font-size:17px;font-weight:700;margin:8px 0 6px;line-height:1.45}.verdict .sub{font-size:13.5px;color:var(--muted);line-height:1.55}
+section.blk{border:1px solid var(--line);border-radius:8px;background:#fff;margin:16px 0;overflow:hidden}
+.blk>.hd{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--box);flex-wrap:wrap}
+.blk>.hd .n{font-family:var(--mono);font-size:10.5px;color:var(--faint)}.blk>.hd .t{font-size:13.5px;font-weight:650}
+.blk>.hd .badge{margin-left:auto;font-family:var(--mono);font-size:9.5px;padding:2px 8px;border-radius:20px;color:#fff;font-weight:600}
+.blk>.hd .badge.key{background:var(--bad)}.blk>.hd .badge.new{background:var(--blue)}.blk>.hd .badge.mkt{background:#555}
+.blk>.bd{padding:16px 18px}
+.note{font-size:13px;color:var(--muted);line-height:1.6;margin:14px 0 0;padding:10px 12px;background:var(--paper);border-radius:5px;border-left:3px solid var(--grid)}
+.note b{color:var(--ink);font-weight:600}
+.intro{font-size:13.5px;color:var(--muted);line-height:1.55;margin-bottom:14px}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -18px;padding:0 18px}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:800px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;color:var(--faint);text-transform:uppercase;position:sticky;top:0;background:#fff}
+td.m{font-family:var(--mono);font-size:12px}tr:last-child td{border-bottom:none}
+.pill{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:20px;color:#fff;display:inline-block;font-weight:700;white-space:nowrap}
+.pill.hold{background:var(--good)}.pill.light{background:var(--act)}.pill.deep{background:var(--bad)}.pill.stop{background:#7C2D12}.pill.raise{background:var(--blue)}
+.b{font-family:var(--mono);font-size:10px;display:inline-block;background:var(--box);border-radius:3px;padding:1px 6px;margin:1px 2px}
+.b.first{background:var(--act-bg);border:1px solid #E8C98E;color:var(--act);font-weight:700}
+.tier{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;padding:10px 10px 5px;color:var(--faint);border-top:1px solid var(--line);background:var(--paper)}
+.proof{display:inline-flex;align-items:center;gap:3px}
+.proof-dot{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+.proof-dot.best{background:var(--good)}.proof-dot.ok{background:var(--act)}.proof-dot.bad{background:var(--bad)}.proof-dot.neutral{background:var(--grid)}
+.proof-pct{font-family:var(--mono);font-size:11px;font-weight:600}
+.conf{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
+.conf.hi{background:var(--good)}.conf.md{background:var(--warn)}.conf.lo{background:var(--bad)}
+.ci{font-family:var(--mono);font-size:9px;color:var(--faint);font-weight:400}
+.speed{font-family:var(--mono);font-size:9.5px;color:var(--faint);display:block;margin-top:2px}
+.posture{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:20px;color:#fff;display:inline-block;font-weight:700}
+.posture.attack{background:var(--good)}.posture.manage{background:var(--act)}.posture.defend{background:var(--bad)}.posture.sleep{background:var(--faint)}
+.delta{font-family:var(--mono);font-size:10.5px;font-weight:600}
+.delta.up{color:var(--good)}.delta.down{color:var(--bad)}.delta.flat{color:var(--faint)}
+.temp-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--grid)}
+.temp-row:last-child{border-bottom:none}
+.temp-week{font-family:var(--mono);font-size:11px;color:var(--faint);width:55px;flex-shrink:0}
+.temp-bar{flex:1;display:flex;gap:2px}
+.temp-seg{height:18px;border-radius:2px}.temp-seg.so{background:var(--act)}.temp-seg.rs{background:var(--good-bg);border:1px solid #A8D5AD}
+.temp-ratio{font-family:var(--mono);font-size:12px;font-weight:600;width:45px;text-align:right;flex-shrink:0}
+.temp-read{font-family:var(--mono);font-size:10px;color:var(--faint);width:95px;flex-shrink:0}
+.hm{border-collapse:collapse;min-width:500px}
+.hm th,.hm td{text-align:center;padding:8px 10px;font-family:var(--mono);font-size:12px}
+.hm .hot{background:#daf1dc;font-weight:700;color:var(--good)}
+.hm .warm{background:#fef9e7;color:var(--warn)}
+.hm .cold{background:#fce8e6;color:var(--bad)}
+.hm .sub-ci{display:block;font-size:8.5px;color:var(--faint);font-weight:400}
+.cov{font-family:var(--mono);font-size:11px;color:var(--muted);line-height:2}
+.cov b{color:var(--ink);font-weight:600}.cov .x{color:var(--bad)}.cov span{display:inline-block;margin-right:18px}
+@media(max-width:700px){body{font-size:14px}.wrap{padding:0 14px 60px}.verdict{padding:14px 16px}.verdict .v{font-size:15.5px}.blk>.bd{padding:14px}.table-wrap{margin:0 -14px;padding:0 14px}.note{font-size:12.5px}.cov span{display:block;margin-right:0}.temp-read{display:none}}
+@media(max-width:450px){.bar .date{margin-left:0;flex-basis:100%}.verdict .v{font-size:14.5px}table{font-size:12px}th,td{padding:7px 6px}}
+</style>
+</head><body>
+<header><div class="bar">
+  <h1>Khabar — What to Do With Your Stock</h1>
+  <span class="tag">LIVE</span>
+  <span class="date">week of 2026-08-17</span>
+</div></header>
+<div class="wrap"><div class="verdict">
+  <div class="lbl">This week's action</div>
+  <div class="v">No urgent actions this week.</div>
+  <div class="sub">Every recommendation carries a confidence level based on sample size and brand coverage.
+    Sell-through figures show margins of error. All findings are observed associations — not controlled experiments.</div>
+</div><section class="blk">
+  <div class="hd"><span class="n">02</span>
+    <span class="t">The stock action board — what to do with each category</span>
+    <span class="badge key">KEY SECTION</span></div>
+  <div class="bd">
+    <p class="intro">Confidence: <span class="conf hi"></span> high
+      <span class="conf md"></span> medium <span class="conf lo"></span> low.
+      Sell-through shows ±margin of error. Speed = median days to first sell-out.</p>
+    <div class="table-wrap"><table><thead><tr>
+      <th>What you have</th><th>What to do</th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">full price</span></th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">1-24%</span></th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">25-39%</span></th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">40%+</span></th>
+      <th>Speed &amp; context</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="note"><b>How to read this:</b> Green dot = best sell-through at that depth.
+      ± figures are approximate 95% confidence margins.
+      <br><br><b>Important:</b> These are <b>observed associations</b> — products discounted to 40%
+      may already be the ones that weren't selling. Use alongside the age × discount table (§03)
+      for a more complete picture.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">03</span>
+    <span class="t">Does product age change the picture? — age × discount heatmap</span></div>
+  <div class="bd">
+    <p class="intro">Sell-through by product age × discount depth. Shows how the two interact.</p>
+    <div class="table-wrap"><table class="hm"><thead><tr>
+      <th style="text-align:left;">Product age</th>
+      <th>Full price</th><th>1-19%</th><th>20-29%</th><th>30-39%</th><th>40%+</th>
+    </tr></thead><tbody><tr><td style="text-align:left;"><b>0-14d</b></td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td></tr><tr><td style="text-align:left;"><b>15-30d</b></td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td></tr><tr><td style="text-align:left;"><b>31-60d</b></td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td></tr><tr><td style="text-align:left;"><b>60d+</b></td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td><td class="neut">—</td></tr></tbody></table></div>
+    <div class="note"><b>Key insights:</b> 15-30 day products respond best to light discounts.
+      31-60 day products need any discount at all. 0-14 day products should generally launch
+      at full price. Cells with n &lt; 30 marked ⚠ — low confidence.
+      <br><br>All figures are <b>observed associations</b> across the entire market, not controlled experiments.
+      n = sample size.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">04</span>
+    <span class="t">What your competitors did this week</span>
+    <span class="badge mkt">MARKET CONTEXT</span></div>
+  <div class="bd">
+    <div class="table-wrap"><table><thead><tr>
+      <th>Brand</th><th>Launches</th><th>vs last wk</th>
+      <th>Price chg</th><th>Sell-outs</th><th>Posture</th>
+    </tr></thead><tbody><tr>
+  <td><b>defacto</b></td>
+  <td class="m">714</td><td><span class="delta up">▲ 249</span></td>
+  <td class="m">984</td><td class="m">0</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>lc_waikiki</b></td>
+  <td class="m">610</td><td><span class="delta up">▲ 254</span></td>
+  <td class="m">1,819</td><td class="m">39</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>ravin</b></td>
+  <td class="m">422</td><td><span class="delta down">▼ 996</span></td>
+  <td class="m">270</td><td class="m">951</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>activ</b></td>
+  <td class="m">107</td><td><span class="delta flat">≈</span></td>
+  <td class="m">53</td><td class="m">853</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>town_team</b></td>
+  <td class="m">78</td><td><span class="delta up">▲ 1</span></td>
+  <td class="m">958</td><td class="m">1,608</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>tie_house</b></td>
+  <td class="m">53</td><td><span class="delta flat">≈</span></td>
+  <td class="m">0</td><td class="m">297</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>cizaro</b></td>
+  <td class="m">46</td><td><span class="delta up">▲ 18</span></td>
+  <td class="m">0</td><td class="m">157</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>arafa</b></td>
+  <td class="m">42</td><td><span class="delta down">▼ 199</span></td>
+  <td class="m">0</td><td class="m">746</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>mens_club</b></td>
+  <td class="m">33</td><td><span class="delta down">▼ 76</span></td>
+  <td class="m">37</td><td class="m">963</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>tomato</b></td>
+  <td class="m">18</td><td><span class="delta flat">≈</span></td>
+  <td class="m">35</td><td class="m">1,943</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>khotwh</b></td>
+  <td class="m">17</td><td><span class="delta down">▼ 91</span></td>
+  <td class="m">64</td><td class="m">380</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>mlameh</b></td>
+  <td class="m">10</td><td><span class="delta flat">≈</span></td>
+  <td class="m">0</td><td class="m">259</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>Attacking</b> = launching + growing. <b>Managing</b> = adjusting existing.
+      <b>Defending</b> = cutting prices. <b>Quiet</b> = minimal activity.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">05</span>
+    <span class="t">Market temperature — is the window closing?</span></div>
+  <div class="bd"><div class="temp-row">
+  <span class="temp-week">07-27</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:71%;"></div>
+    <div class="temp-seg rs" style="width:29%;"></div></div>
+  <span class="temp-ratio" style="color:var(--act);">2.42×</span>
+  <span class="temp-read">Demand ahead</span>
+</div><div class="temp-row">
+  <span class="temp-week">08-03</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:76%;"></div>
+    <div class="temp-seg rs" style="width:24%;"></div></div>
+  <span class="temp-ratio" style="color:var(--bad);">3.18×</span>
+  <span class="temp-read">Peak demand</span>
+</div><div class="temp-row">
+  <span class="temp-week">08-10</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:73%;"></div>
+    <div class="temp-seg rs" style="width:27%;"></div></div>
+  <span class="temp-ratio" style="color:var(--act);">2.77×</span>
+  <span class="temp-read">Demand ahead</span>
+</div><div class="temp-row">
+  <span class="temp-week">08-17</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:25%;"></div>
+    <div class="temp-seg rs" style="width:75%;"></div></div>
+  <span class="temp-ratio" style="color:var(--good);">0.33×</span>
+  <span class="temp-read">Supply catching up</span>
+</div>
+    <div class="note"><b>What this means:</b> Above 1× = demand ahead of supply.
+      Below 1× = supply catching up. Categories where you're holding price
+      still have room. Categories where everyone's discounting won't recover.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">06</span><span class="t">Methodology & reliability</span></div>
+  <div class="bd"><div class="cov">
+    <span><b>Sell-through by depth:</b> witnessed sell-outs cross-referenced with current discount, 21 days</span>
+    <span><b>Discount depth:</b> uses first-observed price (not brand's compare-at, which brands inflate)</span>
+    <span><b>Confidence intervals:</b> approximate 95% binomial CI — within-brand correlation means true uncertainty is wider</span>
+    <span><b>Speed to sell:</b> median days from launch to first witnessed sell-out</span>
+    <span><b>Age × discount:</b> all categories combined — patterns may differ within subcategories</span>
+    <span class="x">All findings are <b>observed associations</b>, not causal estimates</span>
+    <span class="x">Excludes DeFacto sell-outs (stock unreliable), Tree, Dalydress (phantom data)</span>
+  </div></div>
+</section></div>
+</body></html>
