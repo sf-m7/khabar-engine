@@ -1,0 +1,30 @@
+name: proxy-diag2
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install client
+        run: pip install curl_cffi
+      - name: Plain curl control (same run, same pool state)
+        env:
+          DI_USER: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DI_PASS: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DI_HOST: ${{ secrets.DATAIMPULSE_HOST }}
+        run: |
+          HOST="${DI_HOST:-gw.dataimpulse.com}"
+          echo "Gateway: $HOST"
+          for i in 1 2 3; do
+            curl -x "http://${DI_USER}__cr.eg:${DI_PASS}@${HOST}:823" https://dalydress.com -m 15 -o /dev/null -w "curl eg:823 -> %{http_code} (%{time_total}s)\n" -s
+          done
+      - name: curl_cffi matrix
+        env:
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DATAIMPULSE_HOST: ${{ secrets.DATAIMPULSE_HOST }}
+        run: python diag_proxy.py
