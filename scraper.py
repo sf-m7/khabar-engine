@@ -705,6 +705,12 @@ DATAIMPULSE_USER      = os.environ.get("DATAIMPULSE_PROXY_USERNAME", "")
 DATAIMPULSE_PASS      = os.environ.get("DATAIMPULSE_PROXY_PASSWORD", "")
 DATAIMPULSE_HOST      = env_str("DATAIMPULSE_HOST", "gw.dataimpulse.com")
 DATAIMPULSE_PORT      = 823
+# v14.49: Egypt's residential pool periodically congests — proven live
+# 2026-08-20, when a plain-curl control through eg:823 took 15.0s for a request
+# that runs in ~1s on a good hour. The old hardcoded 10s proxy timeouts killed
+# these slow-but-alive peers, skipping every brand (0 products, silent green
+# run). Generous + env-tunable so a bad pool hour no longer blanks the run.
+PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT", "45"))
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
 # ── v14.39: exit-country is now per-engine, not global ───────────────────────
@@ -1310,7 +1316,7 @@ def detect_options(variants):
 
 def check_domain(session, domain):
     try:
-        return execute_with_retry(session.get, f"https://{domain}", timeout=10,
+        return execute_with_retry(session.get, f"https://{domain}", timeout=PROXY_HTTP_TIMEOUT,
                                   headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
     except:
         return False
@@ -2344,7 +2350,7 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
         try:
-            response = execute_with_retry(session.get, url, timeout=30,
+            response = execute_with_retry(session.get, url, timeout=PROXY_HTTP_TIMEOUT,
                                           headers={"User-Agent": "Mozilla/5.0"})
         except Exception as e:
             print(f"  ⚠️ HTTP fault on page {page}: {e}")
