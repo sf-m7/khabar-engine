@@ -1,0 +1,24 @@
+name: proxy-diag
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test DataImpulse routes
+        env:
+          DI_USER: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DI_PASS: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DI_HOST: ${{ secrets.DATAIMPULSE_HOST }}
+        run: |
+          HOST="${DI_HOST:-gw.dataimpulse.com}"
+          echo "Gateway: $HOST"
+          for i in 1 2 3; do
+            curl -x "http://${DI_USER}__cr.eg:${DI_PASS}@${HOST}:823"   https://dalydress.com -m 30 -o /dev/null -w "A eg:823   -> %{http_code}\n" -s
+          done
+          for i in 1 2 3; do
+            curl -x "http://${DI_USER}__cr.eg:${DI_PASS}@${HOST}:12345" https://dalydress.com -m 30 -o /dev/null -w "B eg:12345 -> %{http_code}\n" -s
+          done
+          for i in 1 2 3; do
+            curl -x "http://${DI_USER}__cr.tr:${DI_PASS}@${HOST}:15000" https://dalydress.com -m 30 -o /dev/null -w "C tr:15000 -> %{http_code}\n" -s
+          done
