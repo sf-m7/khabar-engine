@@ -1315,10 +1315,17 @@ def detect_options(variants):
     return "option2", "option1"
 
 def check_domain(session, domain):
+    # v14.49: HEAD instead of GET — we only need the status code, not the
+    # homepage body. Saves one full homepage download per brand per run off the
+    # proxy meter. WAF/Cloudflare blocks score the TLS+IP fingerprint, not the
+    # HTTP method, so a real block still surfaces (403/429 -> False). 405/501
+    # mean the origin refuses HEAD specifically (not a block) -> reachable.
     try:
-        return execute_with_retry(session.get, f"https://{domain}", timeout=PROXY_HTTP_TIMEOUT,
-                                  headers={"User-Agent": "Mozilla/5.0"}).status_code == 200
-    except:
+        code = execute_with_retry(session.head, f"https://{domain}",
+                                  timeout=PROXY_HTTP_TIMEOUT,
+                                  headers={"User-Agent": "Mozilla/5.0"}).status_code
+        return code in (200, 405, 501)
+    except Exception:
         return False
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
@@ -5055,7 +5062,7 @@ def collect_bestseller_ranks(supabase, session):
             if existing and existing.data:
                 continue  # already collected today
 
-            url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit=250"
+            url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit={BESTSELLER_CAP}"
             try:
                 # v14.45 FIX: use the SAME session the brand's normal scrape
                 # uses, instead of the shared one passed in.
