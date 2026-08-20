@@ -786,6 +786,25 @@ def _lcw_http_version():
         print(f"  [LCW] HTTP/1.1 pinning unavailable ({e}); using default.")
         return None
 
+def _proxy_http_version():
+    """
+    v14.49: HTTP/1.1 pin for DataImpulse *proxy* sessions generally — not just
+    LCW. HTTP/2 through gw.dataimpulse.com fails intermittently (curl 28
+    connection timeouts / SETTINGS-frame errors); LCW was immunised in v14.48
+    but the Shopify/Woo proxy path (get_dataimpulse_session) was left on h2 and
+    silently blacked out all 20 proxied brands on 2026-08-18 when the gateway's
+    h2 degraded to ~100% failure. This value is injected PER REQUEST inside
+    execute_with_retry via session._khabar_http_version. Deliberately NOT gated
+    on LCW_FORCE_HTTP1 — the Shopify path must stay pinned regardless of the LCW
+    toggle. None-safe on older curl_cffi (degrades to default h2, no crash).
+    """
+    try:
+        from curl_cffi.const import CurlHttpVersion
+        return CurlHttpVersion.V1_1
+    except Exception as e:
+        print(f"  [proxy] HTTP/1.1 pinning unavailable ({e}); using default.")
+        return None
+
 # v14.40: LCW_PROXY_COUNTRY accepts a comma-separated LIST ("tr,sa,ae").
 # Each new sticky session picks one at random, so the crawl draws from the
 # combined residential pool of every listed country instead of one. A bad
@@ -1079,7 +1098,13 @@ def get_dataimpulse_session():
     proxy_user = f"{DATAIMPULSE_USER}__cr.{SHOPIFY_PROXY_COUNTRY}"
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
     print(f"  [DataImpulse] Egyptian residential proxy session selected.")
-    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    session = requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    # v14.49: pin HTTP/1.1 — same fix LCW got in v14.48. Without this the
+    # Shopify/Woo proxy path stays on HTTP/2, which hangs through
+    # gw.dataimpulse.com (curl 28). Injected per-request in execute_with_retry,
+    # the wrapper every Shopify/Woo/bestseller proxy call already routes through.
+    session._khabar_http_version = _proxy_http_version()
+    return session
 
 def get_shopify_session(brand_name):
     """
