@@ -1117,13 +1117,15 @@ def get_dataimpulse_session():
         port = DATAIMPULSE_PORT
         print(f"  [DataImpulse] Egyptian residential proxy session selected.")
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{port}"
-    session = requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
-    # v14.49: pin HTTP/1.1 — same fix LCW got in v14.48. Without this the
-    # Shopify/Woo proxy path stays on HTTP/2, which hangs through
-    # gw.dataimpulse.com (curl 28). Injected per-request in execute_with_retry,
-    # the wrapper every Shopify/Woo/bestseller proxy call already routes through.
-    session._khabar_http_version = _proxy_http_version()
-    return session
+    # v14.51: REVERTED the v14.49 HTTP/1.1 pin. Forcing http_version=V1_1 on a
+    # chrome124-impersonated session rewrites the ALPN to ["http/1.1"] only,
+    # which real Chrome never sends — Cloudflare (fronting these Shopify stores)
+    # flags the mismatched fingerprint and kills the TLS handshake abruptly
+    # (curl 35, SSL_ERROR_SYSCALL). The pin gave no benefit (the original
+    # outage was curl 28 pool congestion, not HTTP/2) and only broke the
+    # fingerprint. Shopify path stays on pure chrome124 = pre-edit behaviour.
+    # LCW keeps its own pin because its origin doesn't fingerprint like CF.
+    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def get_shopify_session(brand_name):
     """
