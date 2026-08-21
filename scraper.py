@@ -710,7 +710,7 @@ DATAIMPULSE_PORT      = 823
 # that runs in ~1s on a good hour. The old hardcoded 10s proxy timeouts killed
 # these slow-but-alive peers, skipping every brand (0 products, silent green
 # run). Generous + env-tunable so a bad pool hour no longer blanks the run.
-PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT", "45"))
+PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT") or "45")
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
 # ── v14.39: exit-country is now per-engine, not global ───────────────────────
@@ -5600,7 +5600,7 @@ if __name__ == "__main__":
     # without losing anything. Threshold tunable via ZERO_ALERT_FRACTION.
     zeroed = sorted(n for n, (seen, _) in brand_results.items() if seen == 0)
     denom = max(len(brand_results), 1)
-    frac = float(os.environ.get("ZERO_ALERT_FRACTION", "0.4"))
+    frac = float(os.environ.get("ZERO_ALERT_FRACTION") or "0.4")
     threshold = max(3, int(denom * frac + 0.999))
     if len(zeroed) >= threshold:
         msg = (f"🚨 Khabar scraper: {len(zeroed)}/{denom} brands scanned 0 products "
