@@ -59,5 +59,15 @@ jobs:
           SCRAPE_TARGET:              shopify
           DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          # v14.50: these MUST be wired here or the scheduled run ignores
+          # whatever you set in the GitHub UI (repo vars/secrets are NOT auto
+          # env vars). All blank-safe — an unset var behaves as the code
+          # default. This is why a manually-triggered run behaved differently
+          # from the scheduled one: the toggles never reached the job.
+          DATAIMPULSE_HOST:           ${{ vars.DATAIMPULSE_HOST }}      # default gw.dataimpulse.com
+          DATAIMPULSE_STICKY:         ${{ vars.DATAIMPULSE_STICKY }}    # "1" = one held EG peer per brand (stable path)
+          PROXY_HTTP_TIMEOUT:         ${{ vars.PROXY_HTTP_TIMEOUT }}    # default 45 (seconds)
+          ZERO_ALERT_FRACTION:        ${{ vars.ZERO_ALERT_FRACTION }}   # default 0.4 — empty-run guard threshold
+          OPS_TELEGRAM_CHAT_ID:       ${{ secrets.OPS_TELEGRAM_CHAT_ID }}  # guard's Telegram ping target
           CHANGE_DETECT_ACTIVE: "1"
         run: python -u scraper.py
