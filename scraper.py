@@ -1102,8 +1102,21 @@ def get_dataimpulse_session():
     # Markets prices by IP; a non-Egyptian exit corrupts first_observed_price
     # silently.
     proxy_user = f"{DATAIMPULSE_USER}__cr.{SHOPIFY_PROXY_COUNTRY}"
-    proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{DATAIMPULSE_PORT}"
-    print(f"  [DataImpulse] Egyptian residential proxy session selected.")
+    # v14.50: optional sticky session. Port 823 rotates the exit IP on EVERY
+    # request — on a degraded EG pool that is per-request roulette and produces
+    # the uniform curl 35 (abrupt TLS close) seen 2026-08-21, since most random
+    # peers are dead. A dedicated port in 10000-20000 binds ONE residential IP
+    # for ~30 min (the same mechanism the reliable LCW path uses); one healthy
+    # peer then carries the whole brand crawl. Currency-safe — still __cr.eg.
+    # This session is built once per brand, so the sticky IP holds across that
+    # brand's full pagination. Toggle with DATAIMPULSE_STICKY=1.
+    if os.environ.get("DATAIMPULSE_STICKY", "0") == "1":
+        port = random.randint(10000, 20000)
+        print(f"  [DataImpulse] Egyptian sticky session on port.{port}")
+    else:
+        port = DATAIMPULSE_PORT
+        print(f"  [DataImpulse] Egyptian residential proxy session selected.")
+    proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{port}"
     session = requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
     # v14.49: pin HTTP/1.1 — same fix LCW got in v14.48. Without this the
     # Shopify/Woo proxy path stays on HTTP/2, which hangs through
@@ -5577,3 +5590,27 @@ if __name__ == "__main__":
             print(f"  ⚠️ Best-seller rank collection failed (non-fatal): {e}")
 
     print(f"\n🏁 All done. Total price changes this run: {total}")
+
+    # v14.50: empty-run guard. A flaky proxy can silently zero out most brands
+    # and still exit green — that is how a transient blip became a multi-day
+    # blackout caught only by the weekly health check. Fail loudly (non-zero
+    # exit -> red Actions run + GitHub email) and ping the ops chat when too
+    # many brands scanned 0 products, so failures surface in minutes. Failed
+    # brands are already deferred to the next scheduled run, so this alerts
+    # without losing anything. Threshold tunable via ZERO_ALERT_FRACTION.
+    zeroed = sorted(n for n, (seen, _) in brand_results.items() if seen == 0)
+    denom = max(len(brand_results), 1)
+    frac = float(os.environ.get("ZERO_ALERT_FRACTION", "0.4"))
+    threshold = max(3, int(denom * frac + 0.999))
+    if len(zeroed) >= threshold:
+        msg = (f"🚨 Khabar scraper: {len(zeroed)}/{denom} brands scanned 0 products "
+               f"this run (threshold {threshold}). Likely the DataImpulse EG proxy "
+               f"path. Zeroed: {', '.join(zeroed)}")
+        print(f"\n{msg}")
+        ops_chat = os.environ.get("OPS_TELEGRAM_CHAT_ID")
+        if ops_chat:
+            try:
+                send_telegram(get_resilient_session(), ops_chat, msg)
+            except Exception as e:
+                print(f"  ⚠️ ops alert send failed: {e}")
+        sys.exit(1)
