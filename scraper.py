@@ -1125,7 +1125,14 @@ def get_dataimpulse_session():
     # outage was curl 28 pool congestion, not HTTP/2) and only broke the
     # fingerprint. Shopify path stays on pure chrome124 = pre-edit behaviour.
     # LCW keeps its own pin because its origin doesn't fingerprint like CF.
-    session = requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    # v14.52: bump the impersonation fingerprint on the Shopify proxy path only
+    # (LCW/DeFacto untouched). chrome124 is >1yr old; Cloudflare — which fronts
+    # these stores — abruptly rejects stale TLS fingerprints at the handshake
+    # (curl 35, SSL_ERROR_SYSCALL), which matches "worked recently, fails now"
+    # if CF tightened. Installed curl_cffi 0.16.1 supports up to chrome150.
+    # env-tunable so the next bump needs no code change; blank-safe default.
+    _imp = os.environ.get("SHOPIFY_IMPERSONATE") or "chrome146"
+    session = requests.Session(impersonate=_imp, proxies={"https": proxy_url, "http": proxy_url})
     session._khabar_eg_proxy = True   # v14.51: execute_with_retry rotates the exit peer per retry
     return session
 
