@@ -710,7 +710,7 @@ DATAIMPULSE_PORT      = 823
 # that runs in ~1s on a good hour. The old hardcoded 10s proxy timeouts killed
 # these slow-but-alive peers, skipping every brand (0 products, silent green
 # run). Generous + env-tunable so a bad pool hour no longer blanks the run.
-PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT") or "45")
+PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT") or "60")
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
 # ── v14.39: exit-country is now per-engine, not global ───────────────────────
@@ -745,7 +745,26 @@ DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 # silent. That asymmetry is why the guard below refuses to start rather than
 # warns.
 LCW_PROXY_COUNTRY      = env_str("LCW_PROXY_COUNTRY", "tr")
-SHOPIFY_PROXY_COUNTRY  = "eg"   # hardcoded on purpose — not env-overridable
+# v14.52: Egypt's residential pool is too thin to be reliable, so this is now
+# tunable. Shopify /products.json returns the store's BASE currency (EGP)
+# regardless of exit country — geo-currency only affects the rendered
+# storefront, not this JSON endpoint — so a wider pool does NOT corrupt prices
+# for the Shopify path. Set the SHOPIFY_PROXY_COUNTRY repo Variable to:
+#   "global" (or blank) -> largest all-country pool (most reliable)
+#   "eg,sa,ae,tr,..."   -> a comma-list of countries (DataImpulse syntax)
+#   "eg"                -> Egypt only (previous behaviour, the default)
+# WooCommerce stays on Egypt (see scrape_woocommerce) because Woo geo-currency
+# PLUGINS can switch the Store API currency by IP.
+SHOPIFY_PROXY_COUNTRY  = (os.environ.get("SHOPIFY_PROXY_COUNTRY") or "eg").strip().lower()
+
+def _shopify_proxy_user():
+    """Build the DataImpulse username for the Shopify pool from
+    SHOPIFY_PROXY_COUNTRY. 'global'/blank -> no country suffix (all-country
+    pool). A single code or a comma-list -> __cr.<value>."""
+    c = SHOPIFY_PROXY_COUNTRY
+    if c in ("", "global", "any", "all", "world"):
+        return DATAIMPULSE_USER
+    return f"{DATAIMPULSE_USER}__cr.{c}"
 
 # ── v14.41: force HTTP/1.1 on LCW proxy sessions ─────────────────────────────
 #
@@ -838,12 +857,12 @@ def _assert_proxy_country_separation():
     (silent currency contamination of first_observed_price) is unrecoverable
     without re-scraping history that no longer exists.
     """
-    if SHOPIFY_PROXY_COUNTRY != "eg":
-        raise RuntimeError(
-            "FATAL: SHOPIFY_PROXY_COUNTRY must be 'eg'. Shopify Markets prices "
-            "by exit IP; any other country risks writing non-EGP prices into "
-            "first_observed_price."
-        )
+    if SHOPIFY_PROXY_COUNTRY not in ("eg", "global", "any", "all", "world", ""):
+        # v14.52: no longer fatal. Shopify /products.json returns base currency
+        # (EGP) regardless of exit country, so a wider pool is safe for Shopify.
+        # Just note it so a surprising value is visible in the logs.
+        print(f"  ℹ️ SHOPIFY_PROXY_COUNTRY = '{SHOPIFY_PROXY_COUNTRY}' (non-eg pool "
+              f"in use for Shopify; Woo stays on eg).")
     lcw_brands = {b["name"] for b in BRANDS if b["engine"] == "lcw_proxy"}
     overlap = lcw_brands & DATAIMPULSE_PROXY_BRANDS
     if overlap:
@@ -1101,7 +1120,7 @@ def get_dataimpulse_session():
     # — see the exit-country note above DATAIMPULSE_PROXY_BRANDS. Shopify
     # Markets prices by IP; a non-Egyptian exit corrupts first_observed_price
     # silently.
-    proxy_user = f"{DATAIMPULSE_USER}__cr.{SHOPIFY_PROXY_COUNTRY}"
+    proxy_user = _shopify_proxy_user()
     # v14.50: optional sticky session. Port 823 rotates the exit IP on EVERY
     # request — on a degraded EG pool that is per-request roulette and produces
     # the uniform curl 35 (abrupt TLS close) seen 2026-08-21, since most random
@@ -1125,7 +1144,16 @@ def get_dataimpulse_session():
     # outage was curl 28 pool congestion, not HTTP/2) and only broke the
     # fingerprint. Shopify path stays on pure chrome124 = pre-edit behaviour.
     # LCW keeps its own pin because its origin doesn't fingerprint like CF.
-    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    # v14.52: bump the impersonation fingerprint on the Shopify proxy path only
+    # (LCW/DeFacto untouched). chrome124 is >1yr old; Cloudflare — which fronts
+    # these stores — abruptly rejects stale TLS fingerprints at the handshake
+    # (curl 35, SSL_ERROR_SYSCALL), which matches "worked recently, fails now"
+    # if CF tightened. Installed curl_cffi 0.16.1 supports up to chrome150.
+    # env-tunable so the next bump needs no code change; blank-safe default.
+    _imp = os.environ.get("SHOPIFY_IMPERSONATE") or "chrome146"
+    session = requests.Session(impersonate=_imp, proxies={"https": proxy_url, "http": proxy_url})
+    session._khabar_eg_proxy = True   # v14.51: execute_with_retry rotates the exit peer per retry
+    return session
 
 def get_shopify_session(brand_name):
     """
@@ -1224,9 +1252,24 @@ def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=
     _pinned = getattr(_sess, "_khabar_http_version", None)
     if _pinned is not None and "http_version" not in kwargs:
         kwargs["http_version"] = _pinned
+    # v14.51: EG proxy sessions rotate their exit peer per attempt (see loop).
+    _eg_proxy = getattr(_sess, "_khabar_eg_proxy", False)
 
     delay = backoff
     for attempt in range(max_retries):
+        if _eg_proxy:
+            # v14.51: rotate to a FRESH Egyptian sticky peer on EVERY attempt.
+            # Sticky pins one exit IP per session, so without this all retries
+            # reuse the same slow/dead peer — the eagle curl-28 (one slow peer,
+            # 180/228KB, retried 5x on that same peer) and tie_house curl-60
+            # (one peer with a broken cert chain) failures on 2026-08-21. A new
+            # port = a new residential IP, so a bad peer is dropped instead of
+            # hammered. Per-request proxies override the session's; curl_cffi
+            # honors them. Currency-safe — still __cr.eg.
+            _p  = random.randint(10000, 20000)
+            _u  = _shopify_proxy_user()
+            _pu = f"http://{_u}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{_p}"
+            kwargs["proxies"] = {"https": _pu, "http": _pu}
         retry_after = None
         try:
             res = session_method(url, **kwargs)
@@ -4651,7 +4694,7 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
     while True:
         url = f"https://{domain}/wp-json/wc/store/v1/products?per_page={PER_PAGE}&page={page}"
         try:
-            res = execute_with_retry(session.get, url, timeout=30, headers=headers)
+            res = execute_with_retry(session.get, url, timeout=PROXY_HTTP_TIMEOUT, headers=headers)
         except Exception as e:
             print(f"  ⚠️ [WooCommerce] Page {page} network error: {e}")
             break
@@ -4675,8 +4718,17 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
         # the failure source — until we name the offending field we want every
         # other product on the page to still get scraped.
         batch_products, seen_ext_ids = [], set()
+        _woo_bad_currency = 0
         for p in products:
             try:
+                # v14.52: exact currency guard. If Woo is ever put on a non-eg
+                # pool and the store runs a geo-currency plugin, the Store API
+                # returns a different currency_code — skip those products so a
+                # non-EGP price can never reach first_observed_price/snapshots.
+                _cc = (p.get("prices") or {}).get("currency_code")
+                if _cc and _cc.upper() != "EGP":
+                    _woo_bad_currency += 1
+                    continue
                 pid = p.get("id")
                 if not pid or str(pid) in seen_ext_ids:
                     continue
