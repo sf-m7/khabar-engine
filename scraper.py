@@ -1129,12 +1129,13 @@ def get_dataimpulse_session():
     # peer then carries the whole brand crawl. Currency-safe — still __cr.eg.
     # This session is built once per brand, so the sticky IP holds across that
     # brand's full pagination. Toggle with DATAIMPULSE_STICKY=1.
+    _pool = SHOPIFY_PROXY_COUNTRY if SHOPIFY_PROXY_COUNTRY not in ("", "global", "any", "all", "world") else "global"
     if os.environ.get("DATAIMPULSE_STICKY", "0") == "1":
         port = random.randint(10000, 20000)
-        print(f"  [DataImpulse] Egyptian sticky session on port.{port}")
+        print(f"  [DataImpulse] {_pool} pool — sticky session on port.{port}")
     else:
         port = DATAIMPULSE_PORT
-        print(f"  [DataImpulse] Egyptian residential proxy session selected.")
+        print(f"  [DataImpulse] {_pool} pool — rotating residential session.")
     proxy_url  = f"http://{proxy_user}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{port}"
     # v14.51: REVERTED the v14.49 HTTP/1.1 pin. Forcing http_version=V1_1 on a
     # chrome124-impersonated session rewrites the ALPN to ["http/1.1"] only,
@@ -4612,7 +4613,7 @@ def fetch_mobaco_variations(session, domain, product_id):
     url = f"https://{domain}/wp-json/wc/store/v1/products/{product_id}/variations"
     try:
         res = execute_with_retry(
-            session.get, url, max_retries=2, backoff=2, timeout=15,
+            session.get, url, max_retries=2, backoff=2, timeout=PROXY_HTTP_TIMEOUT,
             headers={
                 "accept":          "application/json, text/plain, */*",
                 "accept-language": "en-US,en;q=0.9",
