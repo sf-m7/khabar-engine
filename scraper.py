@@ -710,7 +710,7 @@ DATAIMPULSE_PORT      = 823
 # that runs in ~1s on a good hour. The old hardcoded 10s proxy timeouts killed
 # these slow-but-alive peers, skipping every brand (0 products, silent green
 # run). Generous + env-tunable so a bad pool hour no longer blanks the run.
-PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT") or "60")
+PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT") or "45")
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 
 # ── v14.39: exit-country is now per-engine, not global ───────────────────────
@@ -1125,16 +1125,7 @@ def get_dataimpulse_session():
     # outage was curl 28 pool congestion, not HTTP/2) and only broke the
     # fingerprint. Shopify path stays on pure chrome124 = pre-edit behaviour.
     # LCW keeps its own pin because its origin doesn't fingerprint like CF.
-    # v14.52: bump the impersonation fingerprint on the Shopify proxy path only
-    # (LCW/DeFacto untouched). chrome124 is >1yr old; Cloudflare — which fronts
-    # these stores — abruptly rejects stale TLS fingerprints at the handshake
-    # (curl 35, SSL_ERROR_SYSCALL), which matches "worked recently, fails now"
-    # if CF tightened. Installed curl_cffi 0.16.1 supports up to chrome150.
-    # env-tunable so the next bump needs no code change; blank-safe default.
-    _imp = os.environ.get("SHOPIFY_IMPERSONATE") or "chrome146"
-    session = requests.Session(impersonate=_imp, proxies={"https": proxy_url, "http": proxy_url})
-    session._khabar_eg_proxy = True   # v14.51: execute_with_retry rotates the exit peer per retry
-    return session
+    return requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
 
 def get_shopify_session(brand_name):
     """
@@ -1233,24 +1224,9 @@ def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=
     _pinned = getattr(_sess, "_khabar_http_version", None)
     if _pinned is not None and "http_version" not in kwargs:
         kwargs["http_version"] = _pinned
-    # v14.51: EG proxy sessions rotate their exit peer per attempt (see loop).
-    _eg_proxy = getattr(_sess, "_khabar_eg_proxy", False)
 
     delay = backoff
     for attempt in range(max_retries):
-        if _eg_proxy:
-            # v14.51: rotate to a FRESH Egyptian sticky peer on EVERY attempt.
-            # Sticky pins one exit IP per session, so without this all retries
-            # reuse the same slow/dead peer — the eagle curl-28 (one slow peer,
-            # 180/228KB, retried 5x on that same peer) and tie_house curl-60
-            # (one peer with a broken cert chain) failures on 2026-08-21. A new
-            # port = a new residential IP, so a bad peer is dropped instead of
-            # hammered. Per-request proxies override the session's; curl_cffi
-            # honors them. Currency-safe — still __cr.eg.
-            _p  = random.randint(10000, 20000)
-            _u  = f"{DATAIMPULSE_USER}__cr.{SHOPIFY_PROXY_COUNTRY}"
-            _pu = f"http://{_u}:{DATAIMPULSE_PASS}@{DATAIMPULSE_HOST}:{_p}"
-            kwargs["proxies"] = {"https": _pu, "http": _pu}
         retry_after = None
         try:
             res = session_method(url, **kwargs)
