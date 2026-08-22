@@ -15,6 +15,18 @@ on:
     - cron: "0 4,12,20 * * *"
   workflow_dispatch:
 
+# v14.52: share the LCW scraper's concurrency group. Root cause of "scheduled
+# runs fail, manual runs work": the 04:00 UTC Shopify run overran (up to 3h on
+# the old thin pool) into LCW's 05:20-06:40 UTC window. Two scrapers on ONE
+# DataImpulse account exceed its concurrent-session cap, and the excess
+# connections are killed mid-handshake -> curl 35 / "502 CONNECT tunnel failed"
+# retry loops. This group serialises ALL DataImpulse scrapers (Shopify + LCW +
+# LCW size pass) so only one runs at a time. It also prevents a long Shopify
+# run from colliding with the next Shopify slot. Queue, don't cancel.
+concurrency:
+  group: lcw-scraper
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
