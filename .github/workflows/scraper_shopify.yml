@@ -77,7 +77,13 @@ jobs:
           # default. This is why a manually-triggered run behaved differently
           # from the scheduled one: the toggles never reached the job.
           DATAIMPULSE_HOST:           ${{ vars.DATAIMPULSE_HOST }}      # default gw.dataimpulse.com
-          DATAIMPULSE_STICKY:         ${{ vars.DATAIMPULSE_STICKY }}    # "1" = one held EG peer per brand (stable path)
+          DATAIMPULSE_STICKY:         ${{ vars.DATAIMPULSE_STICKY }}    # "1" = one held peer per brand (stable path)
+          # v14.52: MUST be wired here too (repo vars are NOT auto env vars).
+          # SHOPIFY_PROXY_COUNTRY widens the pool past thin Egypt — set the repo
+          # Variable to "global" (or a list like "eg,sa,ae,tr"). Blank -> code
+          # default "eg". This is the switch that stops the curl-35 loops.
+          SHOPIFY_PROXY_COUNTRY:      ${{ vars.SHOPIFY_PROXY_COUNTRY }}
+          SHOPIFY_IMPERSONATE:        ${{ vars.SHOPIFY_IMPERSONATE }}   # blank -> chrome146
           PROXY_HTTP_TIMEOUT:         ${{ vars.PROXY_HTTP_TIMEOUT }}    # default 45 (seconds)
           ZERO_ALERT_FRACTION:        ${{ vars.ZERO_ALERT_FRACTION }}   # default 0.4 — empty-run guard threshold
           OPS_TELEGRAM_CHAT_ID:       ${{ secrets.OPS_TELEGRAM_CHAT_ID }}  # guard's Telegram ping target
