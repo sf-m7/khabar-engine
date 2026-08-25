@@ -1159,9 +1159,16 @@ def get_dataimpulse_session():
     # which is BROKEN through gw.dataimpulse.com (v14.48) and gets killed at the
     # handshake (curl 35). Restoring both matches the known-good LCW path.
     # Fingerprint stays env-tunable but now defaults to chrome124 like LCW.
+    # v14.54: PROVEN by the fingerprint-sweep diagnostic — every fingerprint on
+    # HTTP/2 (curl_cffi default, NO pin) returned 200 through this proxy to the
+    # Cloudflare-fronted Shopify stores. So Shopify must stay on HTTP/2. The
+    # HTTP/1.1 pin (needed by LCW, whose gateway path breaks on h2) is what was
+    # killing Shopify's TLS handshake to Cloudflare (curl 35). LCW = Akamai +
+    # HTTP/1.1; Shopify = Cloudflare + HTTP/2 — they genuinely need opposite
+    # settings, which is why matching them to each other kept failing. No pin
+    # here. Fingerprint stays env-tunable (all of them pass); default chrome124.
     _imp = os.environ.get("SHOPIFY_IMPERSONATE") or "chrome124"
     session = requests.Session(impersonate=_imp, proxies={"https": proxy_url, "http": proxy_url})
-    session._khabar_http_version = _proxy_http_version()  # HTTP/1.1 pin — same as LCW
     session._khabar_eg_proxy = True   # v14.51: execute_with_retry rotates the exit peer per retry
     return session
 
