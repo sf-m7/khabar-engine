@@ -1151,8 +1151,17 @@ def get_dataimpulse_session():
     # (curl 35, SSL_ERROR_SYSCALL), which matches "worked recently, fails now"
     # if CF tightened. Installed curl_cffi 0.16.1 supports up to chrome150.
     # env-tunable so the next bump needs no code change; blank-safe default.
-    _imp = os.environ.get("SHOPIFY_IMPERSONATE") or "chrome146"
+    # v14.53: make the Shopify proxy session IDENTICAL to the LCW session that
+    # works on this same DataImpulse pool. LCW's own log proves the pool + IPs
+    # are fine (its pool is literally tr,sa,eg) — the difference was HOW we
+    # connect. LCW uses chrome124 + an HTTP/1.1 pin; Shopify had drifted to
+    # chrome146 + no pin (my v14.51/v14.52 changes), so it went out as HTTP/2,
+    # which is BROKEN through gw.dataimpulse.com (v14.48) and gets killed at the
+    # handshake (curl 35). Restoring both matches the known-good LCW path.
+    # Fingerprint stays env-tunable but now defaults to chrome124 like LCW.
+    _imp = os.environ.get("SHOPIFY_IMPERSONATE") or "chrome124"
     session = requests.Session(impersonate=_imp, proxies={"https": proxy_url, "http": proxy_url})
+    session._khabar_http_version = _proxy_http_version()  # HTTP/1.1 pin — same as LCW
     session._khabar_eg_proxy = True   # v14.51: execute_with_retry rotates the exit peer per retry
     return session
 
