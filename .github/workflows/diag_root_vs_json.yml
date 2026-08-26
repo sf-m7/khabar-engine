@@ -1,0 +1,19 @@
+name: diag-root-vs-json
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install curl_cffi
+      - name: Root vs JSON probe
+        env:
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DATAIMPULSE_HOST:           ${{ vars.DATAIMPULSE_HOST }}
+          SHOPIFY_PROXY_COUNTRY:      ${{ vars.SHOPIFY_PROXY_COUNTRY }}
+        run: python diag_root_vs_json.py
