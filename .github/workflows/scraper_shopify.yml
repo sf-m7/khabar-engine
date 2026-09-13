@@ -12,7 +12,7 @@ on:
     # per brand mid-run. The last run is started early enough to finish well
     # before the 00:00 UTC rollover, so a long run never splits one day's
     # snapshots across two calendar dates.
-    - cron: "0 4,12,20 * * *"
+    - cron: "0 12 * * *"
   workflow_dispatch:
 
 # v14.52: share the LCW scraper's concurrency group. Root cause of "scheduled
