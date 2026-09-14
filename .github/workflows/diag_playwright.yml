@@ -1,0 +1,29 @@
+name: diag-playwright
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Real-browser probe through the proxy
+        env:
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          DATAIMPULSE_HOST:           ${{ vars.DATAIMPULSE_HOST }}
+          SHOPIFY_PROXY_COUNTRY:      ${{ vars.SHOPIFY_PROXY_COUNTRY }}
+        run: python diag_playwright.py
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-probe-screenshots
+          path: screenshot_*.png
+          if-no-files-found: ignore
