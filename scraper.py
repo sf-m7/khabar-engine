@@ -546,6 +546,7 @@
 #         IP, once found, is kept rather than discarded after one page.
 # ═══════════════════════════════════════════════════════
 
+import hashlib
 import json
 import os
 import psycopg2
@@ -712,6 +713,25 @@ DATAIMPULSE_PORT      = 823
 # run). Generous + env-tunable so a bad pool hour no longer blanks the run.
 PROXY_HTTP_TIMEOUT    = int(os.environ.get("PROXY_HTTP_TIMEOUT") or "60")
 DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
+
+# v14.55: Decodo dedicated ISP — replaces DataImpulse for Shopify/WooCommerce
+# only. 3 static IPs (isp.decodo.com:10001-10003), NOT a rotating pool. LCW
+# stays on DataImpulse (get_lcw_session, untouched) — it's working fine there.
+# DeFacto has no proxy and is untouched.
+#
+# Why sticky-per-brand instead of DataImpulse-style per-retry rotation: there
+# is no big pool to rotate through here — only 3 IPs. Rotating them like a
+# residential pool would just mean each of the 3 IPs gets hit by every brand
+# in turn, which looks MORE bot-like, not less, and risks all 3 catching a
+# block together. Pinning one brand to one IP for its whole lifetime instead
+# mimics a small number of consistent return visitors. Assignment uses
+# sha256, not Python's hash() — hash() is randomized per process (security
+# feature), so brand->IP would silently reshuffle on every run otherwise.
+DECODO_USER  = os.environ.get("DECODO_PROXY_USERNAME", "")
+DECODO_PASS  = os.environ.get("DECODO_PROXY_PASSWORD", "")
+DECODO_HOST  = env_str("DECODO_HOST", "isp.decodo.com")
+DECODO_PORTS = [10001, 10002, 10003]
+DECODO_CONFIGURED = bool(DECODO_USER and DECODO_PASS)
 
 # ── v14.39: exit-country is now per-engine, not global ───────────────────────
 #
@@ -1172,20 +1192,36 @@ def get_dataimpulse_session():
     session._khabar_eg_proxy = True   # v14.51: execute_with_retry rotates the exit peer per retry
     return session
 
+def _decodo_port_for(brand_name):
+    h = int(hashlib.sha256(brand_name.encode()).hexdigest(), 16)
+    return DECODO_PORTS[h % len(DECODO_PORTS)]
+
+def get_decodo_session(brand_name):
+    """One of Decodo's 3 static ISP IPs, deterministically pinned per brand
+    (same brand always gets the same IP, stable across runs/restarts)."""
+    if not DECODO_CONFIGURED:
+        return None
+    port = _decodo_port_for(brand_name)
+    proxy_url = f"http://{DECODO_USER}:{DECODO_PASS}@{DECODO_HOST}:{port}"
+    session = requests.Session(impersonate="chrome124", proxies={"https": proxy_url, "http": proxy_url})
+    session._khabar_decodo_port = port
+    return session
+
 def get_shopify_session(brand_name):
     """
-    v14.31: brands in DATAIMPULSE_PROXY_BRANDS route through the DataImpulse
-    residential proxy (see note above them); every other brand keeps using
-    get_resilient_session() exactly as before — no behavior change, no added
-    bandwidth cost for brands that were never broken.
+    v14.55: Shopify/WooCommerce brands now route through Decodo's dedicated
+    ISP pool (get_decodo_session) instead of DataImpulse. DATAIMPULSE_PROXY_BRANDS
+    is no longer consulted here — every brand of this call gets a Decodo IP;
+    the old partial-allowlist doesn't apply to a 3-IP dedicated pool the way
+    it did to a big rotating residential one. Falls back to a direct
+    connection if Decodo credentials aren't set (logged, not silent).
     """
-    if brand_name in DATAIMPULSE_PROXY_BRANDS:
-        session = get_dataimpulse_session()
-        if session:
-            print(f"  [{brand_name}] Routing via DataImpulse residential proxy.")
-            return session
-        print(f"  ⚠️ [{brand_name}] DATAIMPULSE credentials not set — "
-              f"falling back to a direct connection (will likely still 429).")
+    session = get_decodo_session(brand_name)
+    if session:
+        print(f"  [{brand_name}] Routing via Decodo ISP (port {session._khabar_decodo_port}).")
+        return session
+    print(f"  ⚠️ [{brand_name}] DECODO credentials not set — "
+          f"falling back to a direct connection (will likely 429/challenge).")
     return get_resilient_session()
 
 def get_lcw_session(avoid_country=None):
@@ -5486,10 +5522,12 @@ if __name__ == "__main__":
     else:
         active_brands = BRANDS
     print(f"🚀 Khabar Scraper starting... target={SCRAPE_TARGET} ({len(active_brands)} brands)")
-    if any(b["name"] in DATAIMPULSE_PROXY_BRANDS or b["engine"] == "lcw_proxy" for b in active_brands):
-        routed = sorted(DATAIMPULSE_PROXY_BRANDS | {b["name"] for b in active_brands if b["engine"] == "lcw_proxy"})
-        print(f"  [DataImpulse] Proxy configured: {DATAIMPULSE_CONFIGURED} "
-              f"(routed brands: {', '.join(routed)})")
+    _decodo_brands = sorted(b["name"] for b in active_brands if b["engine"] in ("shopify", "woocommerce"))
+    if _decodo_brands:
+        print(f"  [Decodo] ISP proxy configured: {DECODO_CONFIGURED} "
+              f"(routed brands: {', '.join(_decodo_brands)})")
+    if any(b["engine"] == "lcw_proxy" for b in active_brands):
+        print(f"  [DataImpulse] Proxy configured: {DATAIMPULSE_CONFIGURED} (LCW only)")
     startup_jitter = random.uniform(0, 30)
     print(f"  Startup jitter: {startup_jitter:.1f}s")
     time.sleep(startup_jitter)
