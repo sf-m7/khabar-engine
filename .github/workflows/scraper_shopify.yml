@@ -74,8 +74,8 @@ jobs:
           # vars above are left wired but are now dead in this job (this
           # workflow never runs the lcw_proxy engine) — kept only so a
           # rollback needs no secrets re-wiring.
-          DECODO_PROXY_USERNAME:      ${{ secrets.DECODO_PROXY_USERNAME }}
-          DECODO_PROXY_PASSWORD:      ${{ secrets.DECODO_PROXY_PASSWORD }}
+          DECODO_PROXY_USERNAME:      ${{ secrets.DECODO_PROXY_USER }}
+          DECODO_PROXY_PASSWORD:      ${{ secrets.DECODO_PROXY_PASS }}
           # v14.50: these MUST be wired here or the scheduled run ignores
           # whatever you set in the GitHub UI (repo vars/secrets are NOT auto
           # env vars). All blank-safe — an unset var behaves as the code
