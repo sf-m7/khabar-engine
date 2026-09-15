@@ -1207,21 +1207,64 @@ def get_decodo_session(brand_name):
     session._khabar_decodo_port = port
     return session
 
+# v14.57: cascading proxy tier for Shopify/WooCommerce, applied PER BRAND —
+# not just the first one. Two layers:
+#   - a BASELINE tier (_proxy_tier_state), decided by the first Shopify/Woo
+#     brand of the run (the canary). If the canary needs to escalate, that
+#     means the runner's IP itself is likely blocked, so the new tier
+#     becomes the baseline for every brand after it — no point re-probing
+#     "direct" on brand 2 if brand 1 just proved it's blocked run-wide.
+#   - a per-brand OVERRIDE (_proxy_tier_override_stack), used by every
+#     brand's own escalation attempts. A brand blocked *individually* (its
+#     own WAF rule, unrelated to the runner IP) escalates and retries on
+#     ITS OWN, without dragging every other brand up to a proxy tier they
+#     don't need — that would burn Decodo/DataImpulse bandwidth for brands
+#     that were never broken.
+# Direct is free — always the starting point unless the baseline has
+# already moved. get_shopify_session() just reads _proxy_tier_name(); it
+# has no idea whether it's reading the baseline or a brand's own override.
+PROXY_TIERS = ["direct", "dataimpulse", "decodo"]
+_proxy_tier_state = {"idx": 0}          # baseline, set by the canary
+_proxy_tier_override_stack = []          # per-brand override, if any
+_proxy_canary_done = {"done": False}
+
+def _proxy_tier_idx():
+    return _proxy_tier_override_stack[-1] if _proxy_tier_override_stack else _proxy_tier_state["idx"]
+
+def _proxy_tier_name():
+    return PROXY_TIERS[_proxy_tier_idx()]
+
+def _next_tier_idx(current_idx, brand_name, reason):
+    """Pure — returns the next tier index up, or None if already at the top.
+    Does not mutate any state; caller decides where to apply the result."""
+    if current_idx >= len(PROXY_TIERS) - 1:
+        return None
+    new_idx = current_idx + 1
+    print(f"  ⬆️  [{brand_name}] escalating proxy tier -> '{PROXY_TIERS[new_idx]}' ({reason})")
+    return new_idx
+
 def get_shopify_session(brand_name):
     """
-    v14.55: Shopify/WooCommerce brands now route through Decodo's dedicated
-    ISP pool (get_decodo_session) instead of DataImpulse. DATAIMPULSE_PROXY_BRANDS
-    is no longer consulted here — every brand of this call gets a Decodo IP;
-    the old partial-allowlist doesn't apply to a 3-IP dedicated pool the way
-    it did to a big rotating residential one. Falls back to a direct
-    connection if Decodo credentials aren't set (logged, not silent).
+    v14.57: reads whichever tier is "current" for this call — either the
+    baseline (set by the canary brand) or a per-brand override while that
+    brand is escalating on its own. See _run_brand_with_proxy_cascade().
     """
+    tier = _proxy_tier_name()
+    if tier == "direct":
+        return get_resilient_session()
+    if tier == "dataimpulse":
+        session = get_dataimpulse_session()
+        if session:
+            print(f"  [{brand_name}] Routing via DataImpulse (tier={tier}).")
+            return session
+        print(f"  ⚠️ [{brand_name}] DATAIMPULSE credentials not set — falling back to direct.")
+        return get_resilient_session()
+    # tier == "decodo"
     session = get_decodo_session(brand_name)
     if session:
         print(f"  [{brand_name}] Routing via Decodo ISP (port {session._khabar_decodo_port}).")
         return session
-    print(f"  ⚠️ [{brand_name}] DECODO credentials not set — "
-          f"falling back to a direct connection (will likely 429/challenge).")
+    print(f"  ⚠️ [{brand_name}] DECODO credentials not set — falling back to direct.")
     return get_resilient_session()
 
 def get_lcw_session(avoid_country=None):
@@ -5400,6 +5443,54 @@ def load_prev_state_direct(brand_name):
             except Exception: pass
 
 
+def _run_brand_with_proxy_cascade(brand_name, domain, engine):
+    """
+    v14.57: EVERY Shopify/WooCommerce brand gets its own escalation attempts
+    now, not just the first. Each brand starts at the current baseline tier;
+    if it scans 0 products, it retries at progressively higher tiers ON ITS
+    OWN via a stacked override (_proxy_tier_override_stack) — this does NOT
+    change what any other brand uses, so one individually-blocked brand
+    can't push the whole run onto a proxy the rest of the pool doesn't need.
+
+    Exception: the very FIRST Shopify/Woo brand of the run is the canary. If
+    IT needs to escalate, that's read as "the runner's IP is blocked" rather
+    than "this one domain is blocked" — so its result gets promoted to the
+    new BASELINE for every brand after it, avoiding N more brands each
+    having to independently discover and re-fail on "direct" before
+    escalating themselves.
+    """
+    if engine not in ("shopify", "woocommerce"):
+        return scrape_brand(brand_name, domain)
+
+    is_canary = not _proxy_canary_done["done"]
+    _proxy_canary_done["done"] = True
+
+    local_idx = _proxy_tier_state["idx"]   # start at current baseline
+    _proxy_tier_override_stack.append(local_idx)
+    try:
+        seen, changes = scrape_brand(brand_name, domain)
+        while seen == 0:
+            reason = "0 products on previous tier" + (" [canary]" if is_canary else "")
+            next_idx = _next_tier_idx(local_idx, brand_name, reason)
+            if next_idx is None:
+                break
+            local_idx = next_idx
+            _proxy_tier_override_stack[-1] = local_idx
+            seen, changes = scrape_brand(brand_name, domain)
+    finally:
+        _proxy_tier_override_stack.pop()
+
+    if is_canary and local_idx > _proxy_tier_state["idx"]:
+        _proxy_tier_state["idx"] = local_idx
+        print(f"  [Proxy cascade] Canary escalation -> baseline tier is now "
+              f"'{PROXY_TIERS[local_idx]}' for every brand this run.")
+    elif local_idx > _proxy_tier_state["idx"]:
+        status = "recovered" if seen > 0 else "still 0 products at top tier"
+        print(f"  [Proxy cascade] [{brand_name}] used '{PROXY_TIERS[local_idx]}' for "
+              f"itself only ({status}) — baseline stays '{_proxy_tier_name()}' for the rest of the run.")
+
+    return seen, changes
+
 def scrape_brand(brand_name, domain):
     """
     v14.20: now returns (seen, changes) instead of just changes.
@@ -5522,10 +5613,13 @@ if __name__ == "__main__":
     else:
         active_brands = BRANDS
     print(f"🚀 Khabar Scraper starting... target={SCRAPE_TARGET} ({len(active_brands)} brands)")
-    _decodo_brands = sorted(b["name"] for b in active_brands if b["engine"] in ("shopify", "woocommerce"))
-    if _decodo_brands:
-        print(f"  [Decodo] ISP proxy configured: {DECODO_CONFIGURED} "
-              f"(routed brands: {', '.join(_decodo_brands)})")
+    _cascade_brands = [b["name"] for b in active_brands if b["engine"] in ("shopify", "woocommerce")]
+    if _cascade_brands:
+        print(f"  [Proxy cascade] {len(_cascade_brands)} Shopify/Woo brand(s) start on baseline tier "
+              f"'{PROXY_TIERS[0]}'. First brand ({_cascade_brands[0]}) is the canary — its escalation "
+              f"(if any) sets the baseline for everyone else; every OTHER brand that scans 0 products "
+              f"escalates for itself only, through {PROXY_TIERS[1:]}. "
+              f"DataImpulse configured: {DATAIMPULSE_CONFIGURED}, Decodo configured: {DECODO_CONFIGURED}.")
     if any(b["engine"] == "lcw_proxy" for b in active_brands):
         print(f"  [DataImpulse] Proxy configured: {DATAIMPULSE_CONFIGURED} (LCW only)")
     startup_jitter = random.uniform(0, 30)
@@ -5574,7 +5668,7 @@ if __name__ == "__main__":
     failed_brands = []   # brands that scanned 0 products on the first pass
 
     for i, b in enumerate(active_brands):
-        seen, changes = scrape_brand(b["name"], b["domain"])
+        seen, changes = _run_brand_with_proxy_cascade(b["name"], b["domain"], b["engine"])
         brand_results[b["name"]] = (seen, changes)
         if seen == 0:
             failed_brands.append(b)
