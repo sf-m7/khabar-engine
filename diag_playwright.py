@@ -56,13 +56,23 @@ def probe(pw, domain, port):
         "username": proxy_username(),
         "password": PASS,
     }
-    browser = pw.chromium.launch(headless=True)
+    # v14.55: hard timeouts at every layer. The earlier version relied only on
+    # page.goto's timeout, which covers navigation but not a stalled TCP
+    # connect to the proxy itself (a residential peer can go silent with no
+    # response at all, no error, no reset — that can sit outside what
+    # navigation-level timeouts catch). This caused a 40+ minute hang with no
+    # workflow-level cap. Now: short launch/context timeouts, a hard 20s
+    # navigation timeout, AND the workflow itself has timeout-minutes so a
+    # stuck run is killed by GitHub regardless of what hangs inside it.
+    browser = pw.chromium.launch(headless=True, timeout=20000)
     context = browser.new_context(proxy=proxy_cfg, ignore_https_errors=True)
+    context.set_default_navigation_timeout(20000)
+    context.set_default_timeout(20000)
     page = context.new_page()
     result = {"domain": domain, "status": None, "title": None,
               "challenge": False, "error": None, "screenshot": None}
     try:
-        resp = page.goto(f"https://{domain}/", timeout=30000, wait_until="domcontentloaded")
+        resp = page.goto(f"https://{domain}/", timeout=20000, wait_until="domcontentloaded")
         result["status"] = resp.status if resp else None
         result["title"] = page.title()
         body_lower = (page.content() or "").lower()
@@ -73,8 +83,14 @@ def probe(pw, domain, port):
     except Exception as e:
         result["error"] = str(e)[:200]
     finally:
-        context.close()
-        browser.close()
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
     return result
 
 print(f"pool={COUNTRY or 'global'}  host={HOST}\n")
