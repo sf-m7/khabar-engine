@@ -2,17 +2,15 @@ name: Khabar Shopify Scraper
 
 on:
   schedule:
-    # 3x daily (reduced from 4x) — trims ~25% of the per-run database egress.
-    # Times are UTC. The LAST run (20:00 UTC ≈ 23:00 Cairo) is the day's "close":
-    # each day's snapshot keeps the LATEST price it sees (sync_snapshot_price),
-    # so whatever this final run records becomes the end-of-day price that the
-    # weekly aggregation rolls up.
-    #
-    # Why 20:00 and not later: snapshot_date is the runner's UTC date, evaluated
-    # per brand mid-run. The last run is started early enough to finish well
-    # before the 00:00 UTC rollover, so a long run never splits one day's
-    # snapshots across two calendar dates.
-    - cron: "0 12 * * *"
+    # 3x daily, Cairo-local: ~5:00 AM, ~3:00 PM, ~10:00 PM (EEST, UTC+3 —
+    # Egypt is in DST until Oct 30, 2026; after that Cairo is UTC+2 and these
+    # three times will land ~1hr earlier locally until the cron is bumped).
+    # Minutes offset from :00 on purpose — GitHub Actions scheduled runs are
+    # most likely to be delayed/dropped at the top of the hour under load;
+    # this is the likely cause of the 2 missed runs on the old "0 12 * * *".
+    - cron: "7 2 * * *"    # ~05:07 Cairo
+    - cron: "13 12 * * *"  # ~15:13 Cairo
+    - cron: "41 19 * * *"  # ~22:41 Cairo
   workflow_dispatch:
 
 # v14.52: share the LCW scraper's concurrency group. Root cause of "scheduled
