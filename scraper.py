@@ -5804,7 +5804,14 @@ if __name__ == "__main__":
     zeroed = sorted(n for n, (seen, _) in brand_results.items() if seen == 0)
     denom = max(len(brand_results), 1)
     frac = float(os.environ.get("ZERO_ALERT_FRACTION") or "0.4")
-    threshold = max(3, int(denom * frac + 0.999))
+    # v14.58 fix: the old `max(3, ...)` floor made this guard structurally
+    # unable to fire on any run with fewer than 3 brands — e.g. the LCW-only
+    # run (denom=1) could scan 0/1 forever and never cross a threshold that
+    # bottoms out at 3. Capping at `denom` restores the intent: for a big
+    # multi-brand run, 1-2 sporadic failures still stay quiet (noise
+    # tolerance preserved); for a small run, ANY brand zeroing out is 100%
+    # of that run and now correctly alerts.
+    threshold = min(denom, max(3, int(denom * frac + 0.999)))
     if len(zeroed) >= threshold:
         msg = (f"🚨 Khabar scraper: {len(zeroed)}/{denom} brands scanned 0 products "
                f"this run (threshold {threshold}). Likely the DataImpulse EG proxy "
