@@ -3768,6 +3768,15 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # Controlled by the LCW_SIZE_CAP repository variable so it can be raised
     # (to clear a backlog) or lowered (to conserve proxy bandwidth) WITHOUT
     # editing this file. Defaults to 65 if the variable isn't set.
+    # v14.59: fresh session for the size pass. Reusing whatever `session` the
+    # main category crawl ended on meant this ran on a potentially 30+ min
+    # old DataImpulse sticky session — get_lcw_session()'s own docstring
+    # notes sticky bindings last "up to ~30 min". A crawl that long left the
+    # size pass with a dead tunnel: every request hung to the timeout
+    # ceiling with no variation, the fingerprint of a black-holed connection
+    # rather than a slow site. Symptom seen live: 100% "curl (28) Connection
+    # timed out" across every URL in the size pass.
+    size_session, _size_country = get_lcw_session(avoid_country=lcw_country)
     SIZE_CAP     = env_int("LCW_SIZE_CAP", 65)
     SIZE_TIMEOUT = 600   # 10 minutes hard ceiling — far less than the 180-min workflow limit
     print(f"  [LCW] Fetching sizes for variants missing data (cap: {SIZE_CAP}/run)...")
@@ -3814,7 +3823,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 print(f"  [LCW] Size pass time limit reached — stopping early.")
                 break
 
-            page_data = fetch_lcw_product_page(session, url)
+            page_data = fetch_lcw_product_page(size_session, url)
             fetched += 1
 
             if not page_data or not page_data.get("sizes"):
