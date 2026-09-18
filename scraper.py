@@ -2972,6 +2972,17 @@ def fetch_lcw_product_page(session, url):
             "accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
             "accept-encoding": "gzip, deflate, br",
+            # v14.61: this was getting a clean HTTP 403 on nearly every URL
+            # while the AJAX category endpoint (which sends these) sailed
+            # through — a bare GET with none of a real navigation's headers
+            # reads as a bot hitting the URL directly, not a browser
+            # following a link. referer points at the domain root since we
+            # don't know which listing page actually linked here.
+            "referer":                   f"https://{url.split('/')[2]}/",
+            "sec-fetch-dest":            "document",
+            "sec-fetch-mode":            "navigate",
+            "sec-fetch-site":            "same-origin",
+            "upgrade-insecure-requests": "1",
         })
         if res.status_code == 200:
             return parse_lcw_page_data(res.text)
