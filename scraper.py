@@ -1267,6 +1267,25 @@ def get_shopify_session(brand_name):
     print(f"  ⚠️ [{brand_name}] DECODO credentials not set — falling back to direct.")
     return get_resilient_session()
 
+# v14.60: LCW provider escalation — see get_lcw_session() docstring for the
+# full reasoning. Separate from the Shopify/Woo PROXY_TIERS state above:
+# LCW is a single brand with its own circuit breaker already, so this only
+# needs two providers and no per-brand override stack.
+LCW_PROXY_PROVIDERS = ["dataimpulse", "decodo"]
+_lcw_provider_state = {"idx": 0}
+
+def _lcw_maybe_escalate_to_decodo(reason):
+    """Called when LCW's own DataImpulse circuit breaker trips. Returns True
+    if we just escalated to Decodo (caller should reset its failure counters
+    and keep going); False if already on Decodo (caller should really abort
+    — there's nothing left to fall back to)."""
+    if _lcw_provider_state["idx"] >= len(LCW_PROXY_PROVIDERS) - 1:
+        return False
+    _lcw_provider_state["idx"] += 1
+    print(f"  ⬆️  [LCW] DataImpulse circuit breaker tripped ({reason}) — "
+          f"escalating to Decodo for the rest of this run.")
+    return True
+
 def get_lcw_session(avoid_country=None):
     """
     v14.34: switched from username-parameter stickiness (__cr.eg;sessid.N on
@@ -1285,7 +1304,28 @@ def get_lcw_session(avoid_country=None):
     country's pool — if a whole pool is having a bad hour, retrying inside it
     is the least useful thing we can do. Falls back to the full list when
     only one country is configured.
+
+    v14.60: if DataImpulse's OWN circuit breaker trips this run (see
+    _lcw_maybe_escalate_to_decodo, called from scrape_lcw), every session
+    request from that point on returns a Decodo session instead — confirmed
+    live on 2026-09 that a DataImpulse-wide outage produces identical
+    connection-timeout hangs across every country AND across fresh sessions,
+    so rotating countries/sessions within DataImpulse gains nothing once
+    that's happening. This is a same-run stopgap only: state resets every
+    process run, so the NEXT scheduled run always tries DataImpulse first
+    again — it isn't a permanent switch, in case DataImpulse recovers.
+    Known tradeoff, accepted deliberately: Decodo's 3 static IPs are shared
+    with the Shopify/Woo cascade, so LCW landing here shares fate with
+    whichever Shopify brand(s) hash to the same IP.
     """
+    if _lcw_provider_state["idx"] == 1:
+        session = get_decodo_session("lc_waikiki")
+        if session:
+            session._khabar_http_version = _lcw_http_version()
+            print(f"  [LCW] Proxy session selected: provider=decodo port.{session._khabar_decodo_port}")
+            return session, "decodo"
+        print("  ⚠️ [LCW] Escalated to Decodo but credentials aren't set — "
+              "falling back to DataImpulse anyway (will likely keep failing).")
     if not DATAIMPULSE_CONFIGURED:
         return requests.Session(impersonate="chrome124"), None
     choices = [c for c in LCW_PROXY_COUNTRIES if c != avoid_country] or LCW_PROXY_COUNTRIES
@@ -3380,10 +3420,16 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
                                   pages_done=0, pages_total=0, pages_failed=1)
             if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
-                print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive / {total_failures[0]} total page "
-                      f"failures — DataImpulse route looks broadly unhealthy "
-                      f"right now, not one bad peer. Aborting LCW run early; "
-                      f"will retry on the next scheduled run.")
+                reason = f"{consecutive_failures[0]} consecutive / {total_failures[0]} total page failures"
+                if _lcw_maybe_escalate_to_decodo(reason):
+                    consecutive_failures[0] = 0
+                    total_failures[0] = 0
+                    rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
+                    session, lcw_country = get_lcw_session()
+                    continue
+                print(f"  🛑 [LCW] {reason} — DataImpulse AND Decodo both look "
+                      f"unhealthy right now, not one bad peer. Aborting LCW run "
+                      f"early; will retry on the next scheduled run.")
                 return _lcw_finalise(supabase, session, brand_name, domain, today,
                                      lcw_model_records, lcw_model_info, prev_prices,
                                      existing_snapshot_ids, products_seen, price_changes)
@@ -3440,10 +3486,17 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                         print(f"  ⚠️ [{cat_name}] Page {page_idx} failed "
                               f"{MAX_PAGE_ATTEMPTS}x. Giving up on this page.")
                     if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
-                        print(f"  🛑 [LCW] {consecutive_failures[0]} consecutive / {total_failures[0]} total page "
-                              f"failures — DataImpulse route looks broadly unhealthy "
-                              f"right now, not one bad peer. Aborting LCW run early; "
-                              f"will retry on the next scheduled run.")
+                        reason = f"{consecutive_failures[0]} consecutive / {total_failures[0]} total page failures"
+                        if _lcw_maybe_escalate_to_decodo(reason):
+                            consecutive_failures[0] = 0
+                            total_failures[0] = 0
+                            rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
+                            session, lcw_country = get_lcw_session()
+                            continue
+                        print(f"  🛑 [LCW] {reason} — DataImpulse AND Decodo both "
+                              f"look unhealthy right now, not one bad peer. "
+                              f"Aborting LCW run early; will retry on the next "
+                              f"scheduled run.")
                         # This category is incomplete — discard its buffer so a
                         # partial colour set never reaches price detection.
                         if LCW_CHECKPOINT:
