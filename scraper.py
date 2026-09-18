@@ -1273,6 +1273,14 @@ def get_shopify_session(brand_name):
 # needs two providers and no per-brand override stack.
 LCW_PROXY_PROVIDERS = ["dataimpulse", "decodo"]
 _lcw_provider_state = {"idx": 0}
+# v14.62: set True when scrape_lcw hits the "day already fully checkpointed,
+# nothing to do" no-op path (see set-site below). 0 products in THAT case is
+# correct-by-design, not a failure — the empty-run guard (and failed_brands/
+# retry-pass logic) needs to tell the two apart, since a 1-brand LCW run
+# legitimately scanning 0 real products now DOES correctly alert (v14.58
+# fix), which means a benign checkpoint no-op must NOT be counted as 0, or
+# every re-run on an already-complete day falsely pages as a proxy outage.
+_lcw_noop_today = {"flag": False}
 
 def _lcw_maybe_escalate_to_decodo(reason):
     """Called when LCW's own DataImpulse circuit breaker trips. Returns True
@@ -3281,6 +3289,7 @@ def _lcw_finalise(supabase, session, brand_name, domain, today,
 def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     print("  Executing LC Waikiki Catalog Engine (API mode)...")
     print(f"  [LCW] Proxy configured: {DATAIMPULSE_CONFIGURED}")
+    _lcw_noop_today["flag"] = False   # v14.62: reset each call — see flag's set-site below
     products_seen, price_changes = 0, 0
 
     prev_prices = load_last_prices(supabase, brand_name)
@@ -3395,6 +3404,7 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     if LCW_CHECKPOINT and len(done_categories) >= len(LCW_CATEGORIES):
         print("  [LCW] All categories already scraped today — skipping the "
               "catalog crawl and going straight to the size pass.")
+        _lcw_noop_today["flag"] = True
 
     # v14.43: how many categories this run actually attempted. If zero, the
     # run is a pure retry no-op (everything was already done by an earlier
@@ -5742,9 +5752,13 @@ if __name__ == "__main__":
 
     for i, b in enumerate(active_brands):
         seen, changes = _run_brand_with_proxy_cascade(b["name"], b["domain"], b["engine"])
-        brand_results[b["name"]] = (seen, changes)
-        if seen == 0:
-            failed_brands.append(b)
+        if b["engine"] == "lcw_proxy" and _lcw_noop_today["flag"]:
+            print(f"  [{b['name']}] Checkpoint no-op (day already complete) — "
+                  f"not counted toward the empty-run guard.")
+        else:
+            brand_results[b["name"]] = (seen, changes)
+            if seen == 0:
+                failed_brands.append(b)
         if i < len(active_brands) - 1:
             pause = random.uniform(8, 20)
             print(f"  Pausing {pause:.1f}s before next brand...")
