@@ -727,8 +727,8 @@ DATAIMPULSE_CONFIGURED = bool(DATAIMPULSE_USER and DATAIMPULSE_PASS)
 # mimics a small number of consistent return visitors. Assignment uses
 # sha256, not Python's hash() — hash() is randomized per process (security
 # feature), so brand->IP would silently reshuffle on every run otherwise.
-DECODO_USER  = os.environ.get("DECODO_PROXY_USERNAME", "")
-DECODO_PASS  = os.environ.get("DECODO_PROXY_PASSWORD", "")
+DECODO_USER  = os.environ.get("DECODO_PROXY_USER", "")
+DECODO_PASS  = os.environ.get("DECODO_PROXY_PASS", "")
 DECODO_HOST  = env_str("DECODO_HOST", "isp.decodo.com")
 DECODO_PORTS = [10001, 10002, 10003]
 DECODO_CONFIGURED = bool(DECODO_USER and DECODO_PASS)
