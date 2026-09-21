@@ -3412,380 +3412,402 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
     # ~10 minutes of proxy bandwidth per retry attempt for no reason.
     categories_crawled = 0
 
-    for cat in LCW_CATEGORIES:
-        cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
-        cat_params = cat.get("params", [])
-        if cat_id in done_categories:
-            print(f"  [{cat_name}] Already complete today — skipping.")
-            continue
-        categories_crawled += 1
+    categories_succeeded = 0
+    while True:
+        for cat in LCW_CATEGORIES:
+            cat_id, cat_name, cat_gender = cat["id"], cat["name"], cat["gender"]
+            cat_params = cat.get("params", [])
+            if cat_id in done_categories:
+                print(f"  [{cat_name}] Already complete today — skipping.")
+                continue
+            categories_crawled += 1
 
-        # v14.41: buffer this category's records. They are merged into the
-        # run-wide set ONLY if every page succeeded, so a partial category
-        # never reaches price detection with an incomplete colour set.
-        cat_model_records, cat_model_info = {}, {}
-        cat_pages_done = cat_pages_failed = 0
-        cat_failed_pages = []
+            # v14.41: buffer this category's records. They are merged into the
+            # run-wide set ONLY if every page succeeded, so a partial category
+            # never reaches price detection with an incomplete colour set.
+            cat_model_records, cat_model_info = {}, {}
+            cat_pages_done = cat_pages_failed = 0
+            cat_failed_pages = []
 
-        print(f"  [{cat_name}] Fetching page 1 to get total page count...")
-        seen_ids   = []
-        first_data, session, lcw_country = lcw_fetch_page_resilient(
-            session, domain, cat_id, 1, headers,
-            seen_ids=[], category_params=cat_params,
-            rotation_budget=rotation_budget, current_country=lcw_country)
-        if not first_data:
-            consecutive_failures[0] += 1
-            total_failures[0] += 1
-            print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
-            if LCW_CHECKPOINT:
-                mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
-                                  pages_done=0, pages_total=0, pages_failed=1)
-            if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
-                reason = f"{consecutive_failures[0]} consecutive / {total_failures[0]} total page failures"
-                if _lcw_maybe_escalate_to_decodo(reason):
-                    consecutive_failures[0] = 0
-                    total_failures[0] = 0
-                    rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
-                    session, lcw_country = get_lcw_session()
-                    continue
-                print(f"  🛑 [LCW] {reason} — DataImpulse AND Decodo both look "
-                      f"unhealthy right now, not one bad peer. Aborting LCW run "
-                      f"early; will retry on the next scheduled run.")
-                return _lcw_finalise(supabase, session, brand_name, domain, today,
-                                     lcw_model_records, lcw_model_info, prev_prices,
-                                     existing_snapshot_ids, products_seen, price_changes)
-            continue
-        consecutive_failures[0] = 0
+            print(f"  [{cat_name}] Fetching page 1 to get total page count...")
+            seen_ids   = []
+            first_data, session, lcw_country = lcw_fetch_page_resilient(
+                session, domain, cat_id, 1, headers,
+                seen_ids=[], category_params=cat_params,
+                rotation_budget=rotation_budget, current_country=lcw_country)
+            if not first_data:
+                consecutive_failures[0] += 1
+                total_failures[0] += 1
+                print(f"  ⚠️ [{cat_name}] Could not reach LCW API. Skipping.")
+                if LCW_CHECKPOINT:
+                    mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                      pages_done=0, pages_total=0, pages_failed=1)
+                if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
+                    reason = f"{consecutive_failures[0]} consecutive / {total_failures[0]} total page failures"
+                    if _lcw_maybe_escalate_to_decodo(reason):
+                        consecutive_failures[0] = 0
+                        total_failures[0] = 0
+                        rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
+                        session, lcw_country = get_lcw_session()
+                        continue
+                    print(f"  🛑 [LCW] {reason} — DataImpulse AND Decodo both look "
+                          f"unhealthy right now, not one bad peer. Aborting LCW run "
+                          f"early; will retry on the next scheduled run.")
+                    return _lcw_finalise(supabase, session, brand_name, domain, today,
+                                         lcw_model_records, lcw_model_info, prev_prices,
+                                         existing_snapshot_ids, products_seen, price_changes)
+                continue
+            consecutive_failures[0] = 0
 
-        catalog_meta = first_data.get("CatalogList") or {}
-        total_items  = catalog_meta.get("ItemCount", 0)
-        page_count   = catalog_meta.get("PageCount", 1)
-        print(f"  [{cat_name}] {total_items} products across {page_count} pages.")
+            catalog_meta = first_data.get("CatalogList") or {}
+            total_items  = catalog_meta.get("ItemCount", 0)
+            page_count   = catalog_meta.get("PageCount", 1)
+            print(f"  [{cat_name}] {total_items} products across {page_count} pages.")
 
-        # v14.41: worklist instead of a fixed range. A failed page is pushed
-        # to the BACK of the queue rather than abandoned, so it is retried
-        # later in the run against a different session/peer. Without this,
-        # requiring a clean sweep of a 55-page category was unachievable: at
-        # even a 3% per-page failure rate, P(at least one failure) ≈ 81%, so
-        # categories would essentially never commit and the checkpoint would
-        # be worse than useless. Verified by simulation before shipping.
-        pending        = list(range(1, page_count + 1))
-        page_attempts  = {}
-        MAX_PAGE_ATTEMPTS = env_int("LCW_PAGE_ATTEMPTS", 3)
+            # v14.41: worklist instead of a fixed range. A failed page is pushed
+            # to the BACK of the queue rather than abandoned, so it is retried
+            # later in the run against a different session/peer. Without this,
+            # requiring a clean sweep of a 55-page category was unachievable: at
+            # even a 3% per-page failure rate, P(at least one failure) ≈ 81%, so
+            # categories would essentially never commit and the checkpoint would
+            # be worse than useless. Verified by simulation before shipping.
+            pending        = list(range(1, page_count + 1))
+            page_attempts  = {}
+            MAX_PAGE_ATTEMPTS = env_int("LCW_PAGE_ATTEMPTS", 3)
 
-        while pending:
-            if time.time() - lcw_start > LCW_TIME_BUDGET_SEC:
-                print(f"  🛑 [LCW] time budget exceeded "
-                      f"(~{int((time.time()-lcw_start)/60)} min) — route too slow "
-                      f"right now; aborting early, will retry next run.")
+            while pending:
+                if time.time() - lcw_start > LCW_TIME_BUDGET_SEC:
+                    print(f"  🛑 [LCW] time budget exceeded "
+                          f"(~{int((time.time()-lcw_start)/60)} min) — route too slow "
+                          f"right now; aborting early, will retry next run.")
+                    if LCW_CHECKPOINT:
+                        mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                          cat_pages_done, page_count, cat_pages_failed)
+                    return _lcw_finalise(supabase, session, brand_name, domain, today,
+                                         lcw_model_records, lcw_model_info, prev_prices,
+                                         existing_snapshot_ids, products_seen, price_changes)
+                page_idx = pending.pop(0)
+                data = first_data if page_idx == 1 else None
+                if page_idx > 1:
+                    time.sleep(random.uniform(1.2, 2.0))
+                    data, session, lcw_country = lcw_fetch_page_resilient(
+                        session, domain, cat_id, page_idx, headers,
+                        seen_ids=seen_ids, category_params=cat_params,
+                        rotation_budget=rotation_budget, current_country=lcw_country)
+                    if not data:
+                        consecutive_failures[0] += 1
+                        total_failures[0] += 1
+                        page_attempts[page_idx] = page_attempts.get(page_idx, 0) + 1
+                        if page_attempts[page_idx] < MAX_PAGE_ATTEMPTS:
+                            pending.append(page_idx)   # retry later, fresh peer
+                            print(f"  ↩️ [{cat_name}] Page {page_idx} failed "
+                                  f"(attempt {page_attempts[page_idx]}/{MAX_PAGE_ATTEMPTS}) "
+                                  f"— re-queued for a later retry.")
+                        else:
+                            cat_pages_failed += 1
+                            cat_failed_pages.append(page_idx)
+                            print(f"  ⚠️ [{cat_name}] Page {page_idx} failed "
+                                  f"{MAX_PAGE_ATTEMPTS}x. Giving up on this page.")
+                        if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
+                            reason = f"{consecutive_failures[0]} consecutive / {total_failures[0]} total page failures"
+                            if _lcw_maybe_escalate_to_decodo(reason):
+                                consecutive_failures[0] = 0
+                                total_failures[0] = 0
+                                rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
+                                session, lcw_country = get_lcw_session()
+                                continue
+                            print(f"  🛑 [LCW] {reason} — DataImpulse AND Decodo both "
+                                  f"look unhealthy right now, not one bad peer. "
+                                  f"Aborting LCW run early; will retry on the next "
+                                  f"scheduled run.")
+                            # This category is incomplete — discard its buffer so a
+                            # partial colour set never reaches price detection.
+                            if LCW_CHECKPOINT:
+                                mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
+                                                  cat_pages_done, page_count, cat_pages_failed)
+                            return _lcw_finalise(supabase, session, brand_name, domain, today,
+                                                 lcw_model_records, lcw_model_info, prev_prices,
+                                                 existing_snapshot_ids, products_seen, price_changes)
+                        continue
+
+                consecutive_failures[0] = 0
+                items = (data.get("CatalogList") or {}).get("Items") or []
+                if not items:
+                    print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
+                    break
+
+                for _item in items:
+                    _opt = _item.get("OptionId")
+                    if _opt and _opt not in seen_ids:
+                        seen_ids.append(_opt)
+
+                batch_products, seen_ext_ids = [], set()
+                for item in items:
+                    model_id = item.get("ModelId")
+                    if not model_id or str(model_id) in seen_ext_ids: continue
+                    seen_ext_ids.add(str(model_id))
+                    name       = (item.get("ProductDescription") or item.get("BrandPropertyDescription")
+                                  or item.get("Name") or f"LCW-{model_id}")
+                    breadcrumb = item.get("BreadCrump") or {}
+                    category   = lcw_normalize_category(breadcrumb)
+                    if category == "uncategorized" and name:
+                        category = lcw_normalize_category({"Level3": name})
+                    gender     = lcw_normalize_gender(breadcrumb, cat_gender)
+                    model_url  = item.get("ModelUrl") or ""
+                    url        = f"https://{domain}{model_url}" if model_url.startswith("/") else model_url
+                    cat_raw    = breadcrumb.get("Level3") or breadcrumb.get("Level2") or ""
+                    batch_products.append({
+                        "brand": brand_name, "external_id": str(model_id), "name": name,
+                        "category_raw":        cat_raw,
+                        "category_normalized": category, "gender": gender,
+                        "sizes_available": [], "url": url,
+                        "image_url":   item.get("DefaultOptionImageUrl"),
+                        "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True,
+                        "delisted_at": None,
+                        # v14.24: LCW's strongest signal for both sleeve length and
+                        # fit/cut is the title — confirmed via live coverage check,
+                        # so this brand uses build_attributes_extracted's default
+                        # (title-first) priority order. Also picks up any v14.25
+                        # dress/jacket/underwear/swimwear/bag attributes if this
+                        # product's category matches one of those groups.
+                        "attributes_extracted": build_attributes_extracted(
+                            brand_name, category, cat_raw, name
+                        ),
+                    })
+
+                if not batch_products: continue
+
+                product_upsert_rows = []
+                for i in range(0, len(batch_products), 100):
+                    res_p = safe_db_execute(
+                        supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id")
+                    )
+                    if res_p and res_p.data: product_upsert_rows.extend(res_p.data)
+                product_id_map  = {row["external_id"]: row["id"] for row in product_upsert_rows}
+                products_seen  += len(batch_products)
+
+                for item in items:
+                    db_pid = product_id_map.get(str(item.get("ModelId")))
+                    if not db_pid: continue
+                    # v14.17: skip already-seeded products — fop_done_ids is passed
+                    # in; the DB still enforces the IS NULL guard, but the network
+                    # call no longer happens.
+                    if db_pid in fop_done_ids: continue
+                    # v14.50: the actual selling price is the campaign-badge price
+                    # when present (LCW moved it there — see _lcw_badge_price), else
+                    # the flat list price. The old DiscountedPriceValue is dead (0).
+                    full_val   = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
+                    badge_val  = _lcw_badge_price(item)
+                    fop = badge_val if badge_val > 0 else full_val
+                    if fop > 0:
+                        safe_db_execute(
+                            supabase.table("products")
+                            .update({"first_observed_price": fop})
+                            .eq("id", db_pid)
+                            .is_("first_observed_price", "null")
+                        )
+                        fop_done_ids.add(db_pid)
+
+                batch_variants, product_variant_tracking = [], {}
+                for item in items:
+                    model_id = item.get("ModelId")
+                    db_pid   = product_id_map.get(str(model_id))
+                    if not db_pid: continue
+                    product_variant_tracking.setdefault(db_pid, [])
+                    opt_id = item.get("OptionId")
+
+                    # v14.44 — one-shot field inspector. LCW changes its payload
+                    # shape without notice, and a renamed price field fails SILENTLY
+                    # (everything reads as full price) rather than raising. Set the
+                    # repo variable LCW_DEBUG_FIELDS=1 and read the next run's log to
+                    # see the real keys and price-ish values on a live item, instead
+                    # of guessing which field died. Off by default; prints once.
+                    global _LCW_FIELDS_DUMPED
+                    if env_str("LCW_DEBUG_FIELDS", "") == "1" and not _LCW_FIELDS_DUMPED:
+                        _LCW_FIELDS_DUMPED = True
+                        price_ish = {k: v for k, v in item.items()
+                                     if any(t in k.lower() for t in
+                                            ("price", "discount", "old", "amount"))}
+                        print(f"  [LCW][DEBUG] item keys: {sorted(item.keys())}")
+                        print(f"  [LCW][DEBUG] price-related fields: {price_ish}")
+
+                    is_discounted  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
+                    discounted_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
+                    full_val       = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
+                    old_val        = _parse_lcw_price(item.get("MinOldPrice"))
+                    badge_val      = _lcw_badge_price(item)   # v14.50 — the real sale price
+
+                    # v14.50 — PRICE RESOLUTION, campaign-badge first.
+                    #
+                    # Around 2026-07-21 LCW moved the live sale price into
+                    # CampaignBadges[].DiscountedPrice and left the flat fields
+                    # (DiscountedPriceValue, MinOldPrice, ConvertedPrice*) returning
+                    # 0/None. Proven live 2026-07-26 (lcw_price_probe.py): o-5208891
+                    # = PriceValue 349, badge DiscountedPrice 169, -52%, matching the
+                    # website. Reading only the flat fields made every item resolve
+                    # to its list price (== first_observed_price), which is why LCW
+                    # showed frozen prices and zero price events for ~a week.
+                    #
+                    # Order: the badge price is the actual charge, so it wins. The
+                    # legacy DiscountedPriceValue path is kept as a fallback in case
+                    # LCW ever repopulates it. The numeric-min path (v14.44) stays as
+                    # a last resort for any odd item that has an old-price field but
+                    # no badge. Full list price only when nothing else is present.
+                    candidates = [v for v in (full_val, old_val) if v and v > 0]
+                    if badge_val and badge_val > 0:
+                        price = badge_val
+                    elif discounted_val and discounted_val > 0:
+                        price = discounted_val
+                    elif is_discounted and candidates:
+                        price = min(candidates)
+                    else:
+                        price = full_val
+                    if not price or price <= 0:
+                        continue
+
+                    # compare_at = the credible "before" price. With a badge sale the
+                    # list price (PriceValue/full_val) is the genuine anchor, so use
+                    # it directly; otherwise fall back to the highest prior field.
+                    # Accepted only when it genuinely exceeds what is being charged
+                    # (1% floor keeps rounding noise out of the discount signals).
+                    if badge_val and full_val > price * 1.01:
+                        compare_at = full_val
+                    else:
+                        highest_prior = max(candidates) if candidates else 0
+                        compare_at    = highest_prior if highest_prior > price * 1.01 else None
+                    if compare_at:
+                        _LCW_DISCOUNTED_SEEN[0] += 1
+                    _LCW_ITEMS_SEEN[0] += 1
+
+                    is_avail   = int(item.get("AvailableStock") or 0) > 0
+                    sku        = f"lcw_{opt_id}"
+
+                    color_img_url = item.get("ColorImageUrl") or ""
+                    color_name = None
+                    if color_img_url:
+                        m = re.search(r'/([^/]+)\.(png|jpg|jpeg|webp)$', color_img_url, re.IGNORECASE)
+                        if m:
+                            color_name = m.group(1).lower()
+                    if not color_name:
+                        color_name = item.get("MainColorHexCode") or None
+                    # Translate the Turkish swatch filename into the English colour name
+                    # that every other brand uses, so cross-brand colour queries (e.g.
+                    # "what % of men's black bottoms got discounted") work without
+                    # per-brand special-casing downstream.
+                    color_name = normalize_lcw_color(color_name)
+
+                    prev       = prev_stock_state.get(sku)
+                    v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
+
+                    batch_variants.append({
+                        "product_id": db_pid, "external_sku": sku, "color": color_name,
+                        # v14.18: "size" intentionally EXCLUDED from the upsert payload.
+                        # LCW's catalog API doesn't include per-variant sizes — those come
+                        # from product-page JSON (the backfill pass). Including size=None
+                        # here made the upsert overwrite sizes populated by previous runs,
+                        # forcing the backfill to redo work every run. Omitting the key
+                        # means ON CONFLICT SET skips the column, preserving existing data.
+                        #
+                        # is_in_stock HERE is the COLOR-WIDE aggregate (AvailableStock > 0
+                        # across every size of this color) — this field's ONLY writer for
+                        # this row going forward (v14.22 FIX 1). The size-backfill pass
+                        # below populates "size" on size-suffixed CHILD rows and no longer
+                        # touches is_in_stock on THIS parent row at all.
+                        "is_in_stock": is_avail, "first_observed_price": v_baseline,
+                        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                        "_meta_price": price, "_meta_compare": compare_at,
+                        "_meta_baseline": v_baseline, "_meta_size": None,
+                        "_meta_color": color_name, "_meta_available": is_avail,
+                    })
+
+                if batch_variants:
+                    # v14.23: change-detection (see helper). LCW rows carry no
+                    # "size" key so variant_needs_write skips the size comparison
+                    # for them automatically.
+                    rows_to_write, skipped_sku_to_id = apply_change_detection(
+                        batch_variants, prev_stock_state, brand_name)
+                    db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
+                               "delisted_at": None} for r in rows_to_write]
+                    variant_upsert_rows = []
+                    for i in range(0, len(db_payload), 100):
+                        res_v = safe_db_execute(
+                            supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku")
+                        )
+                        if res_v and res_v.data: variant_upsert_rows.extend(res_v.data)
+                    sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
+                    sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
+                    for vr in batch_variants:
+                        vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
+                        product_variant_tracking[vr["product_id"]].append(vr)
+
+                    # Per-variant (per-colour) stockout detection — correct at this grain,
+                    # safe to run per page (each OptionId appears on exactly one page).
+                    for db_pid, records in product_variant_tracking.items():
+                        for rec in records:
+                            prev_v = prev_stock_state.get(rec["external_sku"])
+                            if prev_v:
+                                detect_and_write_stockout(
+                                    supabase, rec["variant_db_id"], db_pid, brand_name,
+                                    rec["_meta_size"], None,
+                                    prev_v["is_in_stock"], rec["_meta_available"],
+                                    rec["_meta_price"], rec["_meta_baseline"]
+                                )
+                        # Accumulate this page's colours into the run-level model record
+                        # set; price detection happens once, after the full crawl.
+                        cat_model_records.setdefault(db_pid, []).extend(records)
+                        if db_pid not in cat_model_info:
+                            it = next((item for item in items
+                                       if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
+                            if it:
+                                cat_model_info[db_pid] = {
+                                    "desc":     it.get("ProductDescription") or it.get("BrandPropertyDescription") or "LCW Item",
+                                    "category": lcw_normalize_category(it.get("BreadCrump") or {}),
+                                    "url":      f"https://{domain}{it.get('ModelUrl') or ''}",
+                                }
+
+                cat_pages_done += 1
+                print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
+
+            # ── v14.41: commit or discard this category, whole ───────────────────
+            if cat_pages_failed == 0:
+                for db_pid, recs in cat_model_records.items():
+                    lcw_model_records.setdefault(db_pid, []).extend(recs)
+                lcw_model_info.update(cat_model_info)
+                if LCW_CHECKPOINT:
+                    mark_lcw_progress(supabase, today, cat_id, cat_name, "complete",
+                                      cat_pages_done, page_count, 0)
+                categories_succeeded += 1
+                print(f"  ✅ [{cat_name}] Complete — {cat_pages_done}/{page_count} pages, "
+                      f"{len(cat_model_records)} models committed.")
+            else:
+                # Discarded on purpose. Committing a partial colour set would let
+                # price detection see half a model's colours and invent a price
+                # move that never happened (the v14.9 bug). Redone next run.
                 if LCW_CHECKPOINT:
                     mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
                                       cat_pages_done, page_count, cat_pages_failed)
-                return _lcw_finalise(supabase, session, brand_name, domain, today,
-                                     lcw_model_records, lcw_model_info, prev_prices,
-                                     existing_snapshot_ids, products_seen, price_changes)
-            page_idx = pending.pop(0)
-            data = first_data if page_idx == 1 else None
-            if page_idx > 1:
-                time.sleep(random.uniform(1.2, 2.0))
-                data, session, lcw_country = lcw_fetch_page_resilient(
-                    session, domain, cat_id, page_idx, headers,
-                    seen_ids=seen_ids, category_params=cat_params,
-                    rotation_budget=rotation_budget, current_country=lcw_country)
-                if not data:
-                    consecutive_failures[0] += 1
-                    total_failures[0] += 1
-                    page_attempts[page_idx] = page_attempts.get(page_idx, 0) + 1
-                    if page_attempts[page_idx] < MAX_PAGE_ATTEMPTS:
-                        pending.append(page_idx)   # retry later, fresh peer
-                        print(f"  ↩️ [{cat_name}] Page {page_idx} failed "
-                              f"(attempt {page_attempts[page_idx]}/{MAX_PAGE_ATTEMPTS}) "
-                              f"— re-queued for a later retry.")
-                    else:
-                        cat_pages_failed += 1
-                        cat_failed_pages.append(page_idx)
-                        print(f"  ⚠️ [{cat_name}] Page {page_idx} failed "
-                              f"{MAX_PAGE_ATTEMPTS}x. Giving up on this page.")
-                    if consecutive_failures[0] >= CIRCUIT_BREAKER_LIMIT or total_failures[0] >= MAX_TOTAL_FAILURES:
-                        reason = f"{consecutive_failures[0]} consecutive / {total_failures[0]} total page failures"
-                        if _lcw_maybe_escalate_to_decodo(reason):
-                            consecutive_failures[0] = 0
-                            total_failures[0] = 0
-                            rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
-                            session, lcw_country = get_lcw_session()
-                            continue
-                        print(f"  🛑 [LCW] {reason} — DataImpulse AND Decodo both "
-                              f"look unhealthy right now, not one bad peer. "
-                              f"Aborting LCW run early; will retry on the next "
-                              f"scheduled run.")
-                        # This category is incomplete — discard its buffer so a
-                        # partial colour set never reaches price detection.
-                        if LCW_CHECKPOINT:
-                            mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
-                                              cat_pages_done, page_count, cat_pages_failed)
-                        return _lcw_finalise(supabase, session, brand_name, domain, today,
-                                             lcw_model_records, lcw_model_info, prev_prices,
-                                             existing_snapshot_ids, products_seen, price_changes)
-                    continue
+                print(f"  ⚠️ [{cat_name}] Incomplete — {cat_pages_failed} page(s) failed. "
+                      f"Discarding {len(cat_model_records)} buffered models; "
+                      f"category will be retried in full on the next run.")
 
-            consecutive_failures[0] = 0
-            items = (data.get("CatalogList") or {}).get("Items") or []
-            if not items:
-                print(f"  ⚠️ [{cat_name}] Page {page_idx} returned 0 items.")
-                break
-
-            for _item in items:
-                _opt = _item.get("OptionId")
-                if _opt and _opt not in seen_ids:
-                    seen_ids.append(_opt)
-
-            batch_products, seen_ext_ids = [], set()
-            for item in items:
-                model_id = item.get("ModelId")
-                if not model_id or str(model_id) in seen_ext_ids: continue
-                seen_ext_ids.add(str(model_id))
-                name       = (item.get("ProductDescription") or item.get("BrandPropertyDescription")
-                              or item.get("Name") or f"LCW-{model_id}")
-                breadcrumb = item.get("BreadCrump") or {}
-                category   = lcw_normalize_category(breadcrumb)
-                if category == "uncategorized" and name:
-                    category = lcw_normalize_category({"Level3": name})
-                gender     = lcw_normalize_gender(breadcrumb, cat_gender)
-                model_url  = item.get("ModelUrl") or ""
-                url        = f"https://{domain}{model_url}" if model_url.startswith("/") else model_url
-                cat_raw    = breadcrumb.get("Level3") or breadcrumb.get("Level2") or ""
-                batch_products.append({
-                    "brand": brand_name, "external_id": str(model_id), "name": name,
-                    "category_raw":        cat_raw,
-                    "category_normalized": category, "gender": gender,
-                    "sizes_available": [], "url": url,
-                    "image_url":   item.get("DefaultOptionImageUrl"),
-                    "last_seen_at": datetime.now(timezone.utc).isoformat(), "is_active": True,
-                    "delisted_at": None,
-                    # v14.24: LCW's strongest signal for both sleeve length and
-                    # fit/cut is the title — confirmed via live coverage check,
-                    # so this brand uses build_attributes_extracted's default
-                    # (title-first) priority order. Also picks up any v14.25
-                    # dress/jacket/underwear/swimwear/bag attributes if this
-                    # product's category matches one of those groups.
-                    "attributes_extracted": build_attributes_extracted(
-                        brand_name, category, cat_raw, name
-                    ),
-                })
-
-            if not batch_products: continue
-
-            product_upsert_rows = []
-            for i in range(0, len(batch_products), 100):
-                res_p = safe_db_execute(
-                    supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id")
-                )
-                if res_p and res_p.data: product_upsert_rows.extend(res_p.data)
-            product_id_map  = {row["external_id"]: row["id"] for row in product_upsert_rows}
-            products_seen  += len(batch_products)
-
-            for item in items:
-                db_pid = product_id_map.get(str(item.get("ModelId")))
-                if not db_pid: continue
-                # v14.17: skip already-seeded products — fop_done_ids is passed
-                # in; the DB still enforces the IS NULL guard, but the network
-                # call no longer happens.
-                if db_pid in fop_done_ids: continue
-                # v14.50: the actual selling price is the campaign-badge price
-                # when present (LCW moved it there — see _lcw_badge_price), else
-                # the flat list price. The old DiscountedPriceValue is dead (0).
-                full_val   = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
-                badge_val  = _lcw_badge_price(item)
-                fop = badge_val if badge_val > 0 else full_val
-                if fop > 0:
-                    safe_db_execute(
-                        supabase.table("products")
-                        .update({"first_observed_price": fop})
-                        .eq("id", db_pid)
-                        .is_("first_observed_price", "null")
-                    )
-                    fop_done_ids.add(db_pid)
-
-            batch_variants, product_variant_tracking = [], {}
-            for item in items:
-                model_id = item.get("ModelId")
-                db_pid   = product_id_map.get(str(model_id))
-                if not db_pid: continue
-                product_variant_tracking.setdefault(db_pid, [])
-                opt_id = item.get("OptionId")
-
-                # v14.44 — one-shot field inspector. LCW changes its payload
-                # shape without notice, and a renamed price field fails SILENTLY
-                # (everything reads as full price) rather than raising. Set the
-                # repo variable LCW_DEBUG_FIELDS=1 and read the next run's log to
-                # see the real keys and price-ish values on a live item, instead
-                # of guessing which field died. Off by default; prints once.
-                global _LCW_FIELDS_DUMPED
-                if env_str("LCW_DEBUG_FIELDS", "") == "1" and not _LCW_FIELDS_DUMPED:
-                    _LCW_FIELDS_DUMPED = True
-                    price_ish = {k: v for k, v in item.items()
-                                 if any(t in k.lower() for t in
-                                        ("price", "discount", "old", "amount"))}
-                    print(f"  [LCW][DEBUG] item keys: {sorted(item.keys())}")
-                    print(f"  [LCW][DEBUG] price-related fields: {price_ish}")
-
-                is_discounted  = bool(item.get("Discounted") or item.get("CurrentPricesAreDiscounted"))
-                discounted_val = _parse_lcw_price(item.get("DiscountedPriceValue"))
-                full_val       = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
-                old_val        = _parse_lcw_price(item.get("MinOldPrice"))
-                badge_val      = _lcw_badge_price(item)   # v14.50 — the real sale price
-
-                # v14.50 — PRICE RESOLUTION, campaign-badge first.
-                #
-                # Around 2026-07-21 LCW moved the live sale price into
-                # CampaignBadges[].DiscountedPrice and left the flat fields
-                # (DiscountedPriceValue, MinOldPrice, ConvertedPrice*) returning
-                # 0/None. Proven live 2026-07-26 (lcw_price_probe.py): o-5208891
-                # = PriceValue 349, badge DiscountedPrice 169, -52%, matching the
-                # website. Reading only the flat fields made every item resolve
-                # to its list price (== first_observed_price), which is why LCW
-                # showed frozen prices and zero price events for ~a week.
-                #
-                # Order: the badge price is the actual charge, so it wins. The
-                # legacy DiscountedPriceValue path is kept as a fallback in case
-                # LCW ever repopulates it. The numeric-min path (v14.44) stays as
-                # a last resort for any odd item that has an old-price field but
-                # no badge. Full list price only when nothing else is present.
-                candidates = [v for v in (full_val, old_val) if v and v > 0]
-                if badge_val and badge_val > 0:
-                    price = badge_val
-                elif discounted_val and discounted_val > 0:
-                    price = discounted_val
-                elif is_discounted and candidates:
-                    price = min(candidates)
-                else:
-                    price = full_val
-                if not price or price <= 0:
-                    continue
-
-                # compare_at = the credible "before" price. With a badge sale the
-                # list price (PriceValue/full_val) is the genuine anchor, so use
-                # it directly; otherwise fall back to the highest prior field.
-                # Accepted only when it genuinely exceeds what is being charged
-                # (1% floor keeps rounding noise out of the discount signals).
-                if badge_val and full_val > price * 1.01:
-                    compare_at = full_val
-                else:
-                    highest_prior = max(candidates) if candidates else 0
-                    compare_at    = highest_prior if highest_prior > price * 1.01 else None
-                if compare_at:
-                    _LCW_DISCOUNTED_SEEN[0] += 1
-                _LCW_ITEMS_SEEN[0] += 1
-
-                is_avail   = int(item.get("AvailableStock") or 0) > 0
-                sku        = f"lcw_{opt_id}"
-
-                color_img_url = item.get("ColorImageUrl") or ""
-                color_name = None
-                if color_img_url:
-                    m = re.search(r'/([^/]+)\.(png|jpg|jpeg|webp)$', color_img_url, re.IGNORECASE)
-                    if m:
-                        color_name = m.group(1).lower()
-                if not color_name:
-                    color_name = item.get("MainColorHexCode") or None
-                # Translate the Turkish swatch filename into the English colour name
-                # that every other brand uses, so cross-brand colour queries (e.g.
-                # "what % of men's black bottoms got discounted") work without
-                # per-brand special-casing downstream.
-                color_name = normalize_lcw_color(color_name)
-
-                prev       = prev_stock_state.get(sku)
-                v_baseline = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else price
-
-                batch_variants.append({
-                    "product_id": db_pid, "external_sku": sku, "color": color_name,
-                    # v14.18: "size" intentionally EXCLUDED from the upsert payload.
-                    # LCW's catalog API doesn't include per-variant sizes — those come
-                    # from product-page JSON (the backfill pass). Including size=None
-                    # here made the upsert overwrite sizes populated by previous runs,
-                    # forcing the backfill to redo work every run. Omitting the key
-                    # means ON CONFLICT SET skips the column, preserving existing data.
-                    #
-                    # is_in_stock HERE is the COLOR-WIDE aggregate (AvailableStock > 0
-                    # across every size of this color) — this field's ONLY writer for
-                    # this row going forward (v14.22 FIX 1). The size-backfill pass
-                    # below populates "size" on size-suffixed CHILD rows and no longer
-                    # touches is_in_stock on THIS parent row at all.
-                    "is_in_stock": is_avail, "first_observed_price": v_baseline,
-                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
-                    "_meta_price": price, "_meta_compare": compare_at,
-                    "_meta_baseline": v_baseline, "_meta_size": None,
-                    "_meta_color": color_name, "_meta_available": is_avail,
-                })
-
-            if batch_variants:
-                # v14.23: change-detection (see helper). LCW rows carry no
-                # "size" key so variant_needs_write skips the size comparison
-                # for them automatically.
-                rows_to_write, skipped_sku_to_id = apply_change_detection(
-                    batch_variants, prev_stock_state, brand_name)
-                db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")},
-                           "delisted_at": None} for r in rows_to_write]
-                variant_upsert_rows = []
-                for i in range(0, len(db_payload), 100):
-                    res_v = safe_db_execute(
-                        supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku")
-                    )
-                    if res_v and res_v.data: variant_upsert_rows.extend(res_v.data)
-                sku_to_id = {row["external_sku"]: row["id"] for row in variant_upsert_rows}
-                sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
-                for vr in batch_variants:
-                    vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
-                    product_variant_tracking[vr["product_id"]].append(vr)
-
-                # Per-variant (per-colour) stockout detection — correct at this grain,
-                # safe to run per page (each OptionId appears on exactly one page).
-                for db_pid, records in product_variant_tracking.items():
-                    for rec in records:
-                        prev_v = prev_stock_state.get(rec["external_sku"])
-                        if prev_v:
-                            detect_and_write_stockout(
-                                supabase, rec["variant_db_id"], db_pid, brand_name,
-                                rec["_meta_size"], None,
-                                prev_v["is_in_stock"], rec["_meta_available"],
-                                rec["_meta_price"], rec["_meta_baseline"]
-                            )
-                    # Accumulate this page's colours into the run-level model record
-                    # set; price detection happens once, after the full crawl.
-                    cat_model_records.setdefault(db_pid, []).extend(records)
-                    if db_pid not in cat_model_info:
-                        it = next((item for item in items
-                                   if str(item.get("ModelId")) == next((k for k, v in product_id_map.items() if v == db_pid), None)), None)
-                        if it:
-                            cat_model_info[db_pid] = {
-                                "desc":     it.get("ProductDescription") or it.get("BrandPropertyDescription") or "LCW Item",
-                                "category": lcw_normalize_category(it.get("BreadCrump") or {}),
-                                "url":      f"https://{domain}{it.get('ModelUrl') or ''}",
-                            }
-
-            cat_pages_done += 1
-            print(f"  [{cat_name}] Page {page_idx}/{page_count} — {len(batch_products)} products processed.")
-
-        # ── v14.41: commit or discard this category, whole ───────────────────
-        if cat_pages_failed == 0:
-            for db_pid, recs in cat_model_records.items():
-                lcw_model_records.setdefault(db_pid, []).extend(recs)
-            lcw_model_info.update(cat_model_info)
-            if LCW_CHECKPOINT:
-                mark_lcw_progress(supabase, today, cat_id, cat_name, "complete",
-                                  cat_pages_done, page_count, 0)
-            print(f"  ✅ [{cat_name}] Complete — {cat_pages_done}/{page_count} pages, "
-                  f"{len(cat_model_records)} models committed.")
-        else:
-            # Discarded on purpose. Committing a partial colour set would let
-            # price detection see half a model's colours and invent a price
-            # move that never happened (the v14.9 bug). Redone next run.
-            if LCW_CHECKPOINT:
-                mark_lcw_progress(supabase, today, cat_id, cat_name, "partial",
-                                  cat_pages_done, page_count, cat_pages_failed)
-            print(f"  ⚠️ [{cat_name}] Incomplete — {cat_pages_failed} page(s) failed. "
-                  f"Discarding {len(cat_model_records)} buffered models; "
-                  f"category will be retried in full on the next run.")
+        # v14.63: if every attempted category failed outright (none
+        # succeeded) while DataImpulse is this run's provider, that's
+        # the run-level version of the circuit breaker tripping — it
+        # just never gets there via the per-page counter when the
+        # catalog only has 2 categories total (see _lcw_maybe_escalate_
+        # to_decodo's per-page design: 2 category-level failures can
+        # never reach CIRCUIT_BREAKER_LIMIT=6). Escalate here instead
+        # and retry the WHOLE catalog once on Decodo before giving up.
+        if categories_crawled > 0 and categories_succeeded == 0:
+            if _lcw_maybe_escalate_to_decodo(
+                f"all {categories_crawled} attempted categories failed outright"):
+                consecutive_failures[0] = 0
+                total_failures[0] = 0
+                rotation_budget[0] = env_int("LCW_ROTATION_BUDGET", 8)
+                session, lcw_country = get_lcw_session()
+                categories_crawled = 0
+                continue
+        break
 
     # v14.41: all exit paths funnel through _lcw_finalise so completed
     # categories are always committed, even on an early abort.
