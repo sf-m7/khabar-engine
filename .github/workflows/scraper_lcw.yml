@@ -87,6 +87,18 @@ jobs:
           DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
           DATAIMPULSE_HOST:            ${{ vars.DATAIMPULSE_HOST }}
+          # v14.60: Decodo dedicated ISP — last-resort fallback for LCW,
+          # only used when scrape_lcw's own circuit breaker (per-page AND
+          # the whole-catalog v14.63 check) decides DataImpulse is dead this
+          # run. MUST be wired here as an env var, same as every other proxy
+          # secret in this repo (repo secrets are NOT auto-injected) — this
+          # was missing entirely before, which is why the 2026-09 escalation
+          # fired correctly but had no credentials to escalate to. Names
+          # MUST match scraper.py's os.environ.get() keys exactly:
+          # DECODO_PROXY_USER / DECODO_PROXY_PASS (not USERNAME/PASSWORD —
+          # that mismatch was the actual bug, fixed 2026-09).
+          DECODO_PROXY_USER:           ${{ secrets.DECODO_PROXY_USER }}
+          DECODO_PROXY_PASS:           ${{ secrets.DECODO_PROXY_PASS }}
           SCRAPE_TARGET:               lcw
           # Which of the two daily blocks this run belongs to. Consumed by the
           # checkpoint so the morning and evening runs do not read each
