@@ -89,6 +89,12 @@ jobs:
           echo ""
           echo "Same request through port 12345 (the 10000-20000 sticky range scraper.py actually uses for LCW):"
           curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:12345" https://api.ipify.org/ 2>&1 || echo "FAILED"
+          echo ""
+          echo "Same as above but with the __cr.tr country suffix scraper.py actually appends to the username:"
+          curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}__cr.tr:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:12345" https://api.ipify.org/ 2>&1 || echo "FAILED"
+          echo ""
+          echo "Plain proxy (no country suffix, port 823 — the combo already proven to work) but targeting lcwaikiki.eg itself instead of ipify:"
+          curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:823" https://www.lcwaikiki.eg/en/men-clothing-t-9 2>&1 | tail -40 || echo "FAILED"
 
       - name: Run LCW scraper
         run: python -u scraper.py
