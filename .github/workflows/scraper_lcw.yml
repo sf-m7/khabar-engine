@@ -86,6 +86,9 @@ jobs:
           echo ""
           echo "Same request through DataImpulse's gateway on port 823:"
           curl -v -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:823" https://api.ipify.org/ 2>&1 || echo "FAILED"
+          echo ""
+          echo "Same request through port 12345 (the 10000-20000 sticky range scraper.py actually uses for LCW):"
+          curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:12345" https://api.ipify.org/ 2>&1 || echo "FAILED"
 
       - name: Run LCW scraper
         run: python -u scraper.py
