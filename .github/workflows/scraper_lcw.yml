@@ -76,6 +76,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: DIAGNOSTIC — test DataImpulse gateway from GitHub Actions
+        env:
+          DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+        run: |
+          echo "Runner's own public IP (no proxy):"
+          curl -s https://api.ipify.org/ || echo "FAILED"
+          echo ""
+          echo "Same request through DataImpulse's gateway on port 823:"
+          curl -v -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:823" https://api.ipify.org/ 2>&1 || echo "FAILED"
+
       - name: Run LCW scraper
         run: python -u scraper.py
         env:
