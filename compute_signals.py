@@ -313,6 +313,20 @@ if __name__ == "__main__":
             print(f"      • {b} — holding back: {', '.join(waiting) or 'nothing yet'}")
         print()
 
+    # Open the results connection FIRST, before touching the lake.
+    #
+    # FIXED 2026-09-26 -- this used to come AFTER prefetch()/stockout_events()
+    # below, which is exactly why a bootstrap failure was invisible. Confirmed
+    # live three times in three weeks (2026-09-09, 2026-09-19, 2026-09-25): a
+    # transient "server closed the connection unexpectedly" mid-COPY inside
+    # materialise_products killed the process with an UNCAUGHT exception
+    # before a single signal ran and before this connection existed — so
+    # signal_runs got ZERO rows for the day, not a logged failure. Nothing
+    # downstream (health_check.py's freshness check tolerates 3 days of
+    # staleness by design) ever caught it. Opening pg here means the
+    # try/except below always has somewhere to write the bad news.
+    pg = psycopg2.connect(SUPABASE_DB_URL, sslrootcert=CA_BUNDLE)
+
     con = khabar_lake.connect()
 
     # ONE read of Supabase, here, before any signal runs.
@@ -326,24 +340,49 @@ if __name__ == "__main__":
     # khabar_lake now materialises the hot tier into local DuckDB memory. The
     # per-signal snapshots() calls still do exactly what they did — they just
     # re-point a view at local data instead of re-reading the database.
-    khabar_lake.prefetch(con)
-
-    # Inventory transitions, materialised once, witnessed-only by default.
     #
-    # Separate from prefetch() because it reads a different table entirely
-    # (stockout_events, not price_snapshots) and because the witnessed filter
-    # is applied HERE rather than in each signal's SQL. 57,171 of 85,205 raw
-    # events are collection artefacts -- orphan restocks, delist cycles,
-    # duplicate transitions -- and a signal that forgot the filter would look
-    # like it was working while overstating sellout volume by roughly 3x.
-    #
-    # Cheap and guarded: one read per process regardless of how many signals
-    # use it. Signals that never touch stock_events pay for it once and ignore
-    # it, which is a better trade than each of them re-querying Postgres.
-    n_events = khabar_lake.stockout_events(con)
-    print(f"  📦 Stock events materialised: {n_events:,} witnessed transitions.")
+    # Each of the underlying Postgres reads now retries 3x with backoff
+    # inside khabar_lake._exec_pg_read (added 2026-09-26) to absorb exactly
+    # the kind of transient drop that caused the three incidents above. This
+    # try/except is the second, last-resort layer: for when the database is
+    # genuinely down for longer than three retries can cover, the failure is
+    # now LOGGED to signal_runs (as "_engine_bootstrap") instead of vanishing,
+    # and the process exits non-zero so the GitHub Actions run shows red.
+    bootstrap_signal = {
+        "id": "_engine_bootstrap",
+        "name": "khabar_lake bootstrap (prefetch + stockout_events)",
+        "level": "infra",
+    }
+    bootstrap_started = time.time()
+    try:
+        khabar_lake.prefetch(con)
 
-    pg  = psycopg2.connect(SUPABASE_DB_URL, sslrootcert=CA_BUNDLE)
+        # Inventory transitions, materialised once, witnessed-only by default.
+        #
+        # Separate from prefetch() because it reads a different table entirely
+        # (stockout_events, not price_snapshots) and because the witnessed
+        # filter is applied HERE rather than in each signal's SQL. 57,171 of
+        # 85,205 raw events are collection artefacts -- orphan restocks,
+        # delist cycles, duplicate transitions -- and a signal that forgot
+        # the filter would look like it was working while overstating
+        # sellout volume by roughly 3x.
+        #
+        # Cheap and guarded: one read per process regardless of how many
+        # signals use it. Signals that never touch stock_events pay for it
+        # once and ignore it, which is a better trade than each of them
+        # re-querying Postgres.
+        n_events = khabar_lake.stockout_events(con)
+        print(f"  📦 Stock events materialised: {n_events:,} witnessed transitions.")
+    except Exception as e:
+        print(f"\n   🛑 ENGINE BOOTSTRAP FAILED: {e}")
+        print("      No signal was attempted this run.")
+        log_run(pg, bootstrap_signal, "failed",
+                error_message=str(e)[:2000],
+                duration_seconds=round(time.time() - bootstrap_started, 2))
+        pg.close()
+        print("      Logged to signal_runs as '_engine_bootstrap' — this is "
+              "now a visible red run, not a silent gap. Exiting non-zero.")
+        sys.exit(1)
 
     tally = {"ok": 0, "skipped": 0, "failed": 0}
     for signal in SIGNALS:

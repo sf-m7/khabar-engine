@@ -66,6 +66,7 @@ below is provided for that.
 
 import os
 import sys
+import time
 from datetime import date, timedelta
 
 import duckdb
@@ -193,6 +194,45 @@ _GLOB_CACHE       = None
 _EVENT_GLOB_CACHE = {}
 
 
+def _exec_pg_read(con, sql, what, retries=3, backoff=3):
+    """
+    Run one of the five direct `pg.public.*` reads with retry.
+
+    WHY THIS EXISTS
+    Each of these is a single, uninterruptible COPY-protocol pull over
+    DuckDB's postgres attach — no pooling, no statement-level retry, unlike
+    the rest of the codebase (scraper.py's execute_with_retry, safe_db_execute
+    for psycopg2). Confirmed live 2026-09-25: a transient "server closed the
+    connection unexpectedly" mid-COPY during materialise_products killed the
+    ENTIRE run before a single signal was attempted and before the psycopg2
+    connection used for log_run() even opened — so the failure produced ZERO
+    signal_runs rows, not a logged failure. Checked signal_runs history the
+    same day: this had already happened twice before (2026-09-09, 2026-09-19)
+    with nobody the wiser, because health_check.py's freshness check tolerates
+    up to 3 days of staleness by design and a single missing day is invisible
+    to it.
+
+    This does NOT make a truly down database succeed — three retries with a
+    growing pause absorb a blip, not an outage. See run_with_backfill() in
+    compute_signals.py for the second layer: detecting and recomputing a day
+    that still ends up missing.
+    """
+    delay = backoff
+    for attempt in range(1, retries + 1):
+        try:
+            return con.execute(sql)
+        except duckdb.IOException as e:
+            if attempt == retries:
+                print(f"     ❌ {what}: Postgres read failed after "
+                      f"{retries} attempts: {e}")
+                raise
+            print(f"     ⚠️  {what}: Postgres read failed (attempt "
+                  f"{attempt}/{retries}): {e}")
+            print(f"        retrying in {delay}s...")
+            time.sleep(delay)
+            delay *= 2
+
+
 def _lake_files(con):
     """
     Every day-file in the lake, listed ONCE per process.
@@ -227,7 +267,7 @@ def materialise_variants(con, force=False):
         return con.execute("SELECT count(*) FROM variants_raw").fetchone()[0]
 
     con.execute("DROP TABLE IF EXISTS variants_raw")
-    con.execute("""
+    _exec_pg_read(con, """
         CREATE TABLE variants_raw AS
         SELECT
             id                                      AS variant_id,
@@ -242,7 +282,7 @@ def materialise_variants(con, force=False):
             is_in_stock                             AS is_in_stock,
             delisted_at                             AS delisted_at
         FROM pg.public.product_variants
-    """)
+    """, "materialise_variants")
     _VARIANTS_READY = True
     return con.execute("SELECT count(*) FROM variants_raw").fetchone()[0]
 
@@ -272,7 +312,7 @@ def materialise_hot(con, force=False):
     materialise_variants(con)
 
     con.execute("DROP TABLE IF EXISTS hot_raw")
-    con.execute(f"""
+    _exec_pg_read(con, f"""
         CREATE TABLE hot_raw AS
         SELECT
             ps.id                     AS snapshot_id,
@@ -295,7 +335,7 @@ def materialise_hot(con, force=False):
         LEFT JOIN products_dim p  ON p.product_id  = ps.product_id
         LEFT JOIN variants_raw pv ON pv.variant_id = ps.variant_id
         WHERE """ + _snapshot_quarantine_sql("ps.snapshot_date", "ps.brand") + """
-    """)
+    """, "materialise_hot")
     _HOT_READY = True
     return con.execute("SELECT count(*) FROM hot_raw").fetchone()[0]
 
@@ -634,7 +674,7 @@ def materialise_products(con, force=False):
         return con.execute("SELECT count(*) FROM products_dim").fetchone()[0]
 
     con.execute("DROP TABLE IF EXISTS products_dim")
-    con.execute("""
+    _exec_pg_read(con, """
         CREATE TABLE products_dim AS
         SELECT
             id                                  AS product_id,
@@ -652,7 +692,7 @@ def materialise_products(con, force=False):
             is_active                            AS is_active,
             CAST(delisted_at AS VARCHAR)         AS delisted_at
         FROM pg.public.products
-    """)
+    """, "materialise_products")
     _PRODUCTS_READY = True
     return con.execute("SELECT count(*) FROM products_dim").fetchone()[0]
 
@@ -733,11 +773,11 @@ def materialise_events(con, force=False):
     so_files = _event_files(con, "stockout_events", _ev_start, _ev_end)
     con.execute("DROP TABLE IF EXISTS stockouts_raw")
     if not so_files:
-        con.execute(f"""
+        _exec_pg_read(con, f"""
             CREATE TABLE stockouts_raw AS
             SELECT * FROM ({so_hot})
             WHERE witnessed = TRUE OR witnessed IS NULL
-        """)
+        """, "materialise_events (stockout_events, hot-only)")
     else:
         _so_list = ", ".join(f"'{f}'" for f in so_files)
         _cols = _parquet_columns(con, _so_list)
@@ -767,7 +807,7 @@ def materialise_events(con, force=False):
                 {_seed}                               AS seed_reason
             FROM read_parquet([{_so_list}], union_by_name=true)
         """
-        con.execute(f"""
+        _exec_pg_read(con, f"""
             CREATE TABLE stockouts_raw AS
             WITH hot AS ({so_hot}),
                  cold AS ({so_cold}),
@@ -788,7 +828,7 @@ def materialise_events(con, force=False):
             FROM deduped
             WHERE rn = 1
               AND (witnessed = TRUE OR witnessed IS NULL)
-        """)
+        """, "materialise_events (stockout_events, hot+cold)")
 
     # ---- price_events -------------------------------------------------------
     pe_hot = f"""
@@ -808,11 +848,11 @@ def materialise_events(con, force=False):
     pe_files = _event_files(con, "price_events", _ev_start, _ev_end)
     con.execute("DROP TABLE IF EXISTS price_events_raw")
     if not pe_files:
-        con.execute(f"""
+        _exec_pg_read(con, f"""
             CREATE TABLE price_events_raw AS
             SELECT * FROM ({pe_hot})
             WHERE {_event_quarantine_sql()}
-        """)
+        """, "materialise_events (price_events, hot-only)")
     else:
         _pe_list = ", ".join(f"'{f}'" for f in pe_files)
         _cols = _parquet_columns(con, _pe_list)
@@ -836,7 +876,7 @@ def materialise_events(con, force=False):
                 {_flash}                         AS is_flash_sale
             FROM read_parquet([{_pe_list}], union_by_name=true)
         """
-        con.execute(f"""
+        _exec_pg_read(con, f"""
             CREATE TABLE price_events_raw AS
             WITH hot AS ({pe_hot}),
                  cold AS ({pe_cold}),
@@ -857,7 +897,7 @@ def materialise_events(con, force=False):
             FROM deduped
             WHERE rn = 1
               AND {_event_quarantine_sql()}
-        """)
+        """, "materialise_events (price_events, hot+cold)")
     _EVENTS_READY = True
     n1 = con.execute("SELECT count(*) FROM stockouts_raw").fetchone()[0]
     n2 = con.execute("SELECT count(*) FROM price_events_raw").fetchone()[0]

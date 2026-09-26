@@ -79,17 +79,47 @@ def log_run(pg, product, status, **kw):
 
 
 def missing_requirements(pg, product):
-    """Which required L1 tables have zero rows right now."""
+    """
+    Which required L1 signals have NOT successfully completed TODAY.
+
+    FIXED 2026-09-26 -- this used to check `SELECT count(*) FROM {table}`,
+    i.e. "has this L1 output table EVER had any rows", not whether it has
+    TODAY's. Confirmed live: on all three days the signal engine's DuckDB
+    lake bootstrap crashed outright before any L1 signal ran (2026-09-09,
+    2026-09-19, 2026-09-25), every required L1 table still held YESTERDAY's
+    rows from the last successful run, so this check passed anyway --
+    compute_products.py went ahead and computed a full day of "current"
+    intelligence products (l2_01, l2_02, l2_08, l2_09, l2_10, l2_12, l2_13 --
+    confirmed non-zero rows written every one of those three times) built
+    entirely from stale, day-old L1 numbers, stamped with report_date =
+    today. Nothing anywhere flagged it as stale.
+
+    This checks signal_runs -- the run LOG -- instead of the L1 output table
+    itself, on purpose. A signal that ran fine today but genuinely found zero
+    qualifying rows (a real, valid "nothing to report") also leaves the
+    output table's own latest snapshot_date at yesterday's: replace_rows()
+    in compute_signals.py has no day to DELETE/INSERT against when its query
+    returns zero rows. signal_runs still gets an "ok" row for today in that
+    case (log_run() fires regardless of row count), so checking the log
+    correctly tells "L1 ran today and found nothing" apart from "L1 never
+    ran today at all" -- something the table-row-count check could not
+    distinguish, and got wrong in exactly the cases that mattered.
+    """
     missing = []
     with pg.cursor() as cur:
         for l1_id in product.get("requires", []):
-            table = L1_TABLES.get(l1_id)
-            if table is None:
+            if l1_id not in L1_TABLES:
                 missing.append(f"{l1_id} (unknown table mapping)")
                 continue
-            cur.execute(f"SELECT count(*) FROM {table}")
+            cur.execute("""
+                SELECT count(*) FROM signal_runs
+                WHERE signal_id = %s
+                  AND status = 'ok'
+                  AND run_at::date = CURRENT_DATE
+            """, (l1_id,))
             if cur.fetchone()[0] == 0:
-                missing.append(f"{l1_id} ({table} has 0 rows)")
+                missing.append(f"{l1_id} (no successful signal_runs row for "
+                                f"today — L1 either failed or hasn't run yet)")
     return missing
 
 
