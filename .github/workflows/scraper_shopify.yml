@@ -12,6 +12,15 @@ on:
     - cron: "13 12 * * *"  # ~15:13 Cairo
     - cron: "41 19 * * *"  # ~22:41 Cairo
   workflow_dispatch:
+    inputs:
+      scrape_target:
+        description: >-
+          SCRAPE_TARGET override. Leave as "shopify" for the normal full
+          group run. Set to one brand name (e.g. "cizaro", "defacto") to
+          isolate just that brand for diagnosis — scraper.py already
+          supports this per-brand mode, this input just exposes it here.
+        type: string
+        default: "shopify"
 
 # v14.52: share the LCW scraper's concurrency group. Root cause of "scheduled
 # runs fail, manual runs work": the 04:00 UTC Shopify run overran (up to 3h on
@@ -66,7 +75,7 @@ jobs:
           SUPABASE_DB_URL:            ${{ secrets.SUPABASE_DB_URL }}
           KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          SCRAPE_TARGET:              shopify
+          SCRAPE_TARGET:              ${{ inputs.scrape_target || 'shopify' }}
           DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
           # v14.55: Decodo dedicated ISP (3 static IPs) now carries Shopify +
@@ -74,8 +83,24 @@ jobs:
           # vars above are left wired but are now dead in this job (this
           # workflow never runs the lcw_proxy engine) — kept only so a
           # rollback needs no secrets re-wiring.
-          DECODO_PROXY_USERNAME:      ${{ secrets.DECODO_PROXY_USER }}
-          DECODO_PROXY_PASSWORD:      ${{ secrets.DECODO_PROXY_PASS }}
+          #
+          # FIXED 2026-09-26 -- these two were DECODO_PROXY_USERNAME /
+          # DECODO_PROXY_PASSWORD, but scraper.py has read DECODO_PROXY_USER /
+          # DECODO_PROXY_PASS since the 2026-09-22 02:32 rename commit
+          # (ed2c804). scraper_lcw.yml was updated to match at the time (its
+          # own comment even documents "that mismatch was the actual bug,
+          # fixed 2026-09") -- this file was missed. Net effect since 09-22:
+          # DECODO_CONFIGURED was silently False in every Shopify/WooCommerce
+          # run. Any brand escalating to the top proxy tier ("decodo", after
+          # direct and dataimpulse both fail) got no credentials and fell
+          # back to a direct connection instead -- with only a print warning,
+          # no failure. cizaro is on DATAIMPULSE_PROXY_BRANDS and its volume
+          # step-changed down exactly on 2026-09-22 (confirmed in
+          # price_snapshots: ~70/day -> ~30/day for its men's category,
+          # same-day cutover) -- consistent with this being the top-tier
+          # fallback it needed and silently didn't get.
+          DECODO_PROXY_USER:          ${{ secrets.DECODO_PROXY_USER }}
+          DECODO_PROXY_PASS:          ${{ secrets.DECODO_PROXY_PASS }}
           # v14.50: these MUST be wired here or the scheduled run ignores
           # whatever you set in the GitHub UI (repo vars/secrets are NOT auto
           # env vars). All blank-safe — an unset var behaves as the code
