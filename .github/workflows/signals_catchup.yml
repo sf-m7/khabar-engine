@@ -1,0 +1,100 @@
+name: Khabar Signal Engine — Catch-up
+
+# SAFETY NET for compute_signals.py's main 05:00 UTC run (signals.yml).
+#
+# WHY THIS EXISTS
+# Confirmed live on 2026-09-09, 2026-09-19, and 2026-09-25: the main run died
+# with ZERO rows written to signal_runs for the day — a transient Postgres
+# ("server closed the connection unexpectedly") during the DuckDB lake
+# bootstrap, before a single signal was attempted and before signal_runs even
+# had a connection to write to. Three times in three weeks, none of them
+# caught, because health_check.py's freshness check tolerates up to 3 days
+# of staleness by design and a single missing day is invisible to it.
+#
+# Two fixes already went into khabar_lake.py / compute_signals.py the same
+# day this was diagnosed (2026-09-26):
+#   1. Each of the 5 direct Postgres reads in khabar_lake.py's prefetch now
+#      retries 3x with backoff (khabar_lake._exec_pg_read) — absorbs an
+#      ordinary transient blip on its own.
+#   2. If the bootstrap fails anyway, it's now LOGGED to signal_runs as
+#      "_engine_bootstrap" with status=failed instead of vanishing, and the
+#      job exits non-zero — visible, not silent.
+#
+# Neither of those makes the day actually get computed if the database was
+# down for longer than the in-process retries can cover. This workflow is
+# that: it runs 3 hours after the main schedule (comfortably past its
+# 45-minute timeout even on a slow day) and does nothing at all unless today
+# has zero rows in signal_runs. On an ordinary day this costs one cheap
+# COUNT(*) and exits. On a day the main run failed outright, this is the
+# second attempt that makes signals.yml's own comment — "a missed run is not
+# a lost signal" — actually true, instead of aspirational.
+#
+# If THIS run also fails, the day is a genuine, both-attempts-exhausted miss
+# — at that point it needs a human, which is what the now-visible "failed"
+# row in signal_runs (from either attempt) is for.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  check_and_catchup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check whether today's signal run already happened
+        id: check
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL:   ${{ secrets.PLANETSCALE_DB_URL }}
+        run: |
+          python -c "
+          import os
+          import psycopg2
+          from khabar_db import CA_BUNDLE
+
+          url = os.environ.get('KHABAR_DB_URL', '').strip() or os.environ['SUPABASE_DB_URL']
+          con = psycopg2.connect(url, sslrootcert=CA_BUNDLE)
+          cur = con.cursor()
+          cur.execute(\"SELECT count(*) FROM signal_runs WHERE run_at::date = CURRENT_DATE\")
+          n = cur.fetchone()[0]
+          con.close()
+
+          print(f'signal_runs rows for today so far: {n}')
+          needed = 'true' if n == 0 else 'false'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'needed={needed}\n')
+          "
+
+      - name: Run signal engine (catch-up — main run produced nothing today)
+        if: steps.check.outputs.needed == 'true'
+        env:
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+          SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+          KHABAR_DB_URL:        ${{ secrets.PLANETSCALE_DB_URL }}
+          SIGNALS_DRY_RUN:      "false"
+        run: |
+          echo "⚠️  05:00 UTC main run left zero signal_runs rows for today — retrying now."
+          python -u compute_signals.py
+
+      - name: Main run already succeeded — nothing to do
+        if: steps.check.outputs.needed == 'false'
+        run: echo "✅ Today already has signal_runs rows. Catch-up not needed."

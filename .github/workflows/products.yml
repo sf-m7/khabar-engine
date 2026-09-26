@@ -1,25 +1,43 @@
 name: Khabar L2 Products
 
-# Manual-trigger only for now, same posture as the L1 signal engine had on
-# day one — run it by hand until a few real cycles are trusted, then add a
-# schedule. When that happens, this MUST run after Signal Engine finishes,
-# not in parallel or before: L2 reads the signal_l1_* tables L1 just wrote.
-# If you give this a cron schedule, put it comfortably after Signal Engine's
-# own schedule, not at the same time — check that workflow's cron before
-# picking one here.
-# Runs daily at 09:03 UTC (11:03 AM Egypt) — 30 minutes after Signal Engine's
-# 08:33 UTC start, which takes ~3 min, so L1 has always finished writing before
-# L2 reads it. If you ever change Signal Engine's time, move this in the same
-# commit to stay 30 min behind it — L2 computing on a half-written L1 run would
-# produce quietly wrong numbers.
+# Triggered by Signal Engine finishing, not by a guessed clock offset.
+#
+# FIXED 2026-09-26 -- this used to run on a fixed cron ("3 9 * * *", 30
+# minutes after what the comment claimed was Signal Engine's 08:33 UTC
+# start). Two problems, found together:
+#   1. That comment was already stale — Signal Engine's actual schedule is
+#      "0 5 * * *" (05:00 UTC), not 08:33. The 30-minute buffer was really a
+#      ~4-hour buffer that happened to be wide enough to hide the drift.
+#   2. Even a correct offset is a guess, not a guarantee. On any day Signal
+#      Engine ran late, failed, or (confirmed live, three times in three
+#      weeks: 2026-09-09, 2026-09-19, 2026-09-25) crashed before writing
+#      anything at all, this workflow fired anyway on its own clock and
+#      computed "today's" intelligence products from whatever L1 data
+#      happened to be sitting in the table — silently stale, not missing.
+#
+# `workflow_run` replaces the guess with an actual dependency: this only
+# starts once Signal Engine (either the main run or the catch-up run — see
+# signals_catchup.yml) has finished, success or not. It's still safe to run
+# after a failed/partial Signal Engine run: compute_products.py's own
+# missing_requirements() check (fixed the same day, see compute_products.py)
+# now verifies a real signal_runs "ok" row for TODAY per required L1 signal,
+# not just "the table has some rows" — so a product whose L1 inputs didn't
+# actually complete today is skipped and logged, not silently computed on
+# stale numbers. Firing after a failure vs. skipping the trigger entirely
+# both work; firing is simpler and lets the freshness gate do its job either
+# way.
 #
 # Egress note: unlike Signal Engine, L2 never touches the lake or the large
 # tables. It reads only the small signal_l1_* result tables (kilobytes each)
-# directly over Postgres, so this schedule adds negligible egress — nothing to
-# optimise here.
+# directly over Postgres, so re-checking after both a main and a catch-up run
+# on a bad day adds negligible egress — nothing to optimise here.
 on:
-  schedule:
-    - cron: "3 9 * * *"
+  workflow_run:
+    workflows:
+      - "Khabar Signal Engine"
+      - "Khabar Signal Engine — Catch-up"
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       dry_run:
@@ -47,10 +65,11 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
-          # Scheduled (cron) runs are ALWAYS production: github.event_name is
-          # 'schedule', so this evaluates to 'false' and writes for real. Only
-          # a manual workflow_dispatch can request a dry run, via its checkbox.
-          # Same guard as Signal Engine — without it, inputs.dry_run is empty on
-          # a schedule trigger and the daily run could silently write nothing.
+          # workflow_run triggers are ALWAYS production: github.event_name is
+          # 'workflow_run', so this evaluates to 'false' and writes for real.
+          # Only a manual workflow_dispatch can request a dry run, via its
+          # checkbox. Same guard as Signal Engine — without it, inputs.dry_run
+          # is empty on a non-dispatch trigger and the daily run could
+          # silently write nothing.
           PRODUCTS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         run: python -u compute_products.py
