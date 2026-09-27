@@ -850,10 +850,32 @@ ORDER BY a.last_depth_pct DESC
             ),
             anomaly_days AS (
                 -- Brand-days to suppress entirely. See header comment.
+                --
+                -- EXCEPTION LIST (added 2026-09-26): manually-confirmed
+                -- GENUINE mass-delist events that must NOT be suppressed
+                -- even though they cross the 20% line below. An entry only
+                -- goes here after independently confirming the drop is real
+                -- (e.g. a clean manual re-scrape showing a natural
+                -- end-of-catalogue stop, not a truncation or block) --
+                -- deliberately kept a manually-reviewed list rather than a
+                -- smarter automatic classifier, same reasoning as the
+                -- Tree/Dalydress discussion above: percentage alone can't
+                -- tell "real business event" from "collection bug".
+                --
+                --   * defacto / 2026-09-23: women's catalogue dropped
+                --     ~2,717 SKUs (23.3% of DeFacto's all-time catalogue,
+                --     just over the 20% line). Confirmed genuine via a
+                --     clean manual re-run (SCRAPE_TARGET=defacto,
+                --     2026-09-26): both Men's and Women's crawls completed
+                --     with a natural "No NextDataUrl -- end of catalog"
+                --     stop on the final page of each, no blocked-page
+                --     warning anywhere, no truncation. DeFacto's own API
+                --     said there was nothing more to return.
                 SELECT d.brand, d.delist_day
                 FROM delist_by_day d
                 JOIN brand_catalogue c ON c.brand = d.brand
                 WHERE 100.0 * d.n_delisted / c.catalogue_size > 20
+                  AND NOT (d.brand = 'defacto' AND d.delist_day = DATE '2026-09-23')
             ),
             last_price AS (
                 SELECT product_id, price, honest_discount_pct,

@@ -280,8 +280,32 @@ def check_integrity(cur):
          "SELECT count(*) FROM product_variants "
          "WHERE first_observed_price IS NULL AND delisted_at IS NULL"),
         ("delisted_but_in_stock",
+         # FIXED 2026-09-26 -- this used to be
+         # "WHERE delisted_at IS NOT NULL AND is_in_stock = true", which
+         # fires on 18,700+ rows permanently and always will: v14.40's fix
+         # (see housekeeping.py's delist_stale_products docstring) made
+         # is_in_stock a FROZEN last-observed value at delist time, on
+         # purpose -- most products get pulled from a catalogue WHILE still
+         # in stock, not after selling out first, so a large count here is
+         # the NORMAL shape of the data, not corruption. Checked live
+         # (2026-09-26): 100% of the 18,732 matching rows have
+         # last_updated_at BEFORE delisted_at and zero were touched in the
+         # last 2 days -- none of them are being actively rewritten, which
+         # is what the original bug (documented July 2026, ~1,010 rows,
+         # "2,919 scraped within the last 2 days despite the flag") actually
+         # looked like. That write-path bug is gone; this query just never
+         # stopped testing for its old symptom.
+         #
+         # The real invariant scraper.py's variant_needs_write() guarantees
+         # is narrower: ANY write to a variant after it was delisted MUST
+         # clear delisted_at back to NULL in that same write (see its
+         # "coming back from delisted -> must clear flag" rule). So the
+         # actual bug pattern is last_updated_at LANDING AFTER delisted_at
+         # while delisted_at is still set -- that combination should be
+         # impossible, and finding it means the clear-on-write is failing
+         # right now, not just that history is long.
          "SELECT count(*) FROM product_variants "
-         "WHERE delisted_at IS NOT NULL AND is_in_stock = true"),
+         "WHERE delisted_at IS NOT NULL AND last_updated_at > delisted_at"),
     ]
     for name, sql in checks:
         n = q(cur, sql)[0]["count"]
