@@ -943,6 +943,8 @@ BRANDS = [
     {"name": "carina",     "domain": "carina.eg",                "engine": "shopify"},
     {"name": "andora",     "domain": "www.andoraeg.com",         "engine": "shopify"},
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
+    {"name": "zodiac",     "domain": "zodiac-eg.co",             "engine": "shopify"},
+    {"name": "or_egypt",   "domain": "or-egypt.com",             "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
 #    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
@@ -975,7 +977,9 @@ BRAND_DISPLAY = {
     "arafa":      "Arafa Stores",
     "eagle":      "Eagle",
     "tie_house":  "Tie House",
-    "premoda":    "Premoda",  
+    "premoda":    "Premoda", 
+    "zodiac":     "Zodiac",
+    "or-egypt":   "Or Egypt",
 }
 
 # v14.22 FIX 2: brands whose ENTIRE catalog is a single gender regardless of
