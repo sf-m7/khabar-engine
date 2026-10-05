@@ -15,3 +15,6 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install curl_cffi
       - run: python -u woo_probe.py ${{ inputs.domains }}
+        env:
+          DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
