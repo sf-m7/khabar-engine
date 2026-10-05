@@ -919,7 +919,7 @@ def env_int(name, default):
 # Edit this set directly as brands recover or new ones get blocked.
 DATAIMPULSE_PROXY_BRANDS = {
     "dalydress", "eagle", "just_sbr", "mlameh", "khotwh", "tomato",
-    "ravin", "tree", "mobaco", "rojada", "arafa", "tie_house", "premoda", "activ", "esla", "town_team", "mens_club", "dott_jeans", "carina", "andora", "cizaro"
+    "ravin", "tree", "mobaco", "rojada", "arafa", "tie_house", "premoda", "activ", "esla", "town_team", "mens_club", "dott_jeans", "carina", "andora", "cizaro", "coup"
 }
 
 BRANDS = [
@@ -945,7 +945,7 @@ BRANDS = [
     {"name": "cizaro",     "domain": "cizaro.net",               "engine": "shopify"},
     {"name": "zodiac",     "domain": "zodiac-eg.co",             "engine": "shopify"},
     {"name": "or_egypt",   "domain": "or-egypt.com",             "engine": "shopify"},
-    {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
+    {"name": "mobaco",     "domain": "mobaco.com",               "engine": "magento_gql"},
     {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
     {"name": "coup",       "domain": "coupeg.com",               "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
@@ -5074,8 +5074,8 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 if not pid or str(pid) in seen_ext_ids:
                     continue
                 seen_ext_ids.add(str(pid))
-                name = p.get("name") or f"{brand_name}-{pid}"
-                cats = [c.get("name", "") for c in (p.get("categories") or [])]
+                name = _html_unescape(p.get("name") or f"{brand_name}-{pid}")
+                cats = [_html_unescape(c.get("name", "")) for c in (p.get("categories") or [])]
                 category_raw  = cats[0] if cats else ""
                 category_norm = normalize_category(f"{' '.join(cats)} {name}")
                 gender        = normalize_gender(cats, "", name)
@@ -5345,6 +5345,280 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
 
     if _woo_skipped:
         print(f"  ⚠️ [WooCommerce] {_woo_skipped} variable product(s) skipped (no live variation data).")
+    return products_seen, price_changes
+
+
+# ── v14.64 Magento GraphQL engine (Mobaco) ───────────────────────────────────
+# WHY: Mobaco left WooCommerce for a headless Nuxt storefront on a Magento
+# backend. /wp-json/... now returns the storefront's HTML page (HTTP 200, not
+# JSON), which is why the Woo scraper has been frozen for weeks. Verified live:
+# https://mobaco.hypernode.io/graphql answers anonymous product queries from a
+# datacenter IP with no proxy (311 products, EGP).
+# One paginated query returns product + every variant's price and stock, so no
+# per-product calls are needed at all.
+import html as _html
+def _html_unescape(t):
+    try:
+        return _html.unescape(t or "")
+    except Exception:
+        return t or ""
+
+MAGENTO_GQL_ENDPOINTS = {
+    "mobaco": ["https://mobaco.hypernode.io/graphql", "https://mobaco.com/graphql"],
+}
+MAGENTO_PAGE_SIZE = 40
+_MAGE_PRICE = "price_range{minimum_price{final_price{value currency} regular_price{value}}}"
+MAGENTO_QUERY = (
+    "query($page:Int!,$size:Int!){products(search:\"\",pageSize:$size,currentPage:$page){"
+    "total_count page_info{total_pages current_page}"
+    "items{__typename sku name url_key canonical_url stock_status "
+    "small_image{url} categories{name} " + _MAGE_PRICE + " "
+    "... on ConfigurableProduct{variants{attributes{code label} "
+    "product{sku stock_status " + _MAGE_PRICE + "}}}}}}"
+)
+
+def _mage_price(pr):
+    """price_range -> (final, regular, currency) or (0,0,None)."""
+    try:
+        mp = (pr or {}).get("minimum_price") or {}
+        fin = mp.get("final_price") or {}
+        reg = mp.get("regular_price") or {}
+        return float(fin.get("value") or 0), float(reg.get("value") or 0), fin.get("currency")
+    except Exception:
+        return 0.0, 0.0, None
+
+def _mage_parse_item(item, brand_name, domain):
+    """
+    One GraphQL item -> (product_row_fields, variants) or None.
+    variants: list of dict(sku, size, color, price, compare_at, in_stock).
+    Configurable products with no usable variants are skipped (never fabricate
+    stock from the parent).
+    """
+    sku = item.get("sku")
+    if not sku:
+        return None
+    name = _html_unescape(item.get("name") or f"{brand_name}-{sku}")
+    cats = [_html_unescape(c.get("name", "")) for c in (item.get("categories") or []) if c]
+    url = item.get("canonical_url") or ""
+    if not url.startswith("http") or "hypernode.io" in url:
+        key = item.get("url_key") or ""
+        url = f"https://{domain}/en/{key}" if key else f"https://{domain}/"
+    img = ((item.get("small_image") or {}).get("url")) or None
+    variants = []
+    if item.get("__typename") == "ConfigurableProduct":
+        for v in (item.get("variants") or []):
+            vp = v.get("product") or {}
+            vsku = vp.get("sku")
+            fin, reg, cur = _mage_price(vp.get("price_range"))
+            if not vsku or fin <= 0 or (cur and cur.upper() != "EGP"):
+                continue
+            size = color = None
+            for a in (v.get("attributes") or []):
+                code = (a.get("code") or "").lower()
+                label = (a.get("label") or "").strip() or None
+                if "color" in code or "colour" in code:
+                    color = label
+                elif "size" in code:
+                    size = label
+                elif size is None and color is None:
+                    size = label
+            variants.append({"sku": vsku, "size": size, "color": color, "price": fin,
+                             "compare_at": reg if reg > fin else None,
+                             "in_stock": (vp.get("stock_status") == "IN_STOCK")})
+    else:
+        fin, reg, cur = _mage_price(item.get("price_range"))
+        if fin > 0 and not (cur and cur.upper() != "EGP"):
+            variants.append({"sku": sku, "size": None, "color": None, "price": fin,
+                             "compare_at": reg if reg > fin else None,
+                             "in_stock": (item.get("stock_status") == "IN_STOCK")})
+    if not variants:
+        return None
+    return {"sku": sku, "name": name, "cats": cats, "url": url, "image": img}, variants
+
+def _mage_fetch_page(sessions, endpoints, page):
+    """POST one page. Tries each endpoint/session combo; returns parsed 'products' dict or None."""
+    body = {"query": MAGENTO_QUERY, "variables": {"page": page, "size": MAGENTO_PAGE_SIZE}}
+    hdrs = {"content-type": "application/json", "accept": "application/json",
+            "accept-language": "en-US,en;q=0.9"}
+    for ep in endpoints:
+        for sess in sessions:
+            try:
+                _woo_pace()
+                r = execute_with_retry(sess.post, ep, max_retries=3, backoff=3,
+                                       timeout=PROXY_HTTP_TIMEOUT, json=body, headers=hdrs)
+                if r.status_code != 200:
+                    print(f"  ⚠️ [Magento] {ep} HTTP {r.status_code}: {r.text[:120]!r}")
+                    continue
+                j = r.json()
+                if j.get("errors") and not (j.get("data") or {}).get("products"):
+                    print(f"  ⚠️ [Magento] {ep} GraphQL errors: {str(j['errors'])[:300]}")
+                    continue
+                prods = (j.get("data") or {}).get("products")
+                if prods is not None:
+                    return prods
+            except Exception as e:
+                print(f"  ⚠️ [Magento] {ep} request failed: {str(e)[:120]}")
+    return None
+
+def scrape_magento(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
+    print("  [Magento] Starting GraphQL scrape...")
+    products_seen, price_changes = 0, 0
+    endpoints = MAGENTO_GQL_ENDPOINTS.get(brand_name) or [f"https://{domain}/graphql"]
+    sessions = [requests.Session(impersonate="chrome124"), session]   # direct first, tier session as fallback
+    _deadline = time.time() + WOO_TIME_BUDGET
+    prev_prices = load_last_prices(supabase, brand_name)
+    existing_snapshot_ids, _off = set(), 0
+    while True:
+        _snap = safe_db_execute(
+            supabase.table("price_snapshots").select("product_id")
+            .eq("brand", brand_name).eq("snapshot_date", str(today)).range(_off, _off + 999))
+        _rows = (_snap.data or []) if _snap else []
+        existing_snapshot_ids.update(r["product_id"] for r in _rows if r.get("product_id"))
+        if len(_rows) < 1000:
+            break
+        _off += 1000
+
+    page, total_pages = 1, 1
+    while page <= total_pages:
+        if time.time() > _deadline:
+            print(f"  ⚠️ [Magento] time budget reached at page {page}; stopping cleanly.")
+            break
+        data = _mage_fetch_page(sessions, endpoints, page)
+        if data is None:
+            print(f"  ⚠️ [Magento] page {page} failed on every endpoint; stopping.")
+            break
+        total_pages = int(((data.get("page_info") or {}).get("total_pages")) or 1)
+        items = data.get("items") or []
+        if not items:
+            break
+
+        parsed, batch_products, seen_ids = {}, [], set()
+        for it in items:
+            try:
+                res = _mage_parse_item(it, brand_name, domain)
+                if not res or res[0]["sku"] in seen_ids:
+                    continue
+                pf, vs = res
+                seen_ids.add(pf["sku"])
+                parsed[pf["sku"]] = (pf, vs)
+                cats = pf["cats"]
+                category_raw = cats[-1] if cats else ""
+                category_norm = normalize_category(f"{' '.join(cats)} {pf['name']}")
+                batch_products.append({
+                    "brand": brand_name, "external_id": pf["sku"], "name": pf["name"],
+                    "category_raw": category_raw, "category_normalized": category_norm,
+                    "gender": normalize_gender(cats, "", pf["name"]),
+                    "sizes_available": [], "url": pf["url"], "image_url": pf["image"],
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                    "is_active": True, "delisted_at": None,
+                    "attributes_extracted": build_attributes_extracted(
+                        brand_name, category_norm, category_raw, pf["name"]),
+                })
+            except Exception as e:
+                print(f"  ⚠️ [Magento] Skipping item {it.get('sku')}: {e}")
+                continue
+        if not batch_products:
+            page += 1
+            continue
+
+        product_upsert_rows = []
+        for i in range(0, len(batch_products), 100):
+            res_p = safe_db_execute(
+                supabase.table("products").upsert(batch_products[i:i+100], on_conflict="brand,external_id"))
+            if res_p and res_p.data:
+                product_upsert_rows.extend(res_p.data)
+        product_id_map = {r["external_id"]: r["id"] for r in product_upsert_rows}
+        products_seen += len(batch_products)
+
+        batch_variants, product_variant_tracking = [], {}
+        for sku, (pf, vs) in parsed.items():
+            db_pid = product_id_map.get(sku)
+            if not db_pid:
+                continue
+            product_variant_tracking.setdefault(db_pid, [])
+            if db_pid not in fop_done_ids:
+                safe_db_execute(
+                    supabase.table("products").update({"first_observed_price": min(v["price"] for v in vs)})
+                    .eq("id", db_pid).is_("first_observed_price", "null"))
+                fop_done_ids.add(db_pid)
+            for v in vs:
+                esku = f"{brand_name}_{v['sku']}"
+                prev = prev_stock_state.get(esku)
+                base = float(prev["first_observed_price"]) if (prev and prev.get("first_observed_price")) else v["price"]
+                batch_variants.append({
+                    "product_id": db_pid, "external_sku": esku, "color": v["color"], "size": v["size"],
+                    "is_in_stock": v["in_stock"], "first_observed_price": base,
+                    "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                    "_meta_price": v["price"], "_meta_compare": v["compare_at"], "_meta_baseline": base,
+                    "_meta_size": v["size"], "_meta_color": v["color"], "_meta_available": v["in_stock"],
+                })
+
+        if batch_variants:
+            rows_to_write, skipped_sku_to_id = apply_change_detection(batch_variants, prev_stock_state, brand_name)
+            db_payload = [{**{k: v for k, v in r.items() if not k.startswith("_meta_")}, "delisted_at": None}
+                          for r in rows_to_write]
+            variant_upsert_rows = []
+            for i in range(0, len(db_payload), 100):
+                res_v = safe_db_execute(
+                    supabase.table("product_variants").upsert(db_payload[i:i+100], on_conflict="external_sku"))
+                if res_v and res_v.data:
+                    variant_upsert_rows.extend(res_v.data)
+            sku_to_id = {r["external_sku"]: r["id"] for r in variant_upsert_rows}
+            sku_to_id.update({k: v for k, v in skipped_sku_to_id.items() if v is not None})
+            for vr in batch_variants:
+                vr["variant_db_id"] = sku_to_id.get(vr["external_sku"])
+                product_variant_tracking[vr["product_id"]].append(vr)
+
+            snap_rows = build_snapshot_rows(brand_name, product_variant_tracking, today, existing_snapshot_ids)
+            if snap_rows:
+                safe_db_execute(supabase.table("price_snapshots").insert(snap_rows))
+
+            id_to_sku = {v: k for k, v in product_id_map.items()}
+            for db_pid, records in product_variant_tracking.items():
+                try:
+                    if not records:
+                        continue
+                    sizes_in_stock = [r["_meta_size"] for r in records if r["_meta_available"] and r["_meta_size"]]
+                    for rec in records:
+                        prev_v = prev_stock_state.get(rec["external_sku"])
+                        if prev_v:
+                            detect_and_write_stockout(
+                                supabase, rec["variant_db_id"], db_pid, brand_name,
+                                rec["_meta_size"], rec["_meta_color"], prev_v["is_in_stock"],
+                                rec["_meta_available"], rec["_meta_price"], rec["_meta_baseline"])
+                    curr_price = product_repr_price(records)
+                    v_base = product_repr_baseline(records)
+                    if curr_price is None:
+                        continue
+                    last_p = prev_prices.get(db_pid)
+                    if last_p is None:
+                        prev_prices[db_pid] = curr_price
+                    elif abs(last_p - curr_price) > 0.01:
+                        direction = "down" if curr_price < last_p else "up"
+                        price_changes += 1
+                        if direction == "down" and v_base and curr_price < v_base:
+                            pf = (parsed.get(id_to_sku.get(db_pid)) or (None,))[0]
+                            if pf:
+                                p_cat = normalize_category(f"{' '.join(pf['cats'])} {pf['name']}")
+                                for sz in set(sizes_in_stock):
+                                    find_and_alert_users(supabase, session, brand_name, p_cat, sz,
+                                                         curr_price, pf["name"], pf["url"], v_base)
+                        honest_disc = round(((v_base - curr_price) / v_base) * 100, 2) if (v_base and curr_price < v_base) else None
+                        safe_db_execute(supabase.table("price_events").insert({
+                            "product_id": db_pid, "brand": brand_name,
+                            "price_before": last_p, "price_after": curr_price,
+                            "compare_at_price": records[0].get("_meta_compare"),
+                            "discount_pct": honest_disc, "direction": direction,
+                            "sizes_in_stock": sizes_in_stock,
+                            "recorded_at": datetime.now(timezone.utc).isoformat()}))
+                        prev_prices[db_pid] = curr_price
+                        sync_snapshot_price(supabase, db_pid, today, curr_price)
+                except Exception as e:
+                    print(f"  ⚠️ [Magento] Skipping product db_pid={db_pid} during detection: {e}")
+                    continue
+
+        print(f"  [Magento] Page {page}/{total_pages} — {len(batch_products)} products processed.")
+        page += 1
     return products_seen, price_changes
 
 # ── FX Rate (v14.29) ─────────────────────────────────────────────────────────
@@ -5765,7 +6039,7 @@ def scrape_brand(brand_name, domain):
         # directly. The engine itself will surface a clear error if the API is
         # genuinely unreachable. Mobaco's WordPress homepage was rejecting the
         # bare "Mozilla/5.0" UA we used here, blocking the whole brand from running.
-        if brand_config["engine"] not in ("lcw_proxy", "defacto", "woocommerce"):
+        if brand_config["engine"] not in ("lcw_proxy", "defacto", "woocommerce", "magento_gql"):
             if not check_domain(session, domain):
                 print(f"  ⚠️ Domain {domain} unreachable. Skipping.")
                 return 0, 0
@@ -5822,6 +6096,8 @@ def scrape_brand(brand_name, domain):
             seen, changes = scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         elif brand_config["engine"] == "woocommerce":
             seen, changes = scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
+        elif brand_config["engine"] == "magento_gql":
+            seen, changes = scrape_magento(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids)
         else:
             seen, changes = 0, 0
 
@@ -5843,7 +6119,7 @@ if __name__ == "__main__":
     elif SCRAPE_TARGET == "defacto":
         active_brands = [b for b in BRANDS if b["engine"] == "defacto"]
     elif SCRAPE_TARGET in ("woo", "woocommerce"):
-        active_brands = [b for b in BRANDS if b["engine"] == "woocommerce"]
+        active_brands = [b for b in BRANDS if b["engine"] in ("woocommerce", "magento_gql")]
     elif SCRAPE_TARGET in {b["name"] for b in BRANDS}:
         # single-brand isolation: SCRAPE_TARGET=<brand name> runs just that one.
         # Lets a newly-added brand (e.g. rojada) be validated on its own before
