@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       domains:
-        description: "Space-separated domains, e.g. mobaco.com rojada-egy.com"
-        default: "mobaco.com rojada-egy.com"
+        description: "Space-separated domains, e.g. mobaco.com rojada-egy.com coupeg.com"
+        default: "mobaco.com rojada-egy.com coupeg.com"
 jobs:
   probe:
     runs-on: ubuntu-latest
