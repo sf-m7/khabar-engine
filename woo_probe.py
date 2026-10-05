@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe WooCommerce Store API per domain, DIRECT and via DataImpulse (Egypt exit).
 Never crashes on non-JSON: prints status, content-type, server headers, body start.
-Usage: python woo_probe.py mobaco.com rojada-egy.com <coup-domain>"""
+Usage: python woo_probe.py mobaco.com rojada-egy.com coupeg.com"""
 import os, sys, time, json
 from curl_cffi import requests
 
