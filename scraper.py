@@ -947,6 +947,7 @@ BRANDS = [
     {"name": "or_egypt",   "domain": "or-egypt.com",             "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
     {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
+    {"name": "coup",       "domain": "coupeg.com",               "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
 
@@ -979,6 +980,7 @@ BRAND_DISPLAY = {
     "tie_house":  "Tie House",
     "premoda":    "Premoda", 
     "zodiac":     "Zodiac",
+    "coup":       "Coup",
     "or-egypt":   "Or Egypt",
 }
 
