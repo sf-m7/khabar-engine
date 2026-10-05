@@ -999,10 +999,14 @@ FEMALE_ONLY_BRANDS = {"carina", "just_sbr", "mlameh", "rojada"}
 # ── Category Taxonomy ─────────────────────────────────────────────────────────
 CATEGORY_MAP = {
     "t-shirts":    ["t-shirt", " tee ", " tee,", "تيشيرت", "jersey tee", "jersey t"],
-    "shirts":      ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
-    "polos":       ["polo"],
+    # v14.65 FIX: sweatshirts/hoodies MUST be checked before "shirts" — "shirt"
+    # is a substring of "sweatshirt", so with shirts first every sweatshirt was
+    # silently mistagged as a plain shirt. Confirmed live across Mobaco, Rojada
+    # and Coup (all three had "Sweatshirt"/"SweatShirts & Hoodie" -> "shirts").
     "sweatshirts": ["sweatshirt", "سويت شيرت"],
     "hoodies":     ["hoodie", "hoody", "هودي"],
+    "shirts":      ["shirt", "blouse", "tunic", "تونيك", "قميص", "بلوزة"],
+    "polos":       ["polo"],
     "cardigans":   ["cardigan", "كارديجان"],
     "sweaters":    ["sweater", "pullover", "knitwear", "knit", "بلوفر"],
     "bodysuits":   ["bodysuit", "body suit", "بودي"],
@@ -4883,6 +4887,7 @@ from concurrent.futures import ThreadPoolExecutor
 WOO_TIME_BUDGET = int(os.environ.get("WOO_TIME_BUDGET") or "2400")
 WOO_WORKERS     = max(1, int(os.environ.get("WOO_WORKERS") or "3"))
 WOO_MIN_GAP     = float(os.environ.get("WOO_MIN_GAP") or "0.4")
+WOO_BULK_PAGE_RETRIES = max(0, int(os.environ.get("WOO_BULK_PAGE_RETRIES") or "4"))
 _woo_gap_lock   = threading.Lock()
 _woo_last_req   = {"t": 0.0}
 
@@ -4922,6 +4927,16 @@ def fetch_woo_variations_bulk(session, domain, deadline):
     Layer 1. Returns (var_map, complete) or (None, False) if the store does not
     support type=variation. complete=False means a page failed mid-way; callers
     still use what was fetched but skip products with no match.
+
+    v14.65 FIX: a non-200 or non-JSON page used to be swallowed silently and
+    treated as "bulk unsupported" / "stop here", with no log line at all.
+    On Coup (9,543 variations / ~96 pages through the Cloudflare-protected
+    proxy tier) this silently truncated the fetch to ~7-8 pages (700-800 rows)
+    out of 9,543, which then caused 536+ products to be skipped per run with
+    no visible cause. Now: (1) every failed page is logged with status/body,
+    (2) a failing page (page > 1) gets its own retry-with-backoff (up to
+    WOO_BULK_PAGE_RETRIES) before the fetch gives up, since a transient
+    Cloudflare/proxy blip on page 8 of 96 should not discard pages 9-96.
     """
     headers = {"accept": "application/json, text/plain, */*",
                "accept-language": "en-US,en;q=0.9",
@@ -4929,17 +4944,36 @@ def fetch_woo_variations_bulk(session, domain, deadline):
     var_map, page = {}, 1
     while True:
         if time.time() > deadline:
-            print("  ⚠️ [WooCommerce][bulk] time budget hit during bulk fetch.")
+            print(f"  ⚠️ [WooCommerce][bulk] time budget hit during bulk fetch (page {page}, {len(var_map)} variations so far).")
             return var_map, False
         url = f"https://{domain}/wp-json/wc/store/v1/products?type=variation&per_page=100&page={page}"
-        try:
-            _woo_pace()
-            res = execute_with_retry(session.get, url, max_retries=3, timeout=PROXY_HTTP_TIMEOUT, headers=headers)
-            rows = res.json() if res.status_code == 200 else None
-        except Exception as e:
-            print(f"  ⚠️ [WooCommerce][bulk] page {page} failed: {e}")
-            return (var_map, False) if page > 1 else (None, False)
+        rows, attempt = None, 0
+        while attempt <= WOO_BULK_PAGE_RETRIES:
+            try:
+                _woo_pace()
+                res = execute_with_retry(session.get, url, max_retries=3, timeout=PROXY_HTTP_TIMEOUT, headers=headers)
+                if res.status_code == 200:
+                    try:
+                        rows = res.json()
+                    except Exception:
+                        rows = None
+                        print(f"  ⚠️ [WooCommerce][bulk] page {page} HTTP 200 but non-JSON body "
+                              f"(attempt {attempt+1}/{WOO_BULK_PAGE_RETRIES+1}): {res.text[:150]!r}")
+                else:
+                    print(f"  ⚠️ [WooCommerce][bulk] page {page} HTTP {res.status_code} "
+                          f"(attempt {attempt+1}/{WOO_BULK_PAGE_RETRIES+1}, server={res.headers.get('server')}, "
+                          f"cf-mitigated={res.headers.get('cf-mitigated')}): {res.text[:150]!r}")
+            except Exception as e:
+                print(f"  ⚠️ [WooCommerce][bulk] page {page} request failed "
+                      f"(attempt {attempt+1}/{WOO_BULK_PAGE_RETRIES+1}): {e}")
+            if isinstance(rows, list):
+                break
+            attempt += 1
+            if attempt <= WOO_BULK_PAGE_RETRIES:
+                time.sleep(min(30, 2 ** attempt) + random.uniform(0, 1))
         if not isinstance(rows, list):
+            print(f"  ⚠️ [WooCommerce][bulk] page {page} gave up after {WOO_BULK_PAGE_RETRIES+1} attempts "
+                  f"— stopping with {len(var_map)} variations from {page-1} completed page(s).")
             return (var_map, False) if page > 1 else (None, False)
         if not rows:
             break
