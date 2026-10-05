@@ -946,7 +946,7 @@ BRANDS = [
     {"name": "zodiac",     "domain": "zodiac-eg.co",             "engine": "shopify"},
     {"name": "or_egypt",   "domain": "or-egypt.com",             "engine": "shopify"},
     {"name": "mobaco",     "domain": "mobaco.com",               "engine": "woocommerce"},
-#    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
+    {"name": "rojada",     "domain": "rojada-egy.com",           "engine": "woocommerce"},
     {"name": "defacto",    "domain": "www.defacto.com.eg",       "engine": "defacto"},
 ]
 
@@ -971,7 +971,7 @@ BRAND_DISPLAY = {
     "dalydress":  "Dalydress",
     "esla":       "Esla",
     "mobaco":     "Mobaco",
- #   "rojada":     "Rojada",
+    "rojada":     "Rojada",
     "lc_waikiki": "LC Waikiki",
     "defacto":    "DeFacto",
     "arafa":      "Arafa Stores",
@@ -4854,6 +4854,132 @@ def fetch_mobaco_variations(session, domain, product_id):
             continue
     return result
 
+
+# ── v14.60 WooCommerce engine upgrade ─────────────────────────────────────────
+# PROBLEM: v14.19 fetched variations with ONE extra HTTP call per variable
+# product, strictly serial, with a 1.0-1.8s sleep each (~12+ min for 524
+# products, far worse through a residential proxy with 5 retries x 45-60s).
+# A single stall or a proxy-tier re-run pushed the whole job past its timeout,
+# and the Shopify group shared that job, so Woo failures took everything down.
+#
+# FIX (3 layers, best first):
+#   1. BULK: GET /products?type=variation&per_page=100 returns ALL variations
+#      of the store, 100 per page (~27 calls for Mobaco instead of ~524).
+#      Verified at runtime — if the store ignores type=variation we detect it
+#      and drop to layer 2 automatically.
+#   2. BOUNDED PARALLEL per-product fetch (WOO_WORKERS, default 3, with a
+#      global request spacing) when bulk is unsupported.
+#   3. TIME BUDGET (WOO_TIME_BUDGET, default 2400s per brand): the brand stops
+#      cleanly instead of hanging; the rest is picked up next run.
+# DATA INTEGRITY: if a variable product's real variation data could not be
+# fetched, that product is SKIPPED this run. The old behaviour fell back to
+# parent-level price/stock, which fabricates "in stock" for every size and
+# produces fake restock/stockout events.
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+WOO_TIME_BUDGET = int(os.environ.get("WOO_TIME_BUDGET") or "2400")
+WOO_WORKERS     = max(1, int(os.environ.get("WOO_WORKERS") or "3"))
+WOO_MIN_GAP     = float(os.environ.get("WOO_MIN_GAP") or "0.4")
+_woo_gap_lock   = threading.Lock()
+_woo_last_req   = {"t": 0.0}
+
+def _woo_pace():
+    """Global spacing between Woo requests across all worker threads."""
+    with _woo_gap_lock:
+        wait = _woo_last_req["t"] + WOO_MIN_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _woo_last_req["t"] = time.time()
+
+def _woo_parse_variation_row(row):
+    """One Store API variation row -> (id, live dict) or None."""
+    try:
+        var_id = row.get("id")
+        if not var_id:
+            return None
+        prices = row.get("prices") or {}
+        minor  = prices.get("currency_minor_unit", 2)
+        cc     = prices.get("currency_code")
+        if cc and cc.upper() != "EGP":
+            return None
+        cur = _woo_price(prices.get("price"), minor)
+        reg = _woo_price(prices.get("regular_price"), minor)
+        if cur <= 0:
+            return None
+        return int(var_id), {
+            "price": cur, "compare_at": reg if reg > cur else None,
+            "is_in_stock": bool(row.get("is_in_stock", False)),
+            "sku": row.get("sku") or "",
+        }
+    except Exception:
+        return None
+
+def fetch_woo_variations_bulk(session, domain, deadline):
+    """
+    Layer 1. Returns (var_map, complete) or (None, False) if the store does not
+    support type=variation. complete=False means a page failed mid-way; callers
+    still use what was fetched but skip products with no match.
+    """
+    headers = {"accept": "application/json, text/plain, */*",
+               "accept-language": "en-US,en;q=0.9",
+               "referer": f"https://{domain}/"}
+    var_map, page = {}, 1
+    while True:
+        if time.time() > deadline:
+            print("  ⚠️ [WooCommerce][bulk] time budget hit during bulk fetch.")
+            return var_map, False
+        url = f"https://{domain}/wp-json/wc/store/v1/products?type=variation&per_page=100&page={page}"
+        try:
+            _woo_pace()
+            res = execute_with_retry(session.get, url, max_retries=3, timeout=PROXY_HTTP_TIMEOUT, headers=headers)
+            rows = res.json() if res.status_code == 200 else None
+        except Exception as e:
+            print(f"  ⚠️ [WooCommerce][bulk] page {page} failed: {e}")
+            return (var_map, False) if page > 1 else (None, False)
+        if not isinstance(rows, list):
+            return (var_map, False) if page > 1 else (None, False)
+        if not rows:
+            break
+        if page == 1:
+            # Detect "param ignored": a real variation list has parent ids and
+            # type == variation. A normal product list means unsupported.
+            looks_ok = all((r.get("type") == "variation") or (r.get("parent") or 0) > 0 for r in rows[:10])
+            if not looks_ok:
+                print("  [WooCommerce][bulk] type=variation not supported by this store -> per-product mode.")
+                return None, False
+        for r in rows:
+            parsed = _woo_parse_variation_row(r)
+            if parsed:
+                var_map[parsed[0]] = parsed[1]
+        if len(rows) < 100:
+            break
+        page += 1
+    print(f"  [WooCommerce][bulk] {len(var_map)} variations in {page} page(s).")
+    return var_map, True
+
+_woo_tls = threading.local()
+
+def _woo_fetch_one(brand_name, domain, product_id, deadline):
+    """Layer 2 worker. Own session per thread (curl_cffi sessions are not thread-safe)."""
+    if time.time() > deadline:
+        return product_id, None
+    sess = getattr(_woo_tls, "s", None)
+    if sess is None:
+        sess = get_shopify_session(brand_name)
+        _woo_tls.s = sess
+    _woo_pace()
+    data = fetch_mobaco_variations(sess, domain, product_id)
+    return product_id, (data or None)
+
+def fetch_woo_variations_parallel(brand_name, domain, product_ids, deadline):
+    out = {}
+    with ThreadPoolExecutor(max_workers=WOO_WORKERS) as ex:
+        for pid, data in ex.map(lambda i: _woo_fetch_one(brand_name, domain, i, deadline), product_ids):
+            if data:
+                out[pid] = data
+    return out
+
 def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     """
     Scrapes a WooCommerce store via the public Store API.
@@ -4868,6 +4994,10 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
     products_seen, price_changes = 0, 0
     PER_PAGE = 100
     _MOBACO_DIAG["done"] = False  # v14.23: reset so the diagnostic prints once per run
+    _deadline = time.time() + WOO_TIME_BUDGET
+    _bulk_map, _bulk_complete = fetch_woo_variations_bulk(session, domain, _deadline)
+    print(f"  [WooCommerce] variation mode: {'BULK' if _bulk_map is not None else 'PER-PRODUCT x' + str(WOO_WORKERS)}")
+    _woo_skipped = 0
 
     prev_prices = load_last_prices(supabase, brand_name)
     # v14.17: fop_done_ids passed in from scrape_brand (derived from the variant
@@ -4897,9 +5027,13 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
 
     page = 1
     while True:
+        if time.time() > _deadline:
+            print(f"  ⚠️ [WooCommerce] time budget ({WOO_TIME_BUDGET}s) reached at page {page}; stopping cleanly.")
+            break
         url = f"https://{domain}/wp-json/wc/store/v1/products?per_page={PER_PAGE}&page={page}"
         try:
-            res = execute_with_retry(session.get, url, timeout=PROXY_HTTP_TIMEOUT, headers=headers)
+            _woo_pace()
+            res = execute_with_retry(session.get, url, max_retries=3, timeout=PROXY_HTTP_TIMEOUT, headers=headers)
         except Exception as e:
             print(f"  ⚠️ [WooCommerce] Page {page} network error: {e}")
             break
@@ -5010,8 +5144,12 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 traceback.print_exc()
                 continue
 
-        # ── Variants upsert — v14.19: real per-variation price/stock ──────
+        # ── Variants upsert — v14.60: bulk map or bounded-parallel prefetch ──
         batch_variants, product_variant_tracking = [], {}
+        _page_var_cache = {}
+        if _bulk_map is None:
+            _need = [p["id"] for p in products if p.get("variations")]
+            _page_var_cache = fetch_woo_variations_parallel(brand_name, domain, _need, _deadline)
         for p in products:
             try:
                 db_pid = product_id_map.get(str(p.get("id")))
@@ -5050,7 +5188,14 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                 # One extra call per product, every run, by design (524
                 # products total — cheap, simplest to reason about, no
                 # gating state to get wrong).
-                var_data = fetch_mobaco_variations(session, domain, p["id"])
+                if _bulk_map is not None:
+                    var_data = _bulk_map
+                else:
+                    var_data = _page_var_cache.get(p["id"]) or {}
+                # v14.60: no real variation data -> skip product (never fabricate stock).
+                if not any(v.get("id") and int(v["id"]) in var_data for v in variations):
+                    _woo_skipped += 1
+                    continue
                 term_lookup = _woo_build_term_lookup(p)
 
                 # v14.23: one-time diagnostic on the FIRST variable product of
@@ -5085,15 +5230,9 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                         if live:
                             cur, compare_at, is_avail = live["price"], live["compare_at"], live["is_in_stock"]
                         else:
-                            # The /variations call failed, or this specific
-                            # variation id wasn't in its response — fall back
-                            # to the parent's values rather than dropping the
-                            # variant entirely. This degrades gracefully to
-                            # the OLD behaviour for just this one row instead
-                            # of losing data.
-                            cur = parent_cur
-                            compare_at = parent_reg if (parent_on_sale and parent_reg > parent_cur) else None
-                            is_avail = parent_avail
+                            # v14.60: variation not in live data (hidden/unpublished) -> skip,
+                            # never substitute parent values.
+                            continue
 
                         if cur <= 0 or cur > 1_000_000:
                             continue
@@ -5115,18 +5254,6 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
                         print(f"  ⚠️ [WooCommerce] Skipping variation on product {p.get('id')}: {e}")
                         continue
 
-                # Be polite to Mobaco's server — one extra call per product.
-                # v14.20: widened from 0.2-0.4s to 1.0-1.8s. The tighter pace
-                # was ~2.5-5 requests/second sustained against one small
-                # WooCommerce host for ~524 products, which is fast enough to
-                # trip a basic hosting-provider rate limiter — confirmed by a
-                # real run logging repeated 429s on this exact endpoint. This
-                # full pass now takes roughly 524 x ~1.4s ≈ 12 minutes instead
-                # of ~3, which is the actual fix; execute_with_retry's longer
-                # backoff (see its v14.20 changelog) is the safety net for
-                # whatever rate-limiting still slips through, not the primary
-                # fix.
-                time.sleep(random.uniform(1.0, 1.8))
 
             except Exception as e:
                 _pid = (p or {}).get("id", "?")
@@ -5213,8 +5340,9 @@ def scrape_woocommerce(supabase, session, brand_name, domain, today, prev_stock_
         if len(products) < PER_PAGE:
             break
         page += 1
-        time.sleep(random.uniform(0.8, 1.5))
 
+    if _woo_skipped:
+        print(f"  ⚠️ [WooCommerce] {_woo_skipped} variable product(s) skipped (no live variation data).")
     return products_seen, price_changes
 
 # ── FX Rate (v14.29) ─────────────────────────────────────────────────────────
@@ -5335,44 +5463,44 @@ def collect_bestseller_ranks(supabase, session):
                 continue  # already collected today
 
             url = f"https://{domain}/collections/all/products.json?sort_by=best-selling&limit={BESTSELLER_CAP}"
-            try:
-                # v14.45 FIX: use the SAME session the brand's normal scrape
-                # uses, instead of the shared one passed in.
-                #
-                # The passed-in `session` is a direct connection from the
-                # GitHub Actions runner. Every CF-RAY in the failure logs ended
-                # in "-SEA" — Seattle, i.e. the runner's own datacenter IP, not
-                # a DataImpulse residential exit. Nineteen Shopify brands were
-                # therefore hitting Cloudflare from one datacenter address
-                # within a couple of minutes, and every single one came back
-                # 429 with Retry-After: 60.
-                #
-                # The catalog scrape for these same brands succeeds in the same
-                # run, because it goes through get_shopify_session(). This call
-                # is the only place that skipped it. Nothing in our code
-                # changed when this broke — Cloudflare simply tightened on that
-                # IP range, which is exactly the failure a residential proxy
-                # exists to avoid.
-                #
-                # The explicit "Mozilla/5.0" header is also dropped: it
-                # overrode the Chrome-124 TLS fingerprint the session already
-                # impersonates, producing a request whose headers and TLS
-                # signature disagreed — a combination Cloudflare scores badly
-                # on its own.
-                bs_session = get_shopify_session(brand_name)
-                res = execute_with_retry(
-                    bs_session.get, url, max_retries=2, backoff=3, timeout=30
-                )
-            except Exception as e:
-                if "429" in str(e):
-                    blocked += 1
-                print(f"  ⚠️ [Bestseller] {brand_name}: request failed ({e}). Skipping.")
-                continue
+            # v14.63 FIX (HTTP 403): this pass runs AFTER the brand loop, when the
+            # per-brand proxy override stack is empty, so every brand fell back to
+            # the run's BASELINE tier (usually "direct" = GitHub datacenter IP).
+            # Brands that only succeed in the main scrape via their own escalation
+            # (proxy tier) therefore got 403 here. Now each brand cascades through
+            # the tiers itself on 403/429/network failure, starting at the baseline.
+            res, idx = None, _proxy_tier_state["idx"]
+            while True:
+                _proxy_tier_override_stack.append(idx)
+                try:
+                    bs_session = get_shopify_session(brand_name)
+                    res = execute_with_retry(
+                        bs_session.get, url, max_retries=2, backoff=3, timeout=30
+                    )
+                    failed = res.status_code in (403, 429)
+                    if failed:
+                        print(f"  ⚠️ [Bestseller] {brand_name}: HTTP {res.status_code} on tier "
+                              f"'{PROXY_TIERS[idx]}' (server={res.headers.get('server')}, "
+                              f"cf-mitigated={res.headers.get('cf-mitigated')}, "
+                              f"body={res.text[:80]!r})")
+                except Exception as e:
+                    failed = True
+                    res = None
+                    print(f"  ⚠️ [Bestseller] {brand_name}: request failed on tier '{PROXY_TIERS[idx]}' ({e}).")
+                finally:
+                    _proxy_tier_override_stack.pop()
+                if not failed:
+                    break
+                nxt = _next_tier_idx(idx, brand_name, "bestseller blocked")
+                if nxt is None:
+                    break
+                idx = nxt
+                time.sleep(random.uniform(2, 5))
 
-            if res.status_code != 200:
-                if res.status_code == 429:
-                    blocked += 1
-                print(f"  ⚠️ [Bestseller] {brand_name}: HTTP {res.status_code}. Skipping.")
+            if res is None or res.status_code != 200:
+                blocked += 1
+                print(f"  ⚠️ [Bestseller] {brand_name}: gave up "
+                      f"(HTTP {getattr(res, 'status_code', 'n/a')}) after all tiers. Skipping.")
                 continue
 
             products = res.json().get("products", [])
@@ -5441,8 +5569,8 @@ def collect_bestseller_ranks(supabase, session):
     # the fleet is refusing at once, the cause is the connection, not the
     # brands, and this says so once and plainly.
     if blocked and blocked >= max(3, len(shopify_brands) // 2):
-        print(f"  ⚠️  [Bestseller] {blocked}/{len(shopify_brands)} brands returned "
-              f"HTTP 429 in the same run. That pattern means the requests are "
+        print(f"  ⚠️  [Bestseller] {blocked}/{len(shopify_brands)} brands blocked (403/429) "
+              f"on every proxy tier in the same run. That pattern means the requests are "
               f"being rate-limited by source IP, not by any individual store. "
               f"Check that DATAIMPULSE credentials are set and that these "
               f"brands are listed in DATAIMPULSE_PROXY_BRANDS.")
@@ -5707,12 +5835,12 @@ if __name__ == "__main__":
     # SCRAPE_TARGET controls which brands this run processes.
     SCRAPE_TARGET = os.environ.get("SCRAPE_TARGET", "all").lower()
     if SCRAPE_TARGET == "shopify":
-        active_brands = [b for b in BRANDS if b["engine"] in ("shopify", "defacto", "woocommerce")]
+        active_brands = [b for b in BRANDS if b["engine"] in ("shopify", "defacto")]
     elif SCRAPE_TARGET == "lcw":
         active_brands = [b for b in BRANDS if b["engine"] == "lcw_proxy"]
     elif SCRAPE_TARGET == "defacto":
         active_brands = [b for b in BRANDS if b["engine"] == "defacto"]
-    elif SCRAPE_TARGET == "mobaco":
+    elif SCRAPE_TARGET in ("woo", "woocommerce"):
         active_brands = [b for b in BRANDS if b["engine"] == "woocommerce"]
     elif SCRAPE_TARGET in {b["name"] for b in BRANDS}:
         # single-brand isolation: SCRAPE_TARGET=<brand name> runs just that one.
