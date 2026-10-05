@@ -1,0 +1,17 @@
+name: Site Discover
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Page to inspect"
+        default: "https://mobaco.com/en/women"
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install curl_cffi
+      - run: python -u site_discover.py "${{ inputs.url }}"
