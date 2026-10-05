@@ -1,0 +1,17 @@
+name: Woo Probe
+on:
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: "Space-separated domains, e.g. mobaco.com rojada-egy.com"
+        default: "mobaco.com rojada-egy.com"
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install curl_cffi
+      - run: python -u woo_probe.py ${{ inputs.domains }}
