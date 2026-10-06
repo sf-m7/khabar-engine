@@ -2,15 +2,21 @@ name: Khabar WooCommerce Scraper
 
 on:
   schedule:
-    # 1x daily, ~00:23 Cairo (EEST). Woo brands only need one daily snapshot.
-    # Isolated from the Shopify job so a Woo stall can never take it down.
-    - cron: "23 21 * * *"
+    # Mobaco + Rojada run 3x daily, same cadence as Shopify (offset by a few
+    # minutes to avoid landing on the exact same slot in the shared queue).
+    # Coup stays at 1x daily for now — it's the one brand depending on a
+    # live proxy session through an active Cloudflare challenge; give it a
+    # few more days of single-run history before trusting it 3x unattended.
+    - cron: "10 2 * * *"    # ~05:10 Cairo -> woo_fast (mobaco, rojada)
+    - cron: "16 12 * * *"   # ~15:16 Cairo -> woo_fast (mobaco, rojada)
+    - cron: "44 19 * * *"   # ~22:44 Cairo -> woo_fast (mobaco, rojada)
+    - cron: "23 21 * * *"   # ~00:23 Cairo -> coup (1x/day)
   workflow_dispatch:
     inputs:
       scrape_target:
-        description: 'Leave "woo" for all WooCommerce brands, or one brand name (mobaco / rojada / coup).'
+        description: 'Leave blank for the schedule-based default. Set "woo" for all WooCommerce brands, "woo_fast" for mobaco+rojada only, or one brand name (mobaco / rojada / coup).'
         type: string
-        default: "woo"
+        default: ""
 
 # v14.52: share the LCW scraper's concurrency group. Root cause of "scheduled
 # runs fail, manual runs work": the 04:00 UTC Shopify run overran (up to 3h on
@@ -65,7 +71,19 @@ jobs:
           SUPABASE_DB_URL:            ${{ secrets.SUPABASE_DB_URL }}
           KHABAR_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
           TELEGRAM_BOT_TOKEN:         ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          SCRAPE_TARGET:              ${{ inputs.scrape_target || 'woo' }}
+          # v14.66: on a schedule trigger with no manual override, route by
+          # which cron fired — github.event.schedule carries the exact cron
+          # string that triggered this run. A manual run (workflow_dispatch)
+          # always honors the input if one was given; blank input on a manual
+          # run falls back to "woo" (every Woo brand, useful for an ad-hoc
+          # full check).
+          SCRAPE_TARGET: >-
+            ${{
+              inputs.scrape_target != '' && inputs.scrape_target
+              || (github.event.schedule == '23 21 * * *' && 'coup')
+              || (github.event_name == 'schedule' && 'woo_fast')
+              || 'woo'
+            }}
           DATAIMPULSE_PROXY_USERNAME: ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD: ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
           # v14.55: Decodo dedicated ISP (3 static IPs) now carries Shopify +
