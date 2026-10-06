@@ -6154,6 +6154,11 @@ if __name__ == "__main__":
         active_brands = [b for b in BRANDS if b["engine"] == "defacto"]
     elif SCRAPE_TARGET in ("woo", "woocommerce"):
         active_brands = [b for b in BRANDS if b["engine"] in ("woocommerce", "magento_gql")]
+    elif SCRAPE_TARGET == "woo_fast":
+        # v14.66: Mobaco + Rojada run 3x/day like Shopify; Coup stays at 1x/day
+        # until its proxy-dependent bulk fetch has proven stable over more runs
+        # (see scraper_woo.yml for the schedule -> target routing).
+        active_brands = [b for b in BRANDS if b["engine"] in ("woocommerce", "magento_gql") and b["name"] != "coup"]
     elif SCRAPE_TARGET in {b["name"] for b in BRANDS}:
         # single-brand isolation: SCRAPE_TARGET=<brand name> runs just that one.
         # Lets a newly-added brand (e.g. rojada) be validated on its own before
