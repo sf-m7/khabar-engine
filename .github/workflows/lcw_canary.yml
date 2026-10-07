@@ -1,0 +1,174 @@
+name: LCW Fingerprint Canary
+
+# Built 2026-10 after a recurring pattern: LCW's Cloudflare bot-management
+# periodically starts blocking the exact request fingerprint scrape_lcw()
+# uses, and each time it takes 1-3 days of back-and-forth to notice and
+# diagnose, because the only way to test was running the full scraper and
+# waiting for a real failure. This runs the same 2-request comparison that
+# diagnosis always ends up needing, on its own fast schedule, and pages
+# immediately instead of waiting for someone to notice missing data.
+#
+# BASELINE = chrome124 impersonation, default (HTTP/2) — proven reliable
+#            every time we've tested it standalone.
+# PRODUCTION = chrome124 impersonation + whatever LCW_FORCE_HTTP1 is set to
+#              right now — i.e. literally what scrape_lcw() sends today.
+#
+# Baseline fails + Production fails  -> broader outage (DataImpulse, or
+#   Cloudflare blocking regardless of fingerprint) — not a quick config fix.
+# Baseline succeeds + Production fails -> the landmine signature: whatever
+#   PRODUCTION is currently configured to do (most likely LCW_FORCE_HTTP1)
+#   is what's getting blocked. This exact pattern already happened once
+#   (2026-10): HTTP/1.1 forced on a Chrome-impersonated TLS handshake is an
+#   internal inconsistency Cloudflare's model started catching.
+# Both succeed -> healthy, no alert.
+
+on:
+  schedule:
+    # 6x/day, every 4 hours, off the hour (see scraper_shopify.yml's note on
+    # GH Actions dropping jobs scheduled exactly on :00 under load).
+    - cron: '23 0,4,8,12,16,20 * * *'
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compare baseline vs production LCW fingerprint
+        env:
+          DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
+          DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
+          TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPS_TELEGRAM_CHAT_ID:        ${{ secrets.OPS_TELEGRAM_CHAT_ID }}
+          # Mirrors scraper.py's own default exactly — if that default ever
+          # changes, change it here too, or this stops testing what's real.
+          LCW_FORCE_HTTP1:             ${{ vars.LCW_FORCE_HTTP1 }}
+        run: |
+          python3 <<'PYEOF'
+          import os
+          from curl_cffi import requests
+
+          USER = os.environ["DATAIMPULSE_PROXY_USERNAME"]
+          PASS = os.environ["DATAIMPULSE_PROXY_PASSWORD"]
+          HOST = "gw.dataimpulse.com"
+          PORT = 15000
+          COUNTRY = "tr"
+          URL = ("https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData"
+                 "?xhrKeys=CategoryTreeId,xhrKeys&CategoryTreeId=9&PageIndex=1&Layout=three-column")
+          HEADERS = {
+              "accept": "application/json, text/plain, */*",
+              "accept-language": "en-US,en;q=0.9",
+              "origin": "https://www.lcwaikiki.eg",
+              "referer": "https://www.lcwaikiki.eg/en/men-clothing-t-9",
+              "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+              "content-type": "application/json",
+          }
+          BODY = {"CategoryParameterList": [{"PropertyId": 67, "PropertyValueId": [10]},
+                                             {"PropertyId": 63, "PropertyValueId": [57794]}],
+                  "FilterListJson": "[]", "LastSeenOptionIdsJson": "[]"}
+          PROXY = f"http://{USER}__cr.{COUNTRY}:{PASS}@{HOST}:{PORT}"
+
+          def probe(http_version=None):
+              try:
+                  session = requests.Session(impersonate="chrome124",
+                                              proxies={"https": PROXY, "http": PROXY})
+                  kwargs = {"headers": HEADERS, "json": BODY, "timeout": 20}
+                  if http_version is not None:
+                      kwargs["http_version"] = http_version
+                  res = session.post(URL, **kwargs)
+                  return res.status_code, res.text[:200]
+              except Exception as e:
+                  return None, f"{type(e).__name__}: {e}"
+
+          force_http1 = os.environ.get("LCW_FORCE_HTTP1", "1").strip().lower() not in ("0", "false", "no", "off")
+          prod_http_version = None
+          if force_http1:
+              try:
+                  from curl_cffi.const import CurlHttpVersion
+                  prod_http_version = CurlHttpVersion.V1_1
+              except Exception:
+                  pass
+
+          baseline_status, baseline_body = probe(http_version=None)
+          prod_status, prod_body = probe(http_version=prod_http_version)
+
+          baseline_ok = baseline_status == 200
+          prod_ok = prod_status == 200
+
+          print(f"Baseline (chrome124, default HTTP): {baseline_status}")
+          print(f"Production (chrome124, LCW_FORCE_HTTP1={force_http1}): {prod_status}")
+
+          if baseline_ok and prod_ok:
+              print("Both OK — healthy, no alert.")
+              raise SystemExit(0)
+
+          if baseline_ok and not prod_ok:
+              # The exact flip that fixes this, computed from the CURRENT value —
+              # not just "go check a variable", the actual action to take.
+              flip_to = "0" if force_http1 else "1"
+              msg = (
+                  "🔴 LCW is about to fail (or already failing) its next scheduled run.\n\n"
+                  "CAUSE: production fingerprint is blocked, baseline still works — the "
+                  f"config-mismatch pattern (LCW_FORCE_HTTP1={force_http1} is the suspect, "
+                  "same as the 2026-10 incident).\n\n"
+                  "FIX — do this now:\n"
+                  "1. GitHub repo -> Settings -> Secrets and variables -> Actions -> Variables tab\n"
+                  f"2. Set LCW_FORCE_HTTP1 to \"{flip_to}\" (currently \"{1 if force_http1 else 0}\")\n"
+                  "3. No code deploy needed — takes effect on the next run automatically.\n\n"
+                  f"Baseline: {baseline_status} | Production: {prod_status}"
+              )
+          elif not baseline_ok and not prod_ok:
+              msg = (
+                  "🔴 LCW is about to fail (or already failing) its next scheduled run.\n\n"
+                  "CAUSE: BOTH the baseline and production fingerprints are blocked — not a "
+                  "quick config flip, something broader (DataImpulse itself, or Cloudflare "
+                  "blocking regardless of fingerprint).\n\n"
+                  "DO NOW, in order:\n"
+                  "1. Check DataImpulse dashboard -> Usage chart: flatlined despite traffic? "
+                  "-> account/gateway issue, message their support.\n"
+                  "2. Check DataImpulse dashboard -> Deposit/Overview: balance still there?\n"
+                  "3. If both look fine, this may be a genuine new Cloudflare block on LCW's "
+                  "side — needs a fresh diagnostic, not a repeat of the usual fix.\n\n"
+                  f"Baseline: {baseline_status} — {baseline_body[:150]}\n"
+                  f"Production: {prod_status} — {prod_body[:150]}"
+              )
+          else:
+              msg = (
+                  "🟡 LCW canary: unexpected pattern — production works but baseline doesn't.\n"
+                  f"Baseline: {baseline_status} — {baseline_body[:150]}\n"
+                  f"Production: {prod_status}\n"
+                  "The real scraper is likely fine right now (it uses the production "
+                  "fingerprint). Worth a look when convenient, not urgent."
+              )
+
+          print(f"\n{msg}")
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN")
+          chat_id = os.environ.get("OPS_TELEGRAM_CHAT_ID")
+          if token and chat_id:
+              import urllib.request, urllib.parse
+              data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode()
+              req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+              try:
+                  urllib.request.urlopen(req, timeout=10)
+                  print("Telegram alert sent.")
+              except Exception as e:
+                  print(f"Telegram send failed: {e}")
+          else:
+              print("TELEGRAM_BOT_TOKEN / OPS_TELEGRAM_CHAT_ID not set — alert not sent.")
+
+          raise SystemExit(1)
+          PYEOF
