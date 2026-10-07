@@ -76,25 +76,72 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: DIAGNOSTIC — test DataImpulse gateway from GitHub Actions
+      - name: DIAGNOSTIC — isolate curl_cffi/chrome124/HTTP1.1 as the 403 trigger
         env:
           DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
         run: |
-          echo "Runner's own public IP (no proxy):"
-          curl -s https://api.ipify.org/ || echo "FAILED"
-          echo ""
-          echo "Same request through DataImpulse's gateway on port 823:"
-          curl -v -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:823" https://api.ipify.org/ 2>&1 || echo "FAILED"
-          echo ""
-          echo "Same request through port 12345 (the 10000-20000 sticky range scraper.py actually uses for LCW):"
-          curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:12345" https://api.ipify.org/ 2>&1 || echo "FAILED"
-          echo ""
-          echo "Same as above but with the __cr.tr country suffix scraper.py actually appends to the username:"
-          curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}__cr.tr:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:12345" https://api.ipify.org/ 2>&1 || echo "FAILED"
-          echo ""
-          echo "Plain proxy (no country suffix, port 823 — the combo already proven to work) but targeting lcwaikiki.eg itself instead of ipify:"
-          curl -v --connect-timeout 15 -x "http://${DATAIMPULSE_PROXY_USERNAME}:${DATAIMPULSE_PROXY_PASSWORD}@gw.dataimpulse.com:823" https://www.lcwaikiki.eg/en/men-clothing-t-9 2>&1 | tail -40 || echo "FAILED"
+          python3 <<'PYEOF'
+          import os
+          from curl_cffi import requests
+
+          USER = os.environ["DATAIMPULSE_PROXY_USERNAME"]
+          PASS = os.environ["DATAIMPULSE_PROXY_PASSWORD"]
+          HOST = "gw.dataimpulse.com"
+          PORT = 15000  # fixed sticky port, same for all 3 tests below — isolates
+                         # the client fingerprint, not a different proxy peer
+          URL = ("https://www.lcwaikiki.eg/en/ajax/ProductList/ProductListPageData"
+                 "?xhrKeys=CategoryTreeId,xhrKeys&CategoryTreeId=9&PageIndex=1&Layout=three-column")
+          HEADERS = {
+              "accept": "application/json, text/plain, */*",
+              "accept-language": "en-US,en;q=0.9",
+              "origin": "https://www.lcwaikiki.eg",
+              "referer": "https://www.lcwaikiki.eg/en/men-clothing-t-9",
+              "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+              "content-type": "application/json",
+          }
+          BODY = {"CategoryParameterList": [{"PropertyId": 67, "PropertyValueId": [10]},
+                                             {"PropertyId": 63, "PropertyValueId": [57794]}],
+                  "FilterListJson": "[]", "LastSeenOptionIdsJson": "[]"}
+
+          def proxy_url(country):
+              return f"http://{USER}__cr.{country}:{PASS}@{HOST}:{PORT}"
+
+          def run_test(label, impersonate, http_version=None, country="tr"):
+              print(f"\n=== {label} ===")
+              try:
+                  kwargs = {"proxies": {"https": proxy_url(country), "http": proxy_url(country)}}
+                  if impersonate:
+                      kwargs["impersonate"] = impersonate
+                  session = requests.Session(**kwargs)
+                  post_kwargs = {"headers": HEADERS, "json": BODY, "timeout": 20}
+                  if http_version is not None:
+                      post_kwargs["http_version"] = http_version
+                  res = session.post(URL, **post_kwargs)
+                  print(f"Status: {res.status_code}")
+                  print(f"Body (first 300 chars): {res.text[:300]!r}")
+              except Exception as e:
+                  print(f"EXCEPTION: {type(e).__name__}: {e}")
+
+          # Test 1: curl_cffi, no impersonation, default HTTP version — control,
+          # closest to the plain-curl test that already succeeded cleanly.
+          run_test("1. curl_cffi, no impersonate, default HTTP", impersonate=None)
+
+          # Test 2: add chrome124 impersonation, still default HTTP version —
+          # isolates whether the TLS/JA3 fingerprint alone triggers the 403.
+          run_test("2. curl_cffi, impersonate=chrome124, default HTTP", impersonate="chrome124")
+
+          # Test 3: chrome124 + HTTP/1.1 pinned — exact replica of what
+          # scrape_lcw() actually sends in production (LCW_FORCE_HTTP1=1 default).
+          try:
+              from curl_cffi.const import CurlHttpVersion
+              v1_1 = CurlHttpVersion.V1_1
+          except Exception as e:
+              print(f"Could not import CurlHttpVersion: {e}")
+              v1_1 = None
+          run_test("3. curl_cffi, impersonate=chrome124, HTTP/1.1 pinned (= production config)",
+                    impersonate="chrome124", http_version=v1_1)
+          PYEOF
 
       - name: Run LCW scraper
         run: python -u scraper.py
@@ -107,18 +154,8 @@ jobs:
           DATAIMPULSE_PROXY_USERNAME:  ${{ secrets.DATAIMPULSE_PROXY_USERNAME }}
           DATAIMPULSE_PROXY_PASSWORD:  ${{ secrets.DATAIMPULSE_PROXY_PASSWORD }}
           DATAIMPULSE_HOST:            ${{ vars.DATAIMPULSE_HOST }}
-          # v14.60: Decodo dedicated ISP — last-resort fallback for LCW,
-          # only used when scrape_lcw's own circuit breaker (per-page AND
-          # the whole-catalog v14.63 check) decides DataImpulse is dead this
-          # run. MUST be wired here as an env var, same as every other proxy
-          # secret in this repo (repo secrets are NOT auto-injected) — this
-          # was missing entirely before, which is why the 2026-09 escalation
-          # fired correctly but had no credentials to escalate to. Names
-          # MUST match scraper.py's os.environ.get() keys exactly:
-          # DECODO_PROXY_USER / DECODO_PROXY_PASS (not USERNAME/PASSWORD —
-          # that mismatch was the actual bug, fixed 2026-09).
-          DECODO_PROXY_USER:           ${{ secrets.DECODO_PROXY_USER }}
-          DECODO_PROXY_PASS:           ${{ secrets.DECODO_PROXY_PASS }}
+          # v14.64: Decodo removed — account cancelled 2026-10. scraper.py no
+          # longer reads DECODO_PROXY_USER/PASS at all; nothing to wire here.
           SCRAPE_TARGET:               lcw
           # Which of the two daily blocks this run belongs to. Consumed by the
           # checkpoint so the morning and evening runs do not read each
