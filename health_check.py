@@ -47,6 +47,7 @@ Read-only. It cannot modify anything.
 """
 
 import os
+import re
 import sys
 from datetime import date, timedelta
 
@@ -218,9 +219,24 @@ def check_signal_freshness(cur):
             limit = freshness_days.get(name, default_days)
             stale = (date.today() - r["last_day"]).days
             if stale >= limit:
-                record("FAIL", f"signal/{name}",
-                       f"last wrote {r['last_day']} ({stale} days ago, "
-                       f"limit {limit})")
+                # FIXED 2026-10-09 -- sparse signals (e.g. l1_04 anchor
+                # inflation) legitimately re-write the same old rows daily
+                # when no NEW event occurs. If signal_runs shows a recent
+                # status='ok', the pipeline is alive; only fail when it
+                # isn't.
+                m = re.search(r"(l[12]_\d+)", name)
+                alive = False
+                if m:
+                    alive = q(cur, """
+                        SELECT count(*) AS n FROM signal_runs
+                        WHERE signal_id = %s AND status = 'ok'
+                          AND run_at >= now() - (%s || ' days')::interval
+                    """, (m.group(1), str(limit)))[0]["n"] > 0
+                if not alive:
+                    record("FAIL", f"signal/{name}",
+                           f"last wrote {r['last_day']} ({stale} days ago, "
+                           f"limit {limit}) and no successful signal_runs "
+                           f"row in that window — pipeline looks stopped")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -388,6 +404,27 @@ def check_frozen_prices(cur):
         pct_on_sale = float(r["pct_on_sale"] or 0)
         # broken only if frozen AND we can't see its discounts via compare_at
         if pct_frozen >= 95.0 and pct_on_sale < 5.0:
+            # FIXED 2026-10-09 -- a brand that FINISHED a sale and now holds
+            # full price looks identical to a blind scraper on these two
+            # numbers alone (stable price, ~0% compare_at). Confirmed on
+            # carina (09-23) and activ (10-01): manual scrape_target runs
+            # showed the live site matches the DB exactly, and price_events
+            # recorded the mass reversion -- carina 305 increases averaging
+            # +56%, activ 1,741 increases averaging +36%, on the exact days
+            # on_sale collapsed. A blind scraper cannot observe price moves;
+            # ours did. So if a large share of the catalogue logged an
+            # upward price move in the last 30 days, the collapse is a real
+            # sale ending, not lost visibility -- stay quiet.
+            ups = q(cur, """
+                SELECT count(DISTINCT pe.product_id) AS n
+                FROM price_events pe JOIN products p ON p.id = pe.product_id
+                WHERE p.brand = %s AND pe.direction = 'up'
+                  AND pe.recorded_at >= now() - interval '30 days'
+            """, (r["brand"],))[0]["n"]
+            if ups >= 0.10 * r["products"]:
+                print(f"  ℹ️  frozen_prices/{r['brand']}: sale-ending explains it "
+                      f"({ups:,} products logged price increases in 30d) — not flagged")
+                continue
             record("FAIL", f"frozen_prices/{r['brand']}",
                    f"{pct_frozen:.1f}% of {r['products']:,} products held ONE "
                    f"price for {r['days']} days AND only {pct_on_sale:.1f}% show "
