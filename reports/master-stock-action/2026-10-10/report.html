@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Khabar — What to Do With Your Stock</title>
+<style>
+:root{--paper:#FAFAF8;--ink:#1B1B19;--muted:#6C6A64;--faint:#9A978F;
+--line:#DAD7CF;--box:#EFEDE7;--grid:#E6E3DB;
+--act:#B45309;--act-bg:#FBF1E3;--good:#3F7A4B;--good-bg:#EDF5EE;
+--warn:#B4820A;--warn-bg:#FDF6E3;--bad:#B0413A;--bad-bg:#FBEEED;
+--blue:#2563EB;--blue-bg:#EFF4FF;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+*{box-sizing:border-box;margin:0}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1020px;margin:0 auto;padding:0 20px 80px}
+header{border-bottom:1px solid var(--line);background:var(--paper);position:sticky;top:0;z-index:10}
+.bar{max-width:1020px;margin:0 auto;padding:12px 20px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.bar h1{font-size:16px;font-weight:700}.bar .tag{font-family:var(--mono);font-size:10px;color:#fff;background:var(--bad);border-radius:3px;padding:2px 6px;font-weight:600}
+.bar .date{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.verdict{border:1px solid var(--bad);background:var(--bad-bg);border-radius:8px;padding:18px 20px;margin:20px 0 8px}
+.verdict .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--bad);text-transform:uppercase;font-weight:700}
+.verdict .v{font-size:17px;font-weight:700;margin:8px 0 6px;line-height:1.45}.verdict .sub{font-size:13.5px;color:var(--muted);line-height:1.55}
+section.blk{border:1px solid var(--line);border-radius:8px;background:#fff;margin:16px 0;overflow:hidden}
+.blk>.hd{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--box);flex-wrap:wrap}
+.blk>.hd .n{font-family:var(--mono);font-size:10.5px;color:var(--faint)}.blk>.hd .t{font-size:13.5px;font-weight:650}
+.blk>.hd .badge{margin-left:auto;font-family:var(--mono);font-size:9.5px;padding:2px 8px;border-radius:20px;color:#fff;font-weight:600}
+.blk>.hd .badge.key{background:var(--bad)}.blk>.hd .badge.new{background:var(--blue)}.blk>.hd .badge.mkt{background:#555}
+.blk>.bd{padding:16px 18px}
+.note{font-size:13px;color:var(--muted);line-height:1.6;margin:14px 0 0;padding:10px 12px;background:var(--paper);border-radius:5px;border-left:3px solid var(--grid)}
+.note b{color:var(--ink);font-weight:600}
+.intro{font-size:13.5px;color:var(--muted);line-height:1.55;margin-bottom:14px}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -18px;padding:0 18px}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:800px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;color:var(--faint);text-transform:uppercase;position:sticky;top:0;background:#fff}
+td.m{font-family:var(--mono);font-size:12px}tr:last-child td{border-bottom:none}
+.pill{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:20px;color:#fff;display:inline-block;font-weight:700;white-space:nowrap}
+.pill.hold{background:var(--good)}.pill.light{background:var(--act)}.pill.deep{background:var(--bad)}.pill.stop{background:#7C2D12}.pill.raise{background:var(--blue)}
+.b{font-family:var(--mono);font-size:10px;display:inline-block;background:var(--box);border-radius:3px;padding:1px 6px;margin:1px 2px}
+.b.first{background:var(--act-bg);border:1px solid #E8C98E;color:var(--act);font-weight:700}
+.tier{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;padding:10px 10px 5px;color:var(--faint);border-top:1px solid var(--line);background:var(--paper)}
+.proof{display:inline-flex;align-items:center;gap:3px}
+.proof-dot{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+.proof-dot.best{background:var(--good)}.proof-dot.ok{background:var(--act)}.proof-dot.bad{background:var(--bad)}.proof-dot.neutral{background:var(--grid)}
+.proof-pct{font-family:var(--mono);font-size:11px;font-weight:600}
+.conf{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
+.conf.hi{background:var(--good)}.conf.md{background:var(--warn)}.conf.lo{background:var(--bad)}
+.ci{font-family:var(--mono);font-size:9px;color:var(--faint);font-weight:400}
+.speed{font-family:var(--mono);font-size:9.5px;color:var(--faint);display:block;margin-top:2px}
+.posture{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:20px;color:#fff;display:inline-block;font-weight:700}
+.posture.attack{background:var(--good)}.posture.manage{background:var(--act)}.posture.defend{background:var(--bad)}.posture.sleep{background:var(--faint)}
+.delta{font-family:var(--mono);font-size:10.5px;font-weight:600}
+.delta.up{color:var(--good)}.delta.down{color:var(--bad)}.delta.flat{color:var(--faint)}
+.temp-row{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--grid)}
+.temp-row:last-child{border-bottom:none}
+.temp-week{font-family:var(--mono);font-size:11px;color:var(--faint);width:55px;flex-shrink:0}
+.temp-bar{flex:1;display:flex;gap:2px}
+.temp-seg{height:18px;border-radius:2px}.temp-seg.so{background:var(--act)}.temp-seg.rs{background:var(--good-bg);border:1px solid #A8D5AD}
+.temp-ratio{font-family:var(--mono);font-size:12px;font-weight:600;width:45px;text-align:right;flex-shrink:0}
+.temp-read{font-family:var(--mono);font-size:10px;color:var(--faint);width:95px;flex-shrink:0}
+.hm{border-collapse:collapse;min-width:500px}
+.hm th,.hm td{text-align:center;padding:8px 10px;font-family:var(--mono);font-size:12px}
+.hm .hot{background:#daf1dc;font-weight:700;color:var(--good)}
+.hm .warm{background:#fef9e7;color:var(--warn)}
+.hm .cold{background:#fce8e6;color:var(--bad)}
+.hm .neut{background:var(--paper);color:var(--faint)}
+.hm .sub-ci{display:block;font-size:8.5px;color:var(--faint);font-weight:400}
+.cov{font-family:var(--mono);font-size:11px;color:var(--muted);line-height:2}
+.cov b{color:var(--ink);font-weight:600}.cov .x{color:var(--bad)}.cov span{display:inline-block;margin-right:18px}
+.diff-box{background:var(--blue-bg);border:1px solid #C7D9F7;border-radius:6px;padding:14px 16px}
+.diff-hd{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
+.diff-row{display:flex;gap:8px;align-items:flex-start;padding:5px 0}
+.diff-row+.diff-row{border-top:1px solid #dde6f7}
+.diff-arrow{font-family:var(--mono);font-size:13px;width:18px;text-align:center;flex-shrink:0}
+.diff-txt{font-size:13.5px;line-height:1.5}
+@media(max-width:700px){body{font-size:14px}.wrap{padding:0 14px 60px}.verdict{padding:14px 16px}.verdict .v{font-size:15.5px}.blk>.bd{padding:14px}.table-wrap{margin:0 -14px;padding:0 14px}.note{font-size:12.5px}.cov span{display:block;margin-right:0}.temp-read{display:none}}
+@media(max-width:450px){.bar .date{margin-left:0;flex-basis:100%}.verdict .v{font-size:14.5px}table{font-size:12px}th,td{padding:7px 6px}}
+</style>
+</head><body>
+<header><div class="bar">
+  <h1>Khabar — What to Do With Your Stock</h1>
+  <span class="tag">LIVE</span>
+  <span class="date">week of 2026-10-10</span>
+</div></header>
+<div class="wrap"><div class="verdict">
+  <div class="lbl">This week's action</div>
+  <div class="v">Reduce jeans · slim discount to ~20% (51.9% ±18.8 vs 0% at 40%+). puffer, long-sleeve can take a price increase — discounting destroys demand.</div>
+  <div class="sub">Every recommendation carries a confidence level based on sample size and brand coverage.
+    Sell-through figures show margins of error. All findings are observed associations — not controlled experiments.</div>
+</div><section class="blk">
+  <div class="hd"><span class="n">01</span><span class="t">What changed since last week</span>
+    <span class="badge new">WEEKLY DIFF</span></div>
+  <div class="bd"><div class="diff-box">
+    <div class="diff-hd">Market moves &amp; price shifts</div>
+    <div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▲</span><div class="diff-txt"><b>Market temperature shifted</b> — sell-out/restock ratio moved from 2.19× to 3.37×. Demand pulling ahead of supply.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>or_egypt returned to launching</b> — 2,177 new products after little to no activity last week.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>coup returned to launching</b> — 676 new products after little to no activity last week.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>zodiac returned to launching</b> — 494 new products after little to no activity last week.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>khotwh raised t-shirts prices</b> — 770 increases, 0 cuts. Confidence signal.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>zodiac cut shirts prices broadly</b> — 158 cuts (avg −70.0%), 0 increases.</div></div>
+  </div>
+  <div class="note">Tracks brand launch volume, price-move patterns, and market temperature
+    week over week. Doesn't yet track board-position changes (e.g. a category moving from
+    HOLD to STOP) — that needs a stored snapshot of last week's board, planned as a follow-up.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">02</span>
+    <span class="t">The stock action board — what to do with each category</span>
+    <span class="badge key">KEY SECTION</span></div>
+  <div class="bd">
+    <p class="intro">Confidence: <span class="conf hi"></span> high
+      <span class="conf md"></span> medium <span class="conf lo"></span> low.
+      Sell-through shows ±margin of error. Speed = median days to first sell-out.</p>
+    <div class="table-wrap"><table><thead><tr>
+      <th>What you have</th><th>What to do</th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">full price</span></th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">1-24%</span></th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">25-39%</span></th>
+      <th>Sell-out<br><span style="font-weight:400;text-transform:none;">40%+</span></th>
+      <th>Speed &amp; context</th>
+    </tr></thead><tbody><tr><td colspan="7" class="tier">Fix now — you&#x27;re at the wrong depth</td></tr><tr>
+  <td>jeans · <b>slim</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 361 products</span></td>
+  <td><span class="pill light">Reduce to ~20%</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">19.2%</span></span><br><span class="ci">±4.3</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">51.9%</span></span><br><span class="ci">±18.8</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>
+  <td><span class="speed">103 days to sell</span></td>
+</tr><tr>
+  <td>shirts · <b>formal</b><br>
+    <span class="speed"><span class="conf md"></span> 13 brands · 551 products</span></td>
+  <td><span class="pill light">Reduce to ~20%</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">18.9%</span></span><br><span class="ci">±3.9</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">35.7%</span></span><br><span class="ci">±17.7</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">17.6%</span></span><br><span class="ci">±9.1</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">14.7%</span></span><br><span class="ci">±8.0</span></td>
+  <td><span class="speed">85 days to sell</span></td>
+</tr><tr>
+  <td>shirts · <b>linen</b><br>
+    <span class="speed"><span class="conf md"></span> 18 brands · 314 products</span></td>
+  <td><span class="pill light">Reduce to ~20%</span></td>
+  <td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">21.6%</span></span><br><span class="ci">±7.2</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">48.1%</span></span><br><span class="ci">±18.8</span></td><td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">21.6%</span></span><br><span class="ci">±6.6</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">14.3%</span></span><br><span class="ci">±18.3</span></td>
+  <td><span class="speed">88 days to sell</span></td>
+</tr><tr>
+  <td>trousers · <b>formal</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 316 products</span></td>
+  <td><span class="pill light">Reduce to ~20%</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">22.7%</span></span><br><span class="ci">±5.4</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">68.8%</span></span><br><span class="ci">±22.7</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">23.1%</span></span><br><span class="ci">±11.5</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">15.8%</span></span><br><span class="ci">±16.4</span></td>
+  <td><span class="speed">90 days to sell</span></td>
+</tr><tr>
+  <td>trousers · <b>wide-leg</b><br>
+    <span class="speed"><span class="conf md"></span> 19 brands · 611 products</span></td>
+  <td><span class="pill light">Reduce to ~20%</span></td>
+  <td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">30.8%</span></span><br><span class="ci">±4.7</span></td><td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">62.4%</span></span><br><span class="ci">±9.8</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">28.4%</span></span><br><span class="ci">±10.3</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">43.7%</span></span><br><span class="ci">±11.5</span></td>
+  <td><span class="speed">89 days to sell</span></td>
+</tr><tr><td colspan="7" class="tier">If discounting, commit — half-measures hurt</td></tr><tr>
+  <td>jeans · <b>wide-baggy</b><br>
+    <span class="speed"><span class="conf md"></span> 16 brands · 518 products</span></td>
+  <td><span class="pill deep">Hold or go 40%+</span></td>
+  <td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">36.6%</span></span><br><span class="ci">±5.8</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">58.8%</span></span><br><span class="ci">±10.8</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">36.8%</span></span><br><span class="ci">±10.1</span></td><td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">98.8%</span></span><br><span class="ci">±2.3</span></td>
+  <td><span class="speed">80 days to sell</span></td>
+</tr><tr>
+  <td>shirts · <b>long-sleeve</b><br>
+    <span class="speed"><span class="conf hi"></span> 17 brands · 1,538 products</span></td>
+  <td><span class="pill deep">Hold or go 40%+</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">24.9%</span></span><br><span class="ci">±2.5</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">27.6%</span></span><br><span class="ci">±11.5</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">26.3%</span></span><br><span class="ci">±5.6</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">43.7%</span></span><br><span class="ci">±11.5</span></td>
+  <td><span class="speed">101 days to sell</span></td>
+</tr><tr>
+  <td>shirts · <b>overshirt</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 492 products</span></td>
+  <td><span class="pill deep">Hold or go 40%+</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">23.6%</span></span><br><span class="ci">±5.5</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">34.2%</span></span><br><span class="ci">±15.1</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">11.0%</span></span><br><span class="ci">±4.2</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">36.8%</span></span><br><span class="ci">±21.7</span></td>
+  <td><span class="speed">111 days to sell</span></td>
+</tr><tr>
+  <td>shirts · <b>short-sleeve</b><br>
+    <span class="speed"><span class="conf hi"></span> 18 brands · 2,501 products</span></td>
+  <td><span class="pill deep">Hold or go 40%+</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">23.2%</span></span><br><span class="ci">±2.0</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">28.3%</span></span><br><span class="ci">±5.6</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">23.2%</span></span><br><span class="ci">±4.7</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">40.1%</span></span><br><span class="ci">±6.4</span></td>
+  <td><span class="speed">108 days to sell</span></td>
+</tr><tr>
+  <td>shorts · <b>sport</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 518 products</span></td>
+  <td><span class="pill deep">Hold or go 40%+</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">21.8%</span></span><br><span class="ci">±4.0</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">25.0%</span></span><br><span class="ci">±19.0</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">22.5%</span></span><br><span class="ci">±9.7</span></td><td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">29.6%</span></span><br><span class="ci">±17.2</span></td>
+  <td><span class="speed">100 days to sell</span></td>
+</tr><tr><td colspan="7" class="tier">Raise price — demand supports it</td></tr><tr>
+  <td>jackets · <b>puffer</b><br>
+    <span class="speed"><span class="conf md"></span> 12 brands · 509 products</span></td>
+  <td><span class="pill raise">Test price increase</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">20.4%</span></span><br><span class="ci">±3.8</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">8.7%</span></span><br><span class="ci">±11.5</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">8.7%</span></span><br><span class="ci">±8.1</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>
+  <td><span class="speed">107 days to sell</span></td>
+</tr><tr>
+  <td>t-shirts · <b>long-sleeve</b><br>
+    <span class="speed"><span class="conf md"></span> 10 brands · 245 products</span></td>
+  <td><span class="pill raise">Test price increase</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">42.1%</span></span><br><span class="ci">±6.8</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">11.8%</span></span><br><span class="ci">±10.8</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>
+  <td><span class="speed">100 days to sell</span></td>
+</tr><tr><td colspan="7" class="tier">No action needed — working fine</td></tr><tr>
+  <td>dresses · <b>maxi</b><br>
+    <span class="speed"><span class="conf lo"></span> 9 brands · 156 products</span></td>
+  <td><span class="pill hold">Hold — not enough data to call it</span></td>
+  <td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">20.4%</span></span><br><span class="ci">±7.6</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">69.4%</span></span><br><span class="ci">±15.1</span></td>
+  <td><span class="speed">50 days to sell</span></td>
+</tr><tr>
+  <td>dresses · <b>midi</b><br>
+    <span class="speed"><span class="conf lo"></span> 8 brands · 62 products</span></td>
+  <td><span class="pill hold">Hold — not enough data to call it</span></td>
+  <td><span class="proof"><span class="proof-dot ok"></span><span class="proof-pct">24.5%</span></span><br><span class="ci">±12.0</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">36.4%</span></span><br><span class="ci">±28.4</span></td>
+  <td><span class="speed">84 days to sell</span></td>
+</tr><tr>
+  <td>dresses · <b>mini</b><br>
+    <span class="speed"><span class="conf lo"></span> 9 brands · 91 products</span></td>
+  <td><span class="pill hold">Hold — not enough data to call it</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">12.3%</span></span><br><span class="ci">±8.5</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">0.0%</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>
+  <td><span class="speed">—</span></td>
+</tr><tr>
+  <td>hoodies · <b>pullover</b><br>
+    <span class="speed"><span class="conf md"></span> 8 brands · 582 products</span></td>
+  <td><span class="pill hold">Hold price</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">16.7%</span></span><br><span class="ci">±4.4</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">12.5%</span></span><br><span class="ci">±11.5</span></td><td><span class="proof"><span class="proof-dot bad"></span><span class="proof-pct">1.5%</span></span><br><span class="ci">±1.4</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>
+  <td><span class="speed">98 days to sell</span></td>
+</tr><tr>
+  <td>hoodies · <b>zip-up</b><br>
+    <span class="speed"><span class="conf lo"></span> 9 brands · 36 products</span></td>
+  <td><span class="pill hold">Hold — not enough data to call it</span></td>
+  <td><span class="proof"><span class="proof-dot best"></span><span class="proof-pct" style="color:var(--good);">11.4%</span></span><br><span class="ci">±10.5</span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td><td><span class="proof"><span class="proof-dot neutral"></span><span class="proof-pct">—</span></span></td>
+  <td><span class="speed">—</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>How to read this:</b> Green dot = best sell-through at that depth.
+      ± figures are approximate 95% confidence margins.
+      <br><br><b>Important:</b> These are <b>observed associations</b> — products discounted to 40%
+      may already be the ones that weren't selling. Use alongside the age × discount table (§03)
+      for a more complete picture.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">03</span>
+    <span class="t">Does product age change the picture? — age × discount heatmap</span></div>
+  <div class="bd">
+    <p class="intro">Sell-through by product age × discount depth. Shows how the two interact.</p>
+    <div class="table-wrap"><table class="hm"><thead><tr>
+      <th style="text-align:left;">Product age</th>
+      <th>Full price</th><th>1-19%</th><th>20-29%</th><th>30-39%</th><th>40%+</th>
+    </tr></thead><tbody><tr><td style="text-align:left;"><b>0-14d</b></td><td class="cold">14.1%<span class="sub-ci">n=4,211</span></td><td class="cold">5.7%<span class="sub-ci">n=35</span></td><td class="warm">17.9%<span class="sub-ci">n=28 ⚠</span></td><td class="cold">3.2%<span class="sub-ci">n=31</span></td><td class="hot">59.1%<span class="sub-ci">n=430</span></td></tr><tr><td style="text-align:left;"><b>15-30d</b></td><td class="warm">28.4%<span class="sub-ci">n=994</span></td><td class="warm">39.1%<span class="sub-ci">n=23 ⚠</span></td><td class="hot">61.5%<span class="sub-ci">n=26 ⚠</span></td><td class="neut">—</td><td class="hot">85.4%<span class="sub-ci">n=246</span></td></tr><tr><td style="text-align:left;"><b>31-60d</b></td><td class="hot">41.2%<span class="sub-ci">n=854</span></td><td class="hot">50.0%<span class="sub-ci">n=72</span></td><td class="hot">48.4%<span class="sub-ci">n=91</span></td><td class="hot">71.4%<span class="sub-ci">n=35</span></td><td class="hot">78.9%<span class="sub-ci">n=185</span></td></tr><tr><td style="text-align:left;"><b>60d+</b></td><td class="warm">21.7%<span class="sub-ci">n=21,683</span></td><td class="warm">30.2%<span class="sub-ci">n=1,522</span></td><td class="warm">17.3%<span class="sub-ci">n=4,992</span></td><td class="hot">56.5%<span class="sub-ci">n=720</span></td><td class="hot">48.3%<span class="sub-ci">n=1,900</span></td></tr></tbody></table></div>
+    <div class="note"><b>Key insights:</b> 15-30 day products respond best to light discounts.
+      31-60 day products need any discount at all. 0-14 day products should generally launch
+      at full price. Cells with n &lt; 30 marked ⚠ — low confidence.
+      <br><br>All figures are <b>observed associations</b> across the entire market, not controlled experiments.
+      n = sample size.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">04</span>
+    <span class="t">What your competitors did this week</span>
+    <span class="badge mkt">MARKET CONTEXT</span></div>
+  <div class="bd">
+    <div class="table-wrap"><table><thead><tr>
+      <th>Brand</th><th>Launches</th><th>vs last wk</th>
+      <th>Price chg</th><th>Sell-outs</th><th>Posture</th>
+    </tr></thead><tbody><tr>
+  <td><b>or_egypt</b></td>
+  <td class="m">2,177</td><td><span class="delta up">▲ 0</span></td>
+  <td class="m">0</td><td class="m">733</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>coup</b></td>
+  <td class="m">676</td><td><span class="delta up">▲ 0</span></td>
+  <td class="m">69 ↕</td><td class="m">0</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>zodiac</b></td>
+  <td class="m">494</td><td><span class="delta up">▲ 0</span></td>
+  <td class="m">481 ↓</td><td class="m">818</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>lc_waikiki</b></td>
+  <td class="m">371</td><td><span class="delta flat">≈</span></td>
+  <td class="m">914 ↕</td><td class="m">29</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>rojada</b></td>
+  <td class="m">367</td><td><span class="delta up">▲ 0</span></td>
+  <td class="m">99 ↓</td><td class="m">703</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>mobaco</b></td>
+  <td class="m">324</td><td><span class="delta up">▲ 0</span></td>
+  <td class="m">0</td><td class="m">83</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>defacto</b></td>
+  <td class="m">229</td><td><span class="delta flat">≈</span></td>
+  <td class="m">410 ↓</td><td class="m">0</td>
+  <td><span class="posture manage">Managing</span></td>
+</tr><tr>
+  <td><b>ravin</b></td>
+  <td class="m">218</td><td><span class="delta down">▼ 873</span></td>
+  <td class="m">0</td><td class="m">1,512</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>andora</b></td>
+  <td class="m">122</td><td><span class="delta up">▲ 2</span></td>
+  <td class="m">0</td><td class="m">343</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>arafa</b></td>
+  <td class="m">114</td><td><span class="delta flat">≈</span></td>
+  <td class="m">0</td><td class="m">1,557</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>khotwh</b></td>
+  <td class="m">71</td><td><span class="delta up">▲ 0</span></td>
+  <td class="m">1,446 ↑</td><td class="m">512</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr><tr>
+  <td><b>tie_house</b></td>
+  <td class="m">60</td><td><span class="delta flat">≈</span></td>
+  <td class="m">15 ↑</td><td class="m">547</td>
+  <td><span class="posture attack">Attacking</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>Attacking</b> = launching + growing. <b>Managing</b> = adjusting existing.
+      <b>Defending</b> = cutting prices. <b>Quiet</b> = minimal activity.
+      Arrows: ↑ mostly increases, ↓ mostly cuts, ↕ mixed.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">05</span>
+    <span class="t">Market temperature — is the window closing?</span></div>
+  <div class="bd"><div class="temp-row">
+  <span class="temp-week">09-14</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:69%;"></div>
+    <div class="temp-seg rs" style="width:31%;"></div></div>
+  <span class="temp-ratio" style="color:var(--act);">2.24×</span>
+  <span class="temp-read">Demand ahead</span>
+</div><div class="temp-row">
+  <span class="temp-week">09-21</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:69%;"></div>
+    <div class="temp-seg rs" style="width:31%;"></div></div>
+  <span class="temp-ratio" style="color:var(--act);">2.19×</span>
+  <span class="temp-read">Demand ahead</span>
+</div><div class="temp-row">
+  <span class="temp-week">09-28</span>
+  <div class="temp-bar"><div class="temp-seg so" style="width:77%;"></div>
+    <div class="temp-seg rs" style="width:23%;"></div></div>
+  <span class="temp-ratio" style="color:var(--bad);">3.37×</span>
+  <span class="temp-read">Peak demand</span>
+</div>
+    <div class="note"><b>What this means:</b> Above 1× = demand ahead of supply.
+      Below 1× = supply catching up. Shows the last 4 <b>complete</b> weeks —
+      the current in-progress week is excluded since it's always partial when this report runs.
+      Categories where you're holding price still have room. Categories where everyone's
+      discounting won't recover.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">06</span><span class="t">Methodology & reliability</span></div>
+  <div class="bd"><div class="cov">
+    <span><b>Sell-through by depth:</b> witnessed sell-outs cross-referenced with current discount, 21 days</span>
+    <span><b>Prices:</b> each product's latest snapshot within the last 8 days (not a single fixed date)</span>
+    <span><b>Discount depth:</b> uses first-observed price (not brand's compare-at, which brands inflate)</span>
+    <span><b>Confidence intervals:</b> approximate 95% binomial CI — within-brand correlation means true uncertainty is wider</span>
+    <span><b>Speed to sell:</b> median days from launch to first witnessed sell-out</span>
+    <span><b>Age × discount:</b> all categories combined — patterns may differ within subcategories</span>
+    <span><b>Market temperature:</b> last 4 complete calendar weeks, current in-progress week excluded</span>
+    <span class="x">All findings are <b>observed associations</b>, not causal estimates</span>
+    <span class="x">Excludes DeFacto sell-outs (stock unreliable), Tree, Dalydress (phantom data)</span>
+    <span class="x">Excludes sweatshirts/hoodies mistagged as "shirts" by a known classifier bug (~15% of the category) — fix pending a taxonomy backfill</span>
+  </div></div>
+</section></div>
+</body></html>

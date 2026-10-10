@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Khabar — What to Make & At What Price</title>
+<style>
+:root{--paper:#FAFAF8;--ink:#1B1B19;--muted:#6C6A64;--faint:#9A978F;
+--line:#DAD7CF;--box:#EFEDE7;--grid:#E6E3DB;
+--act:#B45309;--act-bg:#FBF1E3;--good:#3F7A4B;--good-bg:#EDF5EE;
+--warn:#B4820A;--warn-bg:#FDF6E3;--bad:#B0413A;--bad-bg:#FBEEED;
+--blue:#2563EB;--blue-bg:#EFF4FF;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+*{box-sizing:border-box;margin:0}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1020px;margin:0 auto;padding:0 20px 80px}
+header{border-bottom:1px solid var(--line);background:var(--paper);position:sticky;top:0;z-index:10}
+.bar{max-width:1020px;margin:0 auto;padding:12px 20px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.bar h1{font-size:16px;font-weight:700}.bar .tag{font-family:var(--mono);font-size:10px;color:#fff;background:var(--good);border-radius:3px;padding:2px 6px;font-weight:600}
+.bar .date{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.verdict{border:1px solid var(--good);background:var(--good-bg);border-radius:8px;padding:18px 20px;margin:20px 0 8px}
+.verdict .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--good);text-transform:uppercase;font-weight:700}
+.verdict .v{font-size:17px;font-weight:700;margin:8px 0 6px;line-height:1.45}.verdict .sub{font-size:13.5px;color:var(--muted);line-height:1.55}
+section.blk{border:1px solid var(--line);border-radius:8px;background:#fff;margin:16px 0;overflow:hidden}
+.blk>.hd{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--box);flex-wrap:wrap}
+.blk>.hd .n{font-family:var(--mono);font-size:10.5px;color:var(--faint);flex-shrink:0}
+.blk>.hd .t{font-size:13.5px;font-weight:650}
+.blk>.hd .badge{margin-left:auto;font-family:var(--mono);font-size:9.5px;padding:2px 8px;border-radius:20px;color:#fff;font-weight:600;flex-shrink:0}
+.blk>.hd .badge.key{background:var(--good)}.blk>.hd .badge.new{background:var(--blue)}
+.blk>.bd{padding:16px 18px}
+.note{font-size:13px;color:var(--muted);line-height:1.6;margin:14px 0 0;padding:10px 12px;background:var(--paper);border-radius:5px;border-left:3px solid var(--grid)}
+.note b{color:var(--ink);font-weight:600}
+.intro{font-size:13.5px;color:var(--muted);line-height:1.55;margin-bottom:14px}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -18px;padding:0 18px}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:860px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;color:var(--faint);text-transform:uppercase;position:sticky;top:0;background:#fff}
+td.m{font-family:var(--mono);font-size:12px}tr:last-child td{border-bottom:none}
+.pill{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:20px;color:#fff;display:inline-block;font-weight:700;white-space:nowrap}
+.pill.go{background:var(--good)}.pill.buy{background:var(--act)}.pill.watch{background:var(--faint)}.pill.avoid{background:var(--bad)}
+.b{font-family:var(--mono);font-size:10px;display:inline-block;background:var(--box);border-radius:3px;padding:1px 6px;margin:1px 2px;color:var(--ink);white-space:nowrap}
+.b.top{background:var(--act-bg);border:1px solid #E8C98E;color:var(--act);font-weight:700}
+.tier{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;padding:10px 10px 5px;color:var(--faint);border-top:1px solid var(--line);background:var(--paper)}
+.timing{font-family:var(--mono);font-size:10.5px;font-weight:700;white-space:nowrap}
+.timing.go{color:var(--good)}.timing.soon{color:var(--act)}.timing.slow{color:var(--bad)}
+.spark{display:inline-flex;align-items:end;gap:1px;height:16px;vertical-align:middle;margin:0 4px}
+.spark i{width:4px;border-radius:1px;background:var(--act);opacity:.7}
+.price-pill{font-family:var(--mono);font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:4px;display:inline-block;white-space:nowrap;background:var(--good-bg);color:var(--good);border:1px solid #A8D5AD}
+.conf{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
+.conf.hi{background:var(--good)}.conf.md{background:var(--warn)}.conf.lo{background:var(--bad)}
+.ci{font-family:var(--mono);font-size:9px;color:var(--faint);font-weight:400}
+.speed{font-family:var(--mono);font-size:9.5px;color:var(--faint);display:block;margin-top:2px}
+.avoid-item{display:flex;gap:10px;padding:12px 0;border-bottom:1px solid var(--grid);align-items:flex-start}
+.avoid-item:last-child{border-bottom:none}
+.avoid-x{font-family:var(--mono);font-size:14px;color:var(--bad);font-weight:800;flex-shrink:0;width:20px;text-align:center;margin-top:1px}
+.avoid-body{font-size:13.5px;line-height:1.55}.avoid-body strong{font-weight:650}.avoid-body .reason{color:var(--muted)}
+.cov{font-family:var(--mono);font-size:11px;color:var(--muted);line-height:2}
+.cov b{color:var(--ink);font-weight:600}.cov .x{color:var(--bad)}.cov span{display:inline-block;margin-right:18px}
+.diff-box{background:var(--blue-bg);border:1px solid #C7D9F7;border-radius:6px;padding:14px 16px}
+.diff-hd{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
+.diff-row{display:flex;gap:8px;align-items:flex-start;padding:5px 0}
+.diff-row+.diff-row{border-top:1px solid #dde6f7}
+.diff-arrow{font-family:var(--mono);font-size:13px;width:18px;text-align:center;flex-shrink:0}
+.diff-txt{font-size:13.5px;line-height:1.5}
+.tabs{background:var(--paper);border:1px solid var(--grid);border-radius:6px;padding:14px 16px}
+.tab-nav{display:flex;gap:6px;border-bottom:1px solid var(--grid);padding-bottom:10px;margin-bottom:14px;flex-wrap:wrap}
+.tab-btn{font-family:var(--mono);font-size:10.5px;font-weight:600;padding:4px 10px;border-radius:4px;border:1px solid var(--grid);background:#fff;color:var(--muted);cursor:pointer}
+.tab-btn.active{background:var(--ink);color:#fff;border-color:var(--ink)}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.spec-grid{display:flex;gap:24px;flex-wrap:wrap}
+.spec-col{flex:1;min-width:240px}
+.spec-title{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
+.bar-row{display:flex;align-items:center;gap:8px;margin:5px 0}
+.bar-lbl{font-family:var(--mono);font-size:10.5px;color:var(--muted);width:44px;text-align:right;flex-shrink:0}
+.bar-track{flex:1;height:16px;background:var(--grid);border-radius:3px;position:relative;overflow:hidden}
+.bar-fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
+.bar-val{position:absolute;right:5px;top:0;font-family:var(--mono);font-size:9.5px;line-height:16px;color:var(--ink);font-weight:600}
+.sp-block{margin:0 0 22px}.sp-block:last-child{margin-bottom:0}
+.sp-name{font-size:13px;font-weight:650;margin-bottom:4px}
+.sp-name span{font-weight:400;color:var(--faint);font-size:11px;margin-left:6px}
+.sp-axis{position:relative;height:40px;background:var(--paper);border:1px solid var(--grid);border-radius:4px;margin:4px 0 2px}
+.sp-zone{position:absolute;top:0;bottom:0;border-radius:3px}
+.sp-zone.peak{background:rgba(63,122,75,.12);border:1px dashed rgba(63,122,75,.35)}
+.sp-dot{position:absolute;top:11px;height:18px;font-family:var(--mono);font-size:9px;background:var(--box);border:1px solid var(--line);border-radius:3px;padding:0 4px;line-height:16px;white-space:nowrap;transform:translateX(-50%);z-index:2}
+.sp-zone-lbl{position:absolute;top:1px;font-family:var(--mono);font-size:7.5px;letter-spacing:.03em;text-transform:uppercase;font-weight:600;padding:0 4px}
+.sp-zone-lbl.pk{color:var(--good);right:3px}
+.sp-ticks{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8.5px;color:var(--faint);padding:0 1px}
+@media(max-width:700px){body{font-size:14px}.wrap{padding:0 14px 60px}.verdict{padding:14px 16px}.verdict .v{font-size:15.5px}.blk>.bd{padding:14px}.table-wrap{margin:0 -14px;padding:0 14px}.note{font-size:12.5px}.cov span{display:block;margin-right:0}.spec-grid{flex-direction:column;gap:14px}}
+@media(max-width:450px){.bar .date{margin-left:0;flex-basis:100%}.verdict .v{font-size:14.5px}table{font-size:12px}th,td{padding:7px 6px}.b{font-size:9px;padding:1px 4px}}
+</style>
+</head><body>
+<header><div class="bar">
+  <h1>Khabar — What to Make &amp; At What Price</h1>
+  <span class="tag">LIVE</span>
+  <span class="date">week of 2026-10-10</span>
+</div></header>
+<div class="wrap"><div class="verdict">
+  <div class="lbl">This week's action</div>
+  <div class="v">No strong buy signals this week — market in transition.</div>
+  <div class="sub">Every row carries a confidence level, margin of error, and demand index.
+    Bestseller persistence distinguishes real demand from one-week spikes.
+    All price-band findings are observed associations — not controlled experiments.</div>
+</div><section class="blk">
+  <div class="hd"><span class="n">01</span><span class="t">What changed since last week</span>
+    <span class="badge new">WEEKLY DIFF</span></div>
+  <div class="bd"><div class="diff-box">
+    <div class="diff-hd">Board changes &amp; price moves</div>
+    <div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>or_egypt returned to launching</b> — 2,177 new products after little to no activity last week.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>coup returned to launching</b> — 676 new products after little to no activity last week.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>zodiac returned to launching</b> — 494 new products after little to no activity last week.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>ravin slowed sharply</b> — 218 launches this week, down from 873.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>carina slowed sharply</b> — 22 launches this week, down from 495.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>khotwh raised t-shirts prices</b> — 770 increases, 0 cuts. Confidence signal.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>zodiac cut shirts prices broadly</b> — 158 cuts (avg −70.0%), 0 increases.</div></div>
+  </div>
+  <div class="note">Tracks brand launch volume and price-move patterns week over week.
+    Doesn't yet track board-position changes (e.g. a subcategory moving from WATCH to BUY) —
+    that needs a stored snapshot of last week's board, which is a planned follow-up.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">02</span>
+    <span class="t">The action board — what to make, at what price, and when</span>
+    <span class="badge key">KEY SECTION</span></div>
+  <div class="bd">
+    <p class="intro">Confidence: <span class="conf hi"></span> high
+      <span class="conf md"></span> medium <span class="conf lo"></span> low.
+      Bestseller persistence = avg weeks products stayed on lists (out of 8).
+      Demand index = sell-outs + products still out of stock.</p>
+    <div class="table-wrap">
+    <table><thead><tr>
+      <th>What to make</th><th>Action</th><th>Price at</th>
+      <th>Demand proof</th><th>When</th><th>Who's running out</th>
+    </tr></thead><tbody><tr><td colspan="6" class="tier">Watch — don't commit yet</td></tr><tr>
+  <td>sweatshirts · <b>long-sleeve</b><br>
+    <span class="speed"><span class="conf lo"></span> 7 brands · 619 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">500-699</span><br>
+    <span class="ci">43.8% ±9.5 sell-through</span></td>
+  <td><span class="spark"><i style="height:71%"></i><i style="height:71%"></i><i style="height:71%"></i><i style="height:85%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+40%</span><br>
+    <span class="speed">Persistence: 7.3/8 · 5 strong, 2 med, 0 weak</span>
+    <span class="speed">Demand: At 500-699 EGP: 46 sold out (of 135 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 115 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 1.7×</span></td>
+  <td><span class="b top">town_team</span><span class="b top">tomato</span><span class="b top">activ</span><span class="b">+2</span></td>
+</tr><tr>
+  <td>jackets · <b>windbreaker</b><br>
+    <span class="speed"><span class="conf lo"></span> 6 brands · 137 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">23.5% ±20.2 sell-through</span></td>
+  <td><span class="spark"><i style="height:59%"></i><i style="height:59%"></i><i style="height:62%"></i><i style="height:70%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:92%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+56%</span><br>
+    <span class="speed">Persistence: 6.9/8 · 16 strong, 11 med, 1 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 4 sold out (of 21 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 106 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.1×</span></td>
+  <td><span class="b top">town_team</span><span class="b top">andora</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>How to read this:</b> Each row is a production decision.
+      The demand proof column shows three layers: bestseller trend, persistence score,
+      and demand index. Price sell-through is an <b>observed association</b> — premium brands
+      may sell more because of brand strength, not price alone.
+      <br><br><b>Newness caveat:</b> Products under 14 days on bestseller lists may reflect
+      small initial stock, not strong demand. Persistence score helps distinguish:
+      1-2 weeks = could be scarcity, 6+ weeks = proven demand.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">03</span>
+    <span class="t">Don't make these — they look like gaps but they're traps</span></div>
+  <div class="bd"><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>t-shirts · graphic-printed</strong>
+    <span class="ci"><span class="conf hi"></span> high confidence</span> —
+    <span class="reason">10212 products in discount escalation (avg 41.9% depth).
+    Led by khotwh, lc_waikiki, town_team. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>sweaters · crewneck</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">4391 products in discount escalation (avg 37.9% depth).
+    Led by khotwh, mens_club, lc_waikiki. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>hoodies · pullover</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">2889 products in discount escalation (avg 25.1% depth).
+    Led by khotwh. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>shirts · short-sleeve</strong>
+    <span class="ci"><span class="conf hi"></span> high confidence</span> —
+    <span class="reason">2473 products in discount escalation (avg 45.1% depth).
+    Led by khotwh, town_team, lc_waikiki. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>shirts · long-sleeve</strong>
+    <span class="ci"><span class="conf hi"></span> high confidence</span> —
+    <span class="reason">2316 products in discount escalation (avg 37.8% depth).
+    Led by khotwh, lc_waikiki, town_team. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>shirts · overshirt</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">2072 products in discount escalation (avg 36.2% depth).
+    Led by khotwh, lc_waikiki, cizaro. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>trousers · jogger-style</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">1812 products in discount escalation (avg 33.8% depth).
+    Led by lc_waikiki, khotwh. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>t-shirts · basic</strong>
+    <span class="ci"><span class="conf hi"></span> high confidence</span> —
+    <span class="reason">1730 products in discount escalation (avg 43.8% depth).
+    Led by lc_waikiki, khotwh, town_team. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div></div>
+</section><section class="blk">
+  <div class="hd"><span class="n">04</span>
+    <span class="t">Are you early or late? — sell-outs vs restocks (last 21 days)</span></div>
+  <div class="bd">
+    <p class="intro">Ratio above 2× = gap wide open. 1-2× = narrowing. Counts are witnessed events over the last 21 days — small categories will naturally show small counts.</p>
+    <div class="table-wrap"><table><thead><tr>
+      <th>Opportunity</th><th>Sell-outs<br><span style="font-weight:400;text-transform:none;">21 days</span></th><th>Restocks<br><span style="font-weight:400;text-transform:none;">21 days</span></th><th>Gap</th>
+      <th>Demand index</th><th>Top restockers</th>
+    </tr></thead><tbody><tr>
+  <td>jackets · <b>windbreaker</b></td>
+  <td class="m">34</td><td class="m">16</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.1×</td>
+  <td class="m">21 + 11 = 32</td>
+  <td><span class="b">town_team</span><span class="b">andora</span><span class="b">tomato</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>sweatshirts · <b>long-sleeve</b></td>
+  <td class="m">324</td><td class="m">195</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--warn);">NARROWING 1.7×</td>
+  <td class="m">135 + 85 = 220</td>
+  <td><span class="b">town_team</span><span class="b">tomato</span><span class="b">activ</span><span class="b">ravin</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>Demand index:</b> "sold out" + "still out of stock" = estimated total demand
+      including what couldn't be sold because it was already gone. All figures cover the last 21 days only.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">07</span><span class="t">Methodology & reliability</span></div>
+  <div class="bd"><div class="cov">
+    <span><b>Confidence levels:</b> based on brand count (12+ = high), product count (500+ = high), sell-out sample (200+ = high)</span>
+    <span><b>Bestseller persistence:</b> avg weeks each product appeared on bestseller lists out of 8 weeks of daily snapshots from 19 Shopify brands</span>
+    <span><b>Demand index:</b> sell-outs + products still out of stock — partial proxy for unmet demand, not a unit count</span>
+    <span><b>Confidence intervals:</b> approximate 95% binomial CI — within-brand correlation means true uncertainty is wider</span>
+    <span><b>Speed to sell:</b> median days from product launch to first witnessed sell-out — truncated for products under 21 days old</span>
+    <span><b>Prices:</b> each product's latest snapshot within the last 8 days (not a single fixed date)</span>
+    <span class="x">All price-band findings are <b>observed associations</b> — premium brands may sell more because of brand strength, not price</span>
+    <span class="x">Excludes DeFacto (stock unreliable), Tree, Dalydress. Under-tagged: Carina 17%, Mlameh 33%, Activ 40%</span>
+    <span class="x">Excludes sweatshirts/hoodies mistagged as "shirts" by a known classifier bug (~15% of the category) — fix pending a taxonomy backfill</span>
+  </div></div>
+</section></div>
+</body></html>
