@@ -56,21 +56,12 @@ LATEST_PRICE_CTE = f"""
     )
 """
 
-BOARD_SUBCATS = [
-    ("t-shirts", "short-sleeve"), ("t-shirts", "graphic-printed"),
-    ("t-shirts", "oversized"), ("t-shirts", "basic"),
-    ("shirts", "short-sleeve"), ("shirts", "linen"),
-    ("shirts", "overshirt"), ("shirts", "long-sleeve"), ("shirts", "formal"),
-    ("jeans", "wide-baggy"), ("jeans", "slim"),
-    ("trousers", "jogger-style"), ("trousers", "wide-leg"), ("trousers", "cargo"),
-    ("trousers", "formal"), ("shorts", "sport"), ("shorts", "denim"),
-    ("sweaters", "crewneck"), ("dresses", "mini"),
-]
-
-AVOID_CATS = [
-    ("trousers", "jogger-style"), ("sweaters", "crewneck"),
-    ("dresses", "mini"), ("shorts", "denim"),
-]
+# v16.0: BOARD_SUBCATS and AVOID_CATS removed. BOARD_SUBCATS was dead code —
+# defined but never referenced anywhere; the board was always unscoped (any
+# subcategory crossing the stockout threshold qualifies). AVOID_CATS was a
+# hardcoded list presented as a live weekly finding but never actually
+# updated — replaced by the live computation in render() (search "v16.0 fix"
+# near "live_avoid").
 
 PRICE_BANDS = [
     ("under_300", "under 300", 0, 300),
@@ -80,8 +71,21 @@ PRICE_BANDS = [
     ("1000p",     "1,000+",   1000, 999999),
 ]
 
+# v16.0 fix: these used to be hardcoded here and had drifted out of sync with
+# report_lib.py's own exclusion sets (R.EXCLUDE_BRANDS / R.EXCLUDE_STOCK_BRANDS,
+# the intended single source of truth, refreshed from ref_excluded_brands on
+# every R.connect()). Default values below are only a pre-connect placeholder;
+# main() overwrites both from R.EXCLUDE_STOCK_BRANDS / R.EXCLUDE_BRANDS right
+# after connecting, so this file can no longer silently fall behind the real
+# list (e.g. it was missing lc_waikiki and mobaco before this fix).
 EXCLUDED_SELL = "('tree','dalydress','defacto')"
 EXCLUDED_ALL  = "('tree','dalydress')"
+
+
+def _sql_tuple(brands):
+    """Turn a set of brand names into a safe SQL ('a','b',...) literal."""
+    names = sorted(brands) or ["__none__"]
+    return "(" + ",".join("'" + b.replace("'", "''") + "'" for b in names) + ")"
 
 # Taxonomy stopgap (Aug 2026): the scraper's CATEGORY_MAP checks "shirts"
 # (keyword "shirt") before "sweatshirts" (keyword "sweatshirt") and before
@@ -108,9 +112,15 @@ def esc(s):
 
 
 def ci95(p, n):
-    """Approximate 95% CI half-width for a proportion."""
-    if n < 2 or p <= 0 or p >= 1:
+    """Approximate 95% CI half-width for a proportion.
+    v16.0 fix: the old version returned a flat 0 whenever p was 0% or 100% —
+    which made a tiny sample that happened to sell out completely look like
+    the MOST certain number in the report, when small-n extreme proportions
+    are actually the LEAST reliable. Clamp p away from the exact 0/1 edge
+    (Wilson-style continuity nudge) instead of short-circuiting to 0."""
+    if n < 2:
         return 0
+    p = min(max(p, 0.5 / n), 1 - 0.5 / n)
     return round(1.96 * math.sqrt(p * (1 - p) / n) * 100, 1)
 
 
@@ -488,6 +498,18 @@ def build_board(conn):
     di = q_demand_index(conn)
     bs = q_brand_stockouts(conn)
     ci = q_confidence_inputs(conn)
+    dist = q_distress(conn)
+
+    # v16.0 fix: computed once, here, and used by BOTH assign_verdict()
+    # (so a distressed subcategory can't get a "Make now" in §02) and
+    # render()'s §03 avoid list (so the two sections always agree on
+    # exactly which subcategories are flagged this week).
+    distressed_pairs = set()
+    if not dist.empty:
+        tot = dist.groupby(["cat", "sub"])["escalating"].sum().reset_index()
+        distressed_pairs = set(
+            zip(tot[tot["escalating"] >= 15]["cat"], tot[tot["escalating"] >= 15]["sub"])
+        )
 
     rows = []
     for _, r in ab.iterrows():
@@ -507,16 +529,40 @@ def build_board(conn):
         else:
             trend_pct = 0
 
+        # v16.0 fix (was: pick whichever price band has the highest sell-
+        # through RATE, full stop — a thin, high-price batch with a handful
+        # of products could win over a band doing most of the real volume.
+        # Verified live: t-shirts·graphic-printed recommended 700-999 EGP
+        # on 92 products/29 sell-outs while under-300 EGP had 1,623
+        # products/371 sell-outs — 13x the real volume — and lost on rate
+        # alone). A band can now only win if it also carries at least 20%
+        # of the subcategory's total observed sell-out volume. If nothing
+        # clears that bar, fall back to whichever band has the most
+        # absolute sell-out volume, and let the confidence score (below)
+        # mark that as a weaker read rather than presenting it as settled.
         pbd = pb[(pb["cat"] == cat) & (pb["sub"] == sub)]
-        best_band, best_rate, best_ci, best_n = None, 0, 0, 0
+        total_band_sellout = int(pbd["with_sellout"].sum()) if not pbd.empty else 0
+        candidates = []
         for _, pr in pbd.iterrows():
             if pr["products"] > 0:
                 rate = round(100 * pr["with_sellout"] / pr["products"], 1)
-                if rate > best_rate:
-                    best_rate = rate
-                    best_band = pr["price_band"]
-                    best_n = int(pr["products"])
-                    best_ci = ci95(rate/100, best_n)
+                vol_share = (pr["with_sellout"] / total_band_sellout) if total_band_sellout else 0
+                candidates.append({
+                    "band": pr["price_band"], "rate": rate,
+                    "n": int(pr["products"]), "sellout": int(pr["with_sellout"]),
+                    "vol_share": vol_share,
+                })
+        qualified = [c for c in candidates if c["vol_share"] >= 0.20]
+        pool = qualified if qualified else candidates
+        best_band, best_rate, best_ci, best_n, best_band_sellout = None, 0, 0, 0, 0
+        band_backed_by_volume = bool(qualified)
+        if pool:
+            winner = max(pool, key=lambda c: c["rate"])
+            best_band = winner["band"]
+            best_rate = winner["rate"]
+            best_n = winner["n"]
+            best_band_sellout = winner["sellout"]
+            best_ci = ci95(best_rate / 100, best_n)
 
         spd = sp[(sp["cat"] == cat) & (sp["sub"] == sub)]
         med_days = int(spd.iloc[0]["median_days"]) if not spd.empty else None
@@ -539,7 +585,25 @@ def build_board(conn):
             n_sellout = int(cid.iloc[0]["with_sellout"])
         else:
             n_brands, n_products, n_sellout = int(r["brands"]), 0, 0
-        conf = conf_level(n_brands, n_products, n_sellout)
+        category_conf = conf_level(n_brands, n_products, n_sellout)
+
+        # v16.0 fix (was: confidence badge was computed from category-wide
+        # totals only, so a 92-product price band could display "hi"
+        # confidence borrowed from the category's 3,000+ total — and that
+        # borrowed confidence is what let a weak band-level recommendation
+        # reach the strongest verdict tier). Confidence now also reflects
+        # the winning band's own sample, and is downgraded a step if the
+        # band wasn't backed by a real volume share.
+        _tiers = {"hi": 2, "md": 1, "lo": 0}
+        if best_n >= 200 and best_band_sellout >= 50:
+            band_conf = "hi"
+        elif best_n >= 60 and best_band_sellout >= 15:
+            band_conf = "md"
+        else:
+            band_conf = "lo"
+        conf = min([category_conf, band_conf], key=lambda c: _tiers[c])
+        if not band_backed_by_volume and conf == "hi":
+            conf = "md"
 
         band_labels = {k: l for k, l, _, _ in PRICE_BANDS}
         price_label = band_labels.get(best_band, "—")
@@ -552,8 +616,11 @@ def build_board(conn):
             "spark_vals": spark_vals, "trend_pct": trend_pct,
             "price_label": price_label, "best_band": best_band,
             "best_rate": best_rate, "best_ci": best_ci, "best_n": best_n,
+            "best_band_sellout": best_band_sellout,
+            "band_backed_by_volume": band_backed_by_volume,
             "med_days": med_days, "sold_out": sold_out, "still_out": still_out,
             "brand_list": brand_list,
+            "in_distress": (cat, sub) in distressed_pairs,
         })
 
     return rows
@@ -583,7 +650,11 @@ def assign_verdict(row):
     cluster (6-14%) vs where legitimate ones sit (18%+).
     """
     cat, sub = row["cat"], row["sub"]
-    if (cat, sub) in AVOID_CATS:
+    # v16.0 fix: was a hardcoded 4-category list (AVOID_CATS) that never
+    # updated; now the same live-computed distress flag that drives §03,
+    # so this section can't recommend "Make now" on something §03 is
+    # warning clients away from the same week.
+    if row.get("in_distress"):
         return "avoid", "Don't make"
     if row["best_rate"] < 15:
         return "avoid", "Don't make"
@@ -729,6 +800,15 @@ def render_board_row(row):
 
     speed_txt = f"{row['med_days']} days to sell" if row["med_days"] else "—"
 
+    # v16.0 fix (was: this line showed sell-outs summed across the WHOLE
+    # subcategory at every price point, sitting right next to the one
+    # recommended price band — reading as if that volume sold at that
+    # price. Verified live: t-shirts·graphic-printed showed "602 sold out"
+    # next to 700-999 EGP when only 29 of those 602 actually happened at
+    # that price. Now shows the band-specific number first, category total
+    # second and clearly labeled as such.)
+    demand_txt = f"At {esc(row['price_label'])} EGP: {row['best_band_sellout']} sold out (of {row['sold_out']} sold out across all prices in this category)"
+
     return f"""<tr>
   <td>{esc(row['cat'])} · <b>{esc(row['sub'])}</b><br>
     <span class="speed"><span class="conf {row['conf']}"></span> {row['brands']} brands · {row['products']:,} products</span></td>
@@ -737,7 +817,7 @@ def render_board_row(row):
     <span class="ci">{row['best_rate']}% ±{row['best_ci']} sell-through</span></td>
   <td>{render_sparkline(row['spark_vals'])}{trend_html}<br>
     <span class="speed">Persistence: {row['avg_weeks']}/8 · {row['strong']} strong, {row['medium']} med, {row['weak']} weak</span>
-    <span class="speed">Demand: {row['sold_out']} sold out · {row['still_out']} still out</span>
+    <span class="speed">Demand: {demand_txt}</span>
     <span class="speed">Speed: {speed_txt}</span></td>
   <td><span class="timing {timing_cls}">{timing_txt}</span><br>
     <span class="speed">Gap {row['gap_ratio']}×</span></td>
@@ -1041,7 +1121,24 @@ def render(conn):
     distress = q_distress(conn)
     ci_data = q_confidence_inputs(conn)
     avoid_items = ""
-    for cat, sub in AVOID_CATS:
+    # v16.0 fix (was: AVOID_CATS was a hardcoded list of 4 subcategories that
+    # never changed week to week, even though this section is presented as a
+    # fresh weekly finding — a newly-distressed subcategory wouldn't show up
+    # here, and one of these 4 could recover and the report would keep
+    # warning clients off it forever with no indication it's a static list).
+    # Now pulled from the SAME `in_distress` flag build_board() computed and
+    # already used to gate §02's verdicts, so the two sections can never
+    # disagree about which subcategories are flagged this week. Sorted
+    # worst-first, capped at 8 rows so the section can't balloon.
+    esc_totals = {}
+    if not distress.empty:
+        tot = distress.groupby(["cat", "sub"])["escalating"].sum().reset_index()
+        esc_totals = {(r["cat"], r["sub"]): int(r["escalating"]) for _, r in tot.iterrows()}
+    avoid_cats_live = sorted(
+        {(r["cat"], r["sub"]) for r in rows if r.get("in_distress")},
+        key=lambda cs: esc_totals.get(cs, 0), reverse=True
+    )[:8]
+    for cat, sub in avoid_cats_live:
         dd = distress[(distress["cat"] == cat) & (distress["sub"] == sub)]
         if dd.empty:
             continue
@@ -1143,7 +1240,12 @@ def render(conn):
 
 
 def run():
+    global EXCLUDED_SELL, EXCLUDED_ALL
     conn = R.connect()
+    # v16.0 fix: pull the live, centrally-maintained exclusion sets instead of
+    # this file's own stale copy.
+    EXCLUDED_SELL = _sql_tuple(R.EXCLUDE_STOCK_BRANDS)
+    EXCLUDED_ALL  = _sql_tuple(R.EXCLUDE_BRANDS)
     html = render(conn)
     run_dir, _ = R.build_run_dir("master-order-price", "weekly")
     (run_dir / "report.html").write_text(html)
