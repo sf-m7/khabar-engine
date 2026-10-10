@@ -2645,16 +2645,18 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
             # fop_done_ids, now passed in). The DB still has the IS NULL guard as
             # a belt-and-braces safety net, but cutting the call is the saving.
             if db_pid in fop_done_ids: continue
-            first_variant_price = None
-            for v in p.get("variants", []):
-                pr = float(v.get("price") or 0)
-                if pr > 0:
-                    first_variant_price = pr
-                    break
-            if first_variant_price:
+                        # v16.0 fix: first_observed_price must be the TRUE minimum price
+            # across every variant (size/colour), not whichever variant
+            # happened to come first in Shopify's JSON — that was arbitrary
+            # (JSON order is not price order) and silently locked in a wrong,
+            # usually inflated, permanent baseline for ~13% of products.
+            variant_prices = [float(v.get("price") or 0) for v in p.get("variants", [])]
+            variant_prices = [pr for pr in variant_prices if pr > 0]
+            min_variant_price = min(variant_prices) if variant_prices else None
+            if min_variant_price:
                 safe_db_execute(
                     supabase.table("products")
-                    .update({"first_observed_price": first_variant_price})
+                    .update({"first_observed_price": min_variant_price})
                     .eq("id", db_pid)
                     .is_("first_observed_price", "null")
                 )
@@ -3596,27 +3598,34 @@ def scrape_lcw(supabase, session, brand_name, domain, today, prev_stock_state, f
                 product_id_map  = {row["external_id"]: row["id"] for row in product_upsert_rows}
                 products_seen  += len(batch_products)
 
+                # v16.0 fix: a model can appear multiple times in `items` (once
+                # per colour). The old code wrote first_observed_price per-item
+                # with an IS NULL guard, so whichever colour happened to come
+                # first in the API response won — arbitrary, not the cheapest
+                # colour. Now we compute the true minimum across all colours of
+                # a model in this page before writing anything, once per model.
+                model_min_fop = {}
                 for item in items:
                     db_pid = product_id_map.get(str(item.get("ModelId")))
-                    if not db_pid: continue
-                    # v14.17: skip already-seeded products — fop_done_ids is passed
-                    # in; the DB still enforces the IS NULL guard, but the network
-                    # call no longer happens.
-                    if db_pid in fop_done_ids: continue
+                    if not db_pid or db_pid in fop_done_ids:
+                        continue
                     # v14.50: the actual selling price is the campaign-badge price
                     # when present (LCW moved it there — see _lcw_badge_price), else
                     # the flat list price. The old DiscountedPriceValue is dead (0).
                     full_val   = _parse_lcw_price(item.get("PriceValue") or item.get("Price"))
                     badge_val  = _lcw_badge_price(item)
                     fop = badge_val if badge_val > 0 else full_val
-                    if fop > 0:
-                        safe_db_execute(
-                            supabase.table("products")
-                            .update({"first_observed_price": fop})
-                            .eq("id", db_pid)
-                            .is_("first_observed_price", "null")
-                        )
-                        fop_done_ids.add(db_pid)
+                    if fop > 0 and (db_pid not in model_min_fop or fop < model_min_fop[db_pid]):
+                        model_min_fop[db_pid] = fop
+
+                for db_pid, fop in model_min_fop.items():
+                    safe_db_execute(
+                        supabase.table("products")
+                        .update({"first_observed_price": fop})
+                        .eq("id", db_pid)
+                        .is_("first_observed_price", "null")
+                    )
+                    fop_done_ids.add(db_pid)
 
                 batch_variants, product_variant_tracking = [], {}
                 for item in items:
