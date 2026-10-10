@@ -33,9 +33,21 @@ from datetime import date
 
 import report_lib as R
 import report_html as H
+import report_master_order as MO  # v16.0: cross-report consistency check (#9)
 
+# v16.0 fix: these default values are only a pre-connect placeholder — see
+# report_master_order.py's _sql_tuple()/run() for the full writeup. run()
+# below overwrites both from R.EXCLUDE_STOCK_BRANDS / R.EXCLUDE_BRANDS right
+# after connecting, so this file can no longer silently drift from the real
+# exclusion list (it was missing lc_waikiki and mobaco before this fix).
 EXCLUDED_SELL = "('tree','dalydress','defacto')"
 EXCLUDED_ALL  = "('tree','dalydress')"
+
+
+def _sql_tuple(brands):
+    """Turn a set of brand names into a safe SQL ('a','b',...) literal."""
+    names = sorted(brands) or ["__none__"]
+    return "(" + ",".join("'" + b.replace("'", "''") + "'" for b in names) + ")"
 
 LIVE_WINDOW_DAYS = 8
 
@@ -365,8 +377,43 @@ def build_stock_board(conn):
         pr = pers[(pers["cat"] == cat) & (pers["sub"] == sub)]
         avg_wk = float(pr.iloc[0]["avg_weeks"]) if not pr.empty else 0
 
-        best_depth = max(depths, key=lambda d: depths[d]["rate"])
+        # v16.0 fix (was: `best_depth = max(depths, key=rate)` — whichever
+        # bucket had the highest raw rate won, even a bucket with 1-4
+        # products that `render_depth_cell()` itself hides as "—" because it
+        # doesn't clear its own n>=5 display floor. That let an invisible,
+        # tiny-sample bucket drive a visible "Test price increase" / "Stop"
+        # instruction. Same shape as the master_order price-band fix: a
+        # bucket must have n>=5 AND carry at least 20% of this subcategory's
+        # total observed sell-out volume to be crowned "best". If nothing
+        # clears both, fall back to the n>=5 bucket with the most absolute
+        # sell-out volume; confidence below reflects when that happens.)
+        total_depth_sellout = sum(int(round(d["rate"] / 100 * d["n"])) for d in depths.values()) or 1
+        eligible = {k: d for k, d in depths.items() if d["n"] >= 5}
+        qualified = {
+            k: d for k, d in eligible.items()
+            if (round(d["rate"] / 100 * d["n"]) / total_depth_sellout) >= 0.20
+        }
+        pool = qualified or eligible
+        best_depth = max(pool, key=lambda d: pool[d]["rate"]) if pool else None
+        best_depth_backed = bool(qualified)
         fp = depths.get("full_price", {}).get("rate", 0)
+
+        # v16.0 fix: confidence now also reflects the winning bucket's own
+        # sample (was: category-wide totals only — see master_order for the
+        # same fix and the reasoning).
+        _tiers = {"hi": 2, "md": 1, "lo": 0}
+        bd = depths.get(best_depth, {}) if best_depth else {}
+        bd_n, bd_rate = bd.get("n", 0), bd.get("rate", 0)
+        bd_sellout = round(bd_rate / 100 * bd_n)
+        if bd_n >= 150 and bd_sellout >= 40:
+            depth_conf = "hi"
+        elif bd_n >= 40 and bd_sellout >= 10:
+            depth_conf = "md"
+        else:
+            depth_conf = "lo"
+        conf = min([conf, depth_conf], key=lambda c: _tiers[c]) if best_depth else "lo"
+        if not best_depth_backed and conf == "hi":
+            conf = "md"
 
         rows.append({
             "cat": cat, "sub": sub, "brands": n_br, "products": n_pr, "conf": conf,
@@ -378,6 +425,16 @@ def build_stock_board(conn):
 
 
 def assign_stock_verdict(row):
+    # v16.0 fix (was: this function never looked at row["conf"] at all, even
+    # though the report computes and displays a confidence badge per row —
+    # a "lo" confidence row could get the same strong "raise"/"stop"
+    # instruction as a "hi" confidence one). "Stop" and "raise" are the two
+    # verdicts that tell a client to change what they're doing — those now
+    # require at least "md" confidence. Below that, hold with a note that
+    # the data's too thin to call it either way yet.
+    if row.get("conf") == "lo" or not row.get("best_depth"):
+        return "hold", "Hold — not enough data to call it"
+
     depths = row["depths"]
     fp = depths.get("full_price", {}).get("rate", 0)
     light = depths.get("1_24", {}).get("rate", 0)
@@ -567,9 +624,31 @@ def render(conn):
     ba = q_brand_activity(conn)
     mt = q_market_temp(conn)
 
+    # v16.0 fix (#9/#15): cross-check against the pricing report so the two
+    # master reports can't tell a client opposite things about the same
+    # item in the same week. Verified live before this fix: hoodies·zip-up
+    # could clear the pricing report's "worth making" bar on one read of
+    # the data while this report's hard "Stop — nothing sells" rule also
+    # fired for it — a client reading both reports would see "make these
+    # now" and "stop, outlet these" for the same item. This flags that
+    # case instead of silently shipping both; it does not silently resolve
+    # the conflict, since that would hide the disagreement rather than
+    # surface it.
+    MO.EXCLUDED_SELL = MO._sql_tuple(R.EXCLUDE_STOCK_BRANDS)
+    MO.EXCLUDED_ALL  = MO._sql_tuple(R.EXCLUDE_BRANDS)
+    making_now = set()
+    try:
+        for orow in MO.build_board(conn):
+            ov, _ = MO.assign_verdict(orow)
+            if ov in ("go", "buy"):
+                making_now.add((orow["cat"], orow["sub"]))
+    except Exception as e:
+        print(f"[WARN] cross-report check against master-order skipped: {e}")
+
     tiers = {"stop": [], "light": [], "deep": [], "raise": [], "hold": []}
     for r in rows:
         v, _ = assign_stock_verdict(r)
+        r["conflicts_with_order_report"] = (v == "stop" and (r["cat"], r["sub"]) in making_now)
         tiers[v].append(r)
 
     tier_labels = {
@@ -620,9 +699,14 @@ def render(conn):
             l_cell = render_depth_cell(depths, '1_24', r['best_depth'])
             m_cell = render_depth_cell(depths, '25_39', r['best_depth'])
             d_cell = render_depth_cell(depths, '40p', r['best_depth'])
+            conflict_html = (
+                '<br><span class="speed" style="color:var(--bad);font-weight:700;">'
+                '⚠ This week\'s pricing report lists this as worth making — check before acting</span>'
+                if r.get("conflicts_with_order_report") else ""
+            )
             board_rows += f"""<tr>
   <td>{esc(r['cat'])} · <b>{esc(r['sub'])}</b><br>
-    <span class="speed"><span class="conf {r['conf']}"></span> {r['brands']} brands · {r['products']:,} products</span></td>
+    <span class="speed"><span class="conf {r['conf']}"></span> {r['brands']} brands · {r['products']:,} products</span>{conflict_html}</td>
   <td><span class="pill {v}">{esc(label)}</span></td>
   {fp}{l_cell}{m_cell}{d_cell}
   <td><span class="speed">{speed_txt}</span></td>
@@ -804,7 +888,12 @@ def render(conn):
 
 
 def run():
+    global EXCLUDED_SELL, EXCLUDED_ALL
     conn = R.connect()
+    # v16.0 fix: pull the live, centrally-maintained exclusion sets instead
+    # of this file's own stale copy (was missing lc_waikiki and mobaco).
+    EXCLUDED_SELL = _sql_tuple(R.EXCLUDE_STOCK_BRANDS)
+    EXCLUDED_ALL  = _sql_tuple(R.EXCLUDE_BRANDS)
     html = render(conn)
     run_dir, _ = R.build_run_dir("master-stock-action", "weekly")
     (run_dir / "report.html").write_text(html)
