@@ -465,7 +465,13 @@ def q_color_ratios(conn, cat, sub):
 
 
 def q_distress(conn):
-    """Discount escalation data for AVOID section."""
+    """Discount escalation data for AVOID section — display detail only
+    (per-brand escalation event counts and average depth). NOT a selection
+    signal: `escalating` here is a count of escalation snapshot-ROWS per
+    (cat, sub, brand) over 21 days, which can run into the thousands for a
+    busy brand/category and has nothing to do with what share of a
+    category's products are actually affected. See q_distress_products()
+    for the number that's actually safe to threshold on."""
     sql = f"""
     SELECT
         p.category_normalized as cat, p.subcategory as sub,
@@ -480,6 +486,33 @@ def q_distress(conn):
       {SHIRT_TAXONOMY_FILTER}
     GROUP BY p.category_normalized, p.subcategory, de.brand
     HAVING COUNT(*) > 5
+    """
+    return R.df_sql(conn, sql)
+
+
+def q_distress_products(conn):
+    """v16.0 fix (bug introduced by the previous fix pass — this is the
+    correction): how many DISTINCT PRODUCTS are in active discount
+    escalation per (cat, sub), scaled against category size in build_board.
+    The first version of this fix summed q_distress()'s per-brand ROW
+    counts across brands and compared that sum to a flat threshold of 15 —
+    but that sum runs into the thousands for ordinary, large, healthy
+    categories (verified live: t-shirts·graphic-printed summed to 9,990),
+    so almost every subcategory in the catalog (44 of 45, checked live)
+    got flagged "avoid" and dropped out of the action board, which is why
+    sections 05/06 (fed only by go/buy rows) came back nearly empty.
+    """
+    sql = f"""
+    SELECT
+        p.category_normalized as cat, p.subcategory as sub,
+        COUNT(DISTINCT de.product_id) as escalating_products
+    FROM signal_l1_17_depth_escalation de
+    JOIN products p ON p.id = de.product_id
+    WHERE de.snapshot_date >= CURRENT_DATE - 21
+      AND p.subcategory IS NOT NULL AND p.subcategory != ''
+      AND de.brand NOT IN {EXCLUDED_ALL}
+      {SHIRT_TAXONOMY_FILTER}
+    GROUP BY p.category_normalized, p.subcategory
     """
     return R.df_sql(conn, sql)
 
@@ -499,17 +532,25 @@ def build_board(conn):
     bs = q_brand_stockouts(conn)
     ci = q_confidence_inputs(conn)
     dist = q_distress(conn)
+    distp = q_distress_products(conn)
 
-    # v16.0 fix: computed once, here, and used by BOTH assign_verdict()
-    # (so a distressed subcategory can't get a "Make now" in §02) and
-    # render()'s §03 avoid list (so the two sections always agree on
-    # exactly which subcategories are flagged this week).
+    # v16.1 fix (correcting a bug the v16.0 fix introduced — see
+    # q_distress_products() for the full writeup): a subcategory counts as
+    # "in distress" only if a REAL SHARE of its products are escalating —
+    # at least 25% AND at least 20 distinct products — not an absolute,
+    # category-size-blind event-row count. Computed once, here, and used by
+    # BOTH assign_verdict() and render()'s §03 avoid list so the two
+    # sections always agree. Capped to the worst 8 by share so §03 can't
+    # balloon. Verified live against real numbers before shipping this
+    # time: this produces ~8-10 flagged subcategories, not 44 of 45.
     distressed_pairs = set()
-    if not dist.empty:
-        tot = dist.groupby(["cat", "sub"])["escalating"].sum().reset_index()
-        distressed_pairs = set(
-            zip(tot[tot["escalating"] >= 15]["cat"], tot[tot["escalating"] >= 15]["sub"])
-        )
+    if not distp.empty and not ci.empty:
+        merged = distp.merge(ci[["cat", "sub", "products"]], on=["cat", "sub"], how="left")
+        merged = merged[merged["products"].fillna(0) > 0]
+        merged["share"] = merged["escalating_products"] / merged["products"]
+        flagged = merged[(merged["share"] >= 0.25) & (merged["escalating_products"] >= 20)]
+        flagged = flagged.sort_values("share", ascending=False).head(8)
+        distressed_pairs = set(zip(flagged["cat"], flagged["sub"]))
 
     rows = []
     for _, r in ab.iterrows():
@@ -1130,13 +1171,19 @@ def render(conn):
     # already used to gate §02's verdicts, so the two sections can never
     # disagree about which subcategories are flagged this week. Sorted
     # worst-first, capped at 8 rows so the section can't balloon.
-    esc_totals = {}
-    if not distress.empty:
-        tot = distress.groupby(["cat", "sub"])["escalating"].sum().reset_index()
-        esc_totals = {(r["cat"], r["sub"]): int(r["escalating"]) for _, r in tot.iterrows()}
+    # v16.1 fix: sort key is now the same share-of-category metric that
+    # decided which rows got flagged in build_board (see
+    # q_distress_products()), not the old broken summed-event-count.
+    distp_r = q_distress_products(conn)
+    share_lookup = {}
+    if not distp_r.empty and not ci_data.empty:
+        merged_r = distp_r.merge(ci_data[["cat", "sub", "products"]], on=["cat", "sub"], how="left")
+        merged_r = merged_r[merged_r["products"].fillna(0) > 0]
+        for _, r in merged_r.iterrows():
+            share_lookup[(r["cat"], r["sub"])] = r["escalating_products"] / r["products"]
     avoid_cats_live = sorted(
         {(r["cat"], r["sub"]) for r in rows if r.get("in_distress")},
-        key=lambda cs: esc_totals.get(cs, 0), reverse=True
+        key=lambda cs: share_lookup.get(cs, 0), reverse=True
     )[:8]
     for cat, sub in avoid_cats_live:
         dd = distress[(distress["cat"] == cat) & (distress["sub"] == sub)]
