@@ -9,44 +9,44 @@
 
 | Table | Level | Rows | Dates | Brands | Max date | Score |
 |---|---|---|---|---|---|---|
-| signal_l2_share_of_launch | L2 signal | 16175 | 66 | 26 | 2026-10-10 | 100 |
-| signal_l2_size_demand_curve | L2 signal | 2343 | 66 | 0 | 2026-10-10 | 100 |
-| signal_l1_12_new_sku_launch | L1 signal | 39279 | 133 | 26 | 2026-10-10 | 100 |
-| signal_l2_market_velocity | L2 signal | 605 | 66 | 0 | 2026-10-10 | 100 |
-| signal_l1_08_variant_stockout | L1 signal | 38165 | 76 | 24 | 2026-10-10 | 99 |
-| signal_l1_24_restock_density | L1 signal | 32400 | 104 | 24 | 2026-10-10 | 99 |
-| signal_l1_01_genuine_price_drop | L1 signal | 620518 | 77 | 22 | 2026-10-10 | 98 |
-| signal_l1_13_product_delisted | L1 signal | 18774 | 116 | 23 | 2026-09-21 | 98 |
-| signal_l1_14_launch_to_discount | L1 signal | 7877 | 110 | 22 | 2026-10-10 | 98 |
-| signal_l2_replenishment_benchmark | L2 signal | 1299 | 66 | 22 | 2026-10-10 | 98 |
-| signal_l1_09_variant_restock | L1 signal | 14781 | 76 | 23 | 2026-10-10 | 98 |
-| signal_l2_trained_customer | L2 signal | 1153 | 74 | 20 | 2026-10-10 | 97 |
-| signal_l2_discount_honesty | L2 signal | 10826 | 70 | 21 | 2026-10-10 | 97 |
-| signal_l2_first_mover | L2 signal | 14554 | 74 | 21 | 2026-10-10 | 97 |
-| signal_l2_pricing_discipline | L2 signal | 10919 | 74 | 21 | 2026-10-10 | 97 |
-| signal_l1_11_size_asymmetry | L1 signal | 51924 | 75 | 19 | 2026-10-10 | 96 |
-| signal_l1_07_price_anomaly | L1 signal | 4948 | 86 | 19 | 2026-10-10 | 96 |
-| signal_l1_10_dead_stock | L1 signal | 21937 | 80 | 19 | 2026-10-10 | 96 |
-| product_l2_12_liquidation_calendar | L2 product | 30857 | 82 | 26 | 2026-10-10 | 94 |
-| product_l2_10_market_entry | L2 product | 34050 | 82 | 26 | 2026-10-10 | 94 |
-| signal_l1_17_depth_escalation | L1 signal | 200305 | 83 | 16 | 2026-10-10 | 94 |
-| signal_l1_06_discount_recovery | L1 signal | 4742 | 85 | 16 | 2026-10-10 | 94 |
-| product_l2_08_brand_health | L2 product | 22870 | 80 | 25 | 2026-10-10 | 93 |
-| signal_l2_clear_rate_by_depth | L2 signal | 5006 | 57 | 0 | 2026-10-10 | 92 |
-| product_l2_01_price_elasticity | L2 product | 16063 | 79 | 20 | 2026-10-10 | 91 |
-| signal_l1_03_price_staircase | L1 signal | 8613 | 83 | 8 | 2026-10-10 | 90 |
-| product_l2_13_wallet_allocator | L2 product | 74341 | 82 | 19 | 2026-10-10 | 90 |
-| product_l2_02_production_blueprint | L2 product | 74341 | 82 | 19 | 2026-10-10 | 90 |
+| signal_l2_share_of_launch | L2 signal | 16795 | 68 | 26 | 2026-10-12 | 100 |
+| signal_l2_size_demand_curve | L2 signal | 2415 | 68 | 0 | 2026-10-12 | 100 |
+| signal_l1_12_new_sku_launch | L1 signal | 39599 | 135 | 26 | 2026-10-12 | 100 |
+| signal_l2_market_velocity | L2 signal | 632 | 68 | 0 | 2026-10-12 | 100 |
+| signal_l1_08_variant_stockout | L1 signal | 39339 | 78 | 24 | 2026-10-12 | 99 |
+| signal_l1_24_restock_density | L1 signal | 32147 | 106 | 24 | 2026-10-12 | 99 |
+| signal_l1_01_genuine_price_drop | L1 signal | 639030 | 79 | 23 | 2026-10-12 | 98 |
+| signal_l1_13_product_delisted | L1 signal | 23253 | 123 | 23 | 2026-09-28 | 98 |
+| signal_l1_14_launch_to_discount | L1 signal | 8187 | 112 | 23 | 2026-10-12 | 98 |
+| signal_l2_discount_honesty | L2 signal | 11218 | 72 | 23 | 2026-10-12 | 98 |
+| signal_l1_09_variant_restock | L1 signal | 15220 | 78 | 23 | 2026-10-12 | 98 |
+| signal_l2_pricing_discipline | L2 signal | 11301 | 76 | 23 | 2026-10-12 | 98 |
+| signal_l2_replenishment_benchmark | L2 signal | 1343 | 68 | 22 | 2026-10-12 | 98 |
+| signal_l1_10_dead_stock | L1 signal | 22687 | 82 | 20 | 2026-10-12 | 97 |
+| signal_l1_22_discount_velocity | L1 signal | 901 | 75 | 21 | 2026-10-11 | 97 |
+| signal_l2_first_mover | L2 signal | 15048 | 76 | 21 | 2026-10-12 | 97 |
+| signal_l2_trained_customer | L2 signal | 1194 | 76 | 21 | 2026-10-12 | 97 |
+| signal_l1_11_size_asymmetry | L1 signal | 53867 | 77 | 20 | 2026-10-12 | 97 |
+| signal_l1_07_price_anomaly | L1 signal | 4988 | 88 | 19 | 2026-10-12 | 96 |
+| product_l2_10_market_entry | L2 product | 35084 | 84 | 26 | 2026-10-12 | 94 |
+| product_l2_12_liquidation_calendar | L2 product | 31787 | 84 | 26 | 2026-10-12 | 94 |
+| signal_l1_17_depth_escalation | L1 signal | 202143 | 85 | 16 | 2026-10-12 | 94 |
+| signal_l1_06_discount_recovery | L1 signal | 4143 | 87 | 15 | 2026-10-12 | 94 |
+| product_l2_08_brand_health | L2 product | 23577 | 82 | 25 | 2026-10-12 | 93 |
+| signal_l2_clear_rate_by_depth | L2 signal | 5205 | 59 | 0 | 2026-10-12 | 92 |
+| product_l2_02_production_blueprint | L2 product | 77747 | 84 | 20 | 2026-10-12 | 91 |
+| product_l2_01_price_elasticity | L2 product | 16642 | 81 | 21 | 2026-10-12 | 91 |
+| product_l2_09_revealed_demand | L2 product | 77747 | 84 | 20 | 2026-10-12 | 91 |
+| signal_l1_03_price_staircase | L1 signal | 8697 | 85 | 8 | 2026-10-12 | 90 |
+| product_l2_13_wallet_allocator | L2 product | 77747 | 84 | 20 | 2026-10-12 | 90 |
 | signal_l1_04_anchor_inflation | L1 signal | 383 | 27 | 11 | 2026-09-23 | 90 |
-| product_l2_09_revealed_demand | L2 product | 74341 | 82 | 19 | 2026-10-10 | 90 |
-| signal_l1_22_discount_velocity | L1 signal | 885 | 73 | 19 | 2026-10-08 | 81 |
 
 
 ## Invariants
 
 - price_snapshots.discount_pct non-null (expect 0): **0**
 
-- product_variants delisted_at set but in_stock (known bug): **25277**
+- product_variants delisted_at set but in_stock (known bug): **33705**
 
 - product_variants missing first_observed_price: **0**
 
@@ -59,4 +59,4 @@
 ### Method & confidence
 - Generated by integrity_audit.py; see integrity_report.md for the full run.
 
-*Auto-generated 2026-10-10. Confidence tiers: confirmed / directional / maturing — based on brands covered, days observed, and event volume.*
+*Auto-generated 2026-10-12. Confidence tiers: confirmed / directional / maturing — based on brands covered, days observed, and event volume.*
