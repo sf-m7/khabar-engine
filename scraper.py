@@ -4264,7 +4264,27 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                 items = data.get("DataLayer") or []
 
             if not items:
-                print(f"  [DeFacto][{cat_name}] Page {page_index} — no items. End of catalog.")
+                if page_index == 1:
+                    # v14.7x: an EMPTY FIRST PAGE is not "end of catalog" -- it
+                    # is a failure (soft block returning an empty 200, or the
+                    # response schema moved). Seen 2026-10-16..18: HTTP 200 +
+                    # valid JSON + zero items for BOTH categories on every run
+                    # after months of working, with no code change on our side.
+                    # Print enough of the raw response that the next run tells
+                    # us which one it is without another round-trip.
+                    try:
+                        _keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+                        _hdr  = {k: v for k, v in res.headers.items()
+                                 if k.lower() in ("server", "content-type", "x-akamai-transformed",
+                                                  "akamai-grn", "set-cookie", "cf-ray", "x-cache")}
+                        print(f"  ⚠️ [DeFacto][{cat_name}] EMPTY FIRST PAGE (HTTP 200). "
+                              f"body_len={len(res.text)} top_keys={_keys}")
+                        print(f"     headers={_hdr}")
+                        print(f"     body[:400]={res.text[:400]!r}")
+                    except Exception as _e:
+                        print(f"  ⚠️ [DeFacto][{cat_name}] empty first page; diag failed: {_e}")
+                else:
+                    print(f"  [DeFacto][{cat_name}] Page {page_index} — no items. End of catalog.")
                 break
 
             # ── Products upsert ───────────────────────────────────────────
@@ -6015,7 +6035,12 @@ def _run_brand_with_proxy_cascade(brand_name, domain, engine):
     having to independently discover and re-fail on "direct" before
     escalating themselves.
     """
-    if engine not in ("shopify", "woocommerce"):
+    # v14.7x: "defacto" added. It used to bypass the cascade and always go
+    # direct from the GitHub runner IP, so when DeFacto began returning empty
+    # 200s (2026-10-16) there was no escalation path at all. scrape_brand()
+    # already builds its session via get_shopify_session(), which honours the
+    # tier override, so including it here is all that is needed.
+    if engine not in ("shopify", "woocommerce", "defacto"):
         return scrape_brand(brand_name, domain)
 
     is_canary = not _proxy_canary_done["done"]
