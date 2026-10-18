@@ -4185,6 +4185,64 @@ def fetch_defacto_sizes_batch(session, domain, long_codes):
         print(f"  ⚠️ [DeFacto] CombinProduct batch error: {e}")
         return {}
 
+def _defacto_find_items(data):
+    """
+    v14.7x: locate the product dicts ANYWHERE in a PartialIndexScrollResult
+    payload instead of trusting one hardcoded key. From 2026-10-16 the old
+    Data.DataLayer / DataLayer paths came back empty while the response itself
+    was a healthy ~300KB payload reporting Count=1252 (men) / 2096 (women):
+    DeFacto moved the product list. We recognise a product list structurally
+    -- a list of dicts carrying "LongCode" -- and take the largest one.
+    Returns (path, items) or (None, []).
+    """
+    best = [None, []]
+    def walk(o, path, depth):
+        if depth > 14:
+            return
+        if isinstance(o, list):
+            head = [x for x in o[:3] if isinstance(x, dict)]
+            if head and any("LongCode" in x for x in head):
+                if len(o) > len(best[1]):
+                    best[0], best[1] = path, o
+                return
+            for i, x in enumerate(o[:60]):
+                walk(x, f"{path}[{i}]", depth + 1)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                walk(v, f"{path}.{k}" if path else str(k), depth + 1)
+    walk(data, "", 0)
+    return best[0], best[1]
+
+
+def _defacto_shape_dump(data, label):
+    """One-time structural dump for when the schema moves again: top-level
+    Data keys, SearchResponse keys/Count, and the biggest lists of dicts with
+    the keys of their first element (no cookies/headers, so it is log-safe)."""
+    try:
+        d = data.get("Data") if isinstance(data, dict) else None
+        sr = (d or {}).get("SearchResponse") if isinstance(d, dict) else None
+        print(f"     [{label}] Data keys={list(d.keys()) if isinstance(d, dict) else None}")
+        if isinstance(sr, dict):
+            print(f"     [{label}] SearchResponse keys={list(sr.keys())} Count={sr.get('Count')}")
+        lists = []
+        def walk(o, path, depth):
+            if depth > 14:
+                return
+            if isinstance(o, list):
+                if o and isinstance(o[0], dict):
+                    lists.append((len(o), path, list(o[0].keys())[:30]))
+                for i, x in enumerate(o[:60]):
+                    walk(x, f"{path}[{i}]", depth + 1)
+            elif isinstance(o, dict):
+                for k, v in o.items():
+                    walk(v, f"{path}.{k}" if path else str(k), depth + 1)
+        walk(data, "", 0)
+        for n, path, keys in sorted(lists, key=lambda t: -t[0])[:6]:
+            print(f"     [{label}] list n={n} at {path or '<root>'} first-item keys={keys}")
+    except Exception as e:
+        print(f"     [{label}] shape dump failed: {e}")
+
+
 def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     """
     Scrapes DeFacto Egypt via the PartialIndexScrollResult API.
@@ -4262,6 +4320,16 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
             items = (data.get("Data") or {}).get("DataLayer") or []
             if not items:
                 items = data.get("DataLayer") or []
+            if not items:
+                _path, items = _defacto_find_items(data)
+                if items and page_index == 1:
+                    _sr = ((data.get("Data") or {}).get("SearchResponse") or {})
+                    print(f"  🔎 [DeFacto][{cat_name}] product list found at "
+                          f"'{_path}' ({len(items)} items; site reports Count={_sr.get('Count')}).")
+                    _first = items[0] if isinstance(items[0], dict) else {}
+                    _pk = {k: _first[k] for k in _first if "price" in str(k).lower()}
+                    print(f"     item keys={list(_first.keys())[:40]}")
+                    print(f"     price-like fields={_pk}")
 
             if not items:
                 if page_index == 1:
@@ -4281,6 +4349,7 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                               f"body_len={len(res.text)} top_keys={_keys}")
                         print(f"     headers={_hdr}")
                         print(f"     body[:400]={res.text[:400]!r}")
+                        _defacto_shape_dump(data, cat_name)
                     except Exception as _e:
                         print(f"  ⚠️ [DeFacto][{cat_name}] empty first page; diag failed: {_e}")
                 else:
@@ -4422,6 +4491,13 @@ def scrape_defacto(supabase, session, brand_name, domain, today, prev_stock_stat
                     "_meta_color":         color_name,
                     "_meta_available":     is_avail,
                 })
+
+            if not batch_variants and page_index == 1:
+                _f = items[0] if items and isinstance(items[0], dict) else {}
+                print(f"  🛑 [DeFacto][{cat_name}] {len(items)} items parsed but NONE priced "
+                      f"-- item schema changed (Price/DiscountedPrice/Stock missing). "
+                      f"item keys={list(_f.keys())[:40]}")
+                _defacto_shape_dump(data, cat_name)
 
             if batch_variants:
                 # v14.23: change-detection. Note the size-population block below
