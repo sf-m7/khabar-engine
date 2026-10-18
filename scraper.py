@@ -4187,31 +4187,37 @@ def fetch_defacto_sizes_batch(session, domain, long_codes):
 
 def _defacto_find_items(data):
     """
-    v14.7x: locate the product dicts ANYWHERE in a PartialIndexScrollResult
-    payload instead of trusting one hardcoded key. From 2026-10-16 the old
-    Data.DataLayer / DataLayer paths came back empty while the response itself
-    was a healthy ~300KB payload reporting Count=1252 (men) / 2096 (women):
-    DeFacto moved the product list. We recognise a product list structurally
-    -- a list of dicts carrying "LongCode" -- and take the largest one.
-    Returns (path, items) or (None, []).
+    v14.7x -> v14.7x.2: locate every product dict ANYWHERE in a
+    PartialIndexScrollResult payload, instead of trusting one hardcoded key.
+
+    Confirmed via shape dump on a live response (2026-10-18, Count=1252 men /
+    2096 women -- the real catalogue, not a block): DeFacto's rebuilt
+    storefront no longer puts products in one array at all. Each product is
+    its own page-layout cell: Data.SearchResponse.Template[i].columns[j]
+    .content.widget.widgetContent is ONE product's dict, with its own Sizes /
+    ProductPictures / DataLayer.Sizes lists nested inside it. 24 (or so)
+    scattered single-product dicts, not one 24-element array -- which is
+    exactly why the original version of this function (look for a LIST of
+    dicts containing "LongCode") found nothing: there is no such list.
+
+    Fix: walk every dict in the tree and collect each one that itself
+    carries "LongCode", wherever it sits. Returns (path_description, items).
     """
-    best = [None, []]
+    found = []
     def walk(o, path, depth):
-        if depth > 14:
+        if depth > 20:
             return
-        if isinstance(o, list):
-            head = [x for x in o[:3] if isinstance(x, dict)]
-            if head and any("LongCode" in x for x in head):
-                if len(o) > len(best[1]):
-                    best[0], best[1] = path, o
-                return
-            for i, x in enumerate(o[:60]):
-                walk(x, f"{path}[{i}]", depth + 1)
-        elif isinstance(o, dict):
+        if isinstance(o, dict):
+            if "LongCode" in o:
+                found.append(o)
+                return  # a product dict's own values don't nest another product
             for k, v in o.items():
                 walk(v, f"{path}.{k}" if path else str(k), depth + 1)
+        elif isinstance(o, list):
+            for i, x in enumerate(o[:200]):
+                walk(x, f"{path}[{i}]", depth + 1)
     walk(data, "", 0)
-    return best[0], best[1]
+    return ("<scattered widgetContent nodes>", found)
 
 
 def _defacto_shape_dump(data, label):
