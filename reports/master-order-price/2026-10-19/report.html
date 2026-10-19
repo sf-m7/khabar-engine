@@ -1,0 +1,945 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Khabar — What to Make & At What Price</title>
+<style>
+:root{--paper:#FAFAF8;--ink:#1B1B19;--muted:#6C6A64;--faint:#9A978F;
+--line:#DAD7CF;--box:#EFEDE7;--grid:#E6E3DB;
+--act:#B45309;--act-bg:#FBF1E3;--good:#3F7A4B;--good-bg:#EDF5EE;
+--warn:#B4820A;--warn-bg:#FDF6E3;--bad:#B0413A;--bad-bg:#FBEEED;
+--blue:#2563EB;--blue-bg:#EFF4FF;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+*{box-sizing:border-box;margin:0}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:15px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1020px;margin:0 auto;padding:0 20px 80px}
+header{border-bottom:1px solid var(--line);background:var(--paper);position:sticky;top:0;z-index:10}
+.bar{max-width:1020px;margin:0 auto;padding:12px 20px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.bar h1{font-size:16px;font-weight:700}.bar .tag{font-family:var(--mono);font-size:10px;color:#fff;background:var(--good);border-radius:3px;padding:2px 6px;font-weight:600}
+.bar .date{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.verdict{border:1px solid var(--good);background:var(--good-bg);border-radius:8px;padding:18px 20px;margin:20px 0 8px}
+.verdict .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--good);text-transform:uppercase;font-weight:700}
+.verdict .v{font-size:17px;font-weight:700;margin:8px 0 6px;line-height:1.45}.verdict .sub{font-size:13.5px;color:var(--muted);line-height:1.55}
+section.blk{border:1px solid var(--line);border-radius:8px;background:#fff;margin:16px 0;overflow:hidden}
+.blk>.hd{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--box);flex-wrap:wrap}
+.blk>.hd .n{font-family:var(--mono);font-size:10.5px;color:var(--faint);flex-shrink:0}
+.blk>.hd .t{font-size:13.5px;font-weight:650}
+.blk>.hd .badge{margin-left:auto;font-family:var(--mono);font-size:9.5px;padding:2px 8px;border-radius:20px;color:#fff;font-weight:600;flex-shrink:0}
+.blk>.hd .badge.key{background:var(--good)}.blk>.hd .badge.new{background:var(--blue)}
+.blk>.bd{padding:16px 18px}
+.note{font-size:13px;color:var(--muted);line-height:1.6;margin:14px 0 0;padding:10px 12px;background:var(--paper);border-radius:5px;border-left:3px solid var(--grid)}
+.note b{color:var(--ink);font-weight:600}
+.intro{font-size:13.5px;color:var(--muted);line-height:1.55;margin-bottom:14px}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -18px;padding:0 18px}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:860px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+th{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;color:var(--faint);text-transform:uppercase;position:sticky;top:0;background:#fff}
+td.m{font-family:var(--mono);font-size:12px}tr:last-child td{border-bottom:none}
+.pill{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:20px;color:#fff;display:inline-block;font-weight:700;white-space:nowrap}
+.pill.go{background:var(--good)}.pill.buy{background:var(--act)}.pill.watch{background:var(--faint)}.pill.avoid{background:var(--bad)}
+.b{font-family:var(--mono);font-size:10px;display:inline-block;background:var(--box);border-radius:3px;padding:1px 6px;margin:1px 2px;color:var(--ink);white-space:nowrap}
+.b.top{background:var(--act-bg);border:1px solid #E8C98E;color:var(--act);font-weight:700}
+.tier{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;padding:10px 10px 5px;color:var(--faint);border-top:1px solid var(--line);background:var(--paper)}
+.timing{font-family:var(--mono);font-size:10.5px;font-weight:700;white-space:nowrap}
+.timing.go{color:var(--good)}.timing.soon{color:var(--act)}.timing.slow{color:var(--bad)}
+.spark{display:inline-flex;align-items:end;gap:1px;height:16px;vertical-align:middle;margin:0 4px}
+.spark i{width:4px;border-radius:1px;background:var(--act);opacity:.7}
+.price-pill{font-family:var(--mono);font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:4px;display:inline-block;white-space:nowrap;background:var(--good-bg);color:var(--good);border:1px solid #A8D5AD}
+.conf{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
+.conf.hi{background:var(--good)}.conf.md{background:var(--warn)}.conf.lo{background:var(--bad)}
+.ci{font-family:var(--mono);font-size:9px;color:var(--faint);font-weight:400}
+.speed{font-family:var(--mono);font-size:9.5px;color:var(--faint);display:block;margin-top:2px}
+.avoid-item{display:flex;gap:10px;padding:12px 0;border-bottom:1px solid var(--grid);align-items:flex-start}
+.avoid-item:last-child{border-bottom:none}
+.avoid-x{font-family:var(--mono);font-size:14px;color:var(--bad);font-weight:800;flex-shrink:0;width:20px;text-align:center;margin-top:1px}
+.avoid-body{font-size:13.5px;line-height:1.55}.avoid-body strong{font-weight:650}.avoid-body .reason{color:var(--muted)}
+.cov{font-family:var(--mono);font-size:11px;color:var(--muted);line-height:2}
+.cov b{color:var(--ink);font-weight:600}.cov .x{color:var(--bad)}.cov span{display:inline-block;margin-right:18px}
+.diff-box{background:var(--blue-bg);border:1px solid #C7D9F7;border-radius:6px;padding:14px 16px}
+.diff-hd{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
+.diff-row{display:flex;gap:8px;align-items:flex-start;padding:5px 0}
+.diff-row+.diff-row{border-top:1px solid #dde6f7}
+.diff-arrow{font-family:var(--mono);font-size:13px;width:18px;text-align:center;flex-shrink:0}
+.diff-txt{font-size:13.5px;line-height:1.5}
+.tabs{background:var(--paper);border:1px solid var(--grid);border-radius:6px;padding:14px 16px}
+.tab-nav{display:flex;gap:6px;border-bottom:1px solid var(--grid);padding-bottom:10px;margin-bottom:14px;flex-wrap:wrap}
+.tab-btn{font-family:var(--mono);font-size:10.5px;font-weight:600;padding:4px 10px;border-radius:4px;border:1px solid var(--grid);background:#fff;color:var(--muted);cursor:pointer}
+.tab-btn.active{background:var(--ink);color:#fff;border-color:var(--ink)}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.spec-grid{display:flex;gap:24px;flex-wrap:wrap}
+.spec-col{flex:1;min-width:240px}
+.spec-title{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
+.bar-row{display:flex;align-items:center;gap:8px;margin:5px 0}
+.bar-lbl{font-family:var(--mono);font-size:10.5px;color:var(--muted);width:44px;text-align:right;flex-shrink:0}
+.bar-track{flex:1;height:16px;background:var(--grid);border-radius:3px;position:relative;overflow:hidden}
+.bar-fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
+.bar-val{position:absolute;right:5px;top:0;font-family:var(--mono);font-size:9.5px;line-height:16px;color:var(--ink);font-weight:600}
+.sp-block{margin:0 0 22px}.sp-block:last-child{margin-bottom:0}
+.sp-name{font-size:13px;font-weight:650;margin-bottom:4px}
+.sp-name span{font-weight:400;color:var(--faint);font-size:11px;margin-left:6px}
+.sp-axis{position:relative;height:40px;background:var(--paper);border:1px solid var(--grid);border-radius:4px;margin:4px 0 2px}
+.sp-zone{position:absolute;top:0;bottom:0;border-radius:3px}
+.sp-zone.peak{background:rgba(63,122,75,.12);border:1px dashed rgba(63,122,75,.35)}
+.sp-dot{position:absolute;top:11px;height:18px;font-family:var(--mono);font-size:9px;background:var(--box);border:1px solid var(--line);border-radius:3px;padding:0 4px;line-height:16px;white-space:nowrap;transform:translateX(-50%);z-index:2}
+.sp-zone-lbl{position:absolute;top:1px;font-family:var(--mono);font-size:7.5px;letter-spacing:.03em;text-transform:uppercase;font-weight:600;padding:0 4px}
+.sp-zone-lbl.pk{color:var(--good);right:3px}
+.sp-ticks{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8.5px;color:var(--faint);padding:0 1px}
+@media(max-width:700px){body{font-size:14px}.wrap{padding:0 14px 60px}.verdict{padding:14px 16px}.verdict .v{font-size:15.5px}.blk>.bd{padding:14px}.table-wrap{margin:0 -14px;padding:0 14px}.note{font-size:12.5px}.cov span{display:block;margin-right:0}.spec-grid{flex-direction:column;gap:14px}}
+@media(max-width:450px){.bar .date{margin-left:0;flex-basis:100%}.verdict .v{font-size:14.5px}table{font-size:12px}th,td{padding:7px 6px}.b{font-size:9px;padding:1px 4px}}
+</style>
+</head><body>
+<header><div class="bar">
+  <h1>Khabar — What to Make &amp; At What Price</h1>
+  <span class="tag">LIVE</span>
+  <span class="date">week of 2026-10-19</span>
+</div></header>
+<div class="wrap"><div class="verdict">
+  <div class="lbl">This week's action</div>
+  <div class="v">Make short-sleeve t-shirts now — selling out across 13 brands, demand stable 4% over 8 weeks, bestseller persistence 6.5/8. Price at 300-499 EGP (49.7% ±3.7 sell-through).</div>
+  <div class="sub">Every row carries a confidence level, margin of error, and demand index.
+    Bestseller persistence distinguishes real demand from one-week spikes.
+    All price-band findings are observed associations — not controlled experiments.</div>
+</div><section class="blk">
+  <div class="hd"><span class="n">01</span><span class="t">What changed since last week</span>
+    <span class="badge new">WEEKLY DIFF</span></div>
+  <div class="bd"><div class="diff-box">
+    <div class="diff-hd">Board changes &amp; price moves</div>
+    <div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>khotwh ramped up launches</b> — 201 new products this week, up from 71.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>carina ramped up launches</b> — 85 new products this week, up from 26.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>cizaro ramped up launches</b> — 74 new products this week, up from 16.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>coup slowed sharply</b> — 102 launches this week, down from 676.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>mobaco slowed sharply</b> — 85 launches this week, down from 325.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--bad);">▼</span><div class="diff-txt"><b>town_team cut shirts prices broadly</b> — 157 cuts (avg −28.6%), 11 increases.</div></div><div class="diff-row"><span class="diff-arrow" style="color:var(--good);">▲</span><div class="diff-txt"><b>tomato raised trousers prices</b> — 110 increases, 7 cuts. Confidence signal.</div></div>
+  </div>
+  <div class="note">Tracks brand launch volume and price-move patterns week over week.
+    Doesn't yet track board-position changes (e.g. a subcategory moving from WATCH to BUY) —
+    that needs a stored snapshot of last week's board, which is a planned follow-up.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">02</span>
+    <span class="t">The action board — what to make, at what price, and when</span>
+    <span class="badge key">KEY SECTION</span></div>
+  <div class="bd">
+    <p class="intro">Confidence: <span class="conf hi"></span> high
+      <span class="conf md"></span> medium <span class="conf lo"></span> low.
+      Bestseller persistence = avg weeks products stayed on lists (out of 8).
+      Demand index = sell-outs + products still out of stock.</p>
+    <div class="table-wrap">
+    <table><thead><tr>
+      <th>What to make</th><th>Action</th><th>Price at</th>
+      <th>Demand proof</th><th>When</th><th>Who's running out</th>
+    </tr></thead><tbody><tr><td colspan="6" class="tier">Make these now — demand is proven</td></tr><tr>
+  <td>t-shirts · <b>short-sleeve</b><br>
+    <span class="speed"><span class="conf hi"></span> 13 brands · 1,668 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">300-499</span><br>
+    <span class="ci">49.7% ±3.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:57%"></i><i style="height:58%"></i><i style="height:83%"></i><i style="height:88%"></i><i style="height:100%"></i><i style="height:64%"></i><i style="height:60%"></i><i style="height:55%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">-4%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 45 strong, 31 med, 51 weak</span>
+    <span class="speed">Demand: At 300-499 EGP: 358 sold out (of 873 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 105 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 10.7×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">tomato</span><span class="b top">town_team</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>shirts · <b>short-sleeve</b><br>
+    <span class="speed"><span class="conf hi"></span> 18 brands · 2,488 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">500-699</span><br>
+    <span class="ci">25.8% ±4.0 sell-through</span></td>
+  <td><span class="spark"><i style="height:68%"></i><i style="height:77%"></i><i style="height:90%"></i><i style="height:97%"></i><i style="height:100%"></i><i style="height:90%"></i><i style="height:88%"></i><i style="height:85%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+25%</span><br>
+    <span class="speed">Persistence: 6.7/8 · 84 strong, 42 med, 28 weak</span>
+    <span class="speed">Demand: At 500-699 EGP: 119 sold out (of 589 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 122 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 6.8×</span></td>
+  <td><span class="b top">town_team</span><span class="b top">tomato</span><span class="b top">arafa</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>shirts · <b>long-sleeve</b><br>
+    <span class="speed"><span class="conf hi"></span> 17 brands · 1,520 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">500-699</span><br>
+    <span class="ci">32.8% ±4.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:75%"></i><i style="height:83%"></i><i style="height:95%"></i><i style="height:95%"></i><i style="height:100%"></i><i style="height:80%"></i><i style="height:81%"></i><i style="height:63%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-15%</span><br>
+    <span class="speed">Persistence: 6.6/8 · 43 strong, 38 med, 13 weak</span>
+    <span class="speed">Demand: At 500-699 EGP: 126 sold out (of 446 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 110 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 4.1×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">ravin</span><span class="b top">arafa</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>t-shirts · <b>basic</b><br>
+    <span class="speed"><span class="conf hi"></span> 17 brands · 837 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">under 300</span><br>
+    <span class="ci">25.2% ±4.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:61%"></i><i style="height:62%"></i><i style="height:74%"></i><i style="height:81%"></i><i style="height:100%"></i><i style="height:70%"></i><i style="height:70%"></i><i style="height:70%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+14%</span><br>
+    <span class="speed">Persistence: 6.7/8 · 36 strong, 28 med, 19 weak</span>
+    <span class="speed">Demand: At under 300 EGP: 81 sold out (of 219 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 93 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 4.1×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">ravin</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>shorts · <b>sport</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 516 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">under 300</span><br>
+    <span class="ci">33.8% ±8.0 sell-through</span></td>
+  <td><span class="spark"><i style="height:82%"></i><i style="height:82%"></i><i style="height:88%"></i><i style="height:94%"></i><i style="height:76%"></i><i style="height:82%"></i><i style="height:100%"></i><i style="height:70%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">-14%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 9 strong, 10 med, 4 weak</span>
+    <span class="speed">Demand: At under 300 EGP: 46 sold out (of 147 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 116 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 9.3×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">tomato</span><span class="b top">town_team</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>trousers · <b>jogger-style</b><br>
+    <span class="speed"><span class="conf md"></span> 16 brands · 800 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">300-499</span><br>
+    <span class="ci">27.8% ±7.3 sell-through</span></td>
+  <td><span class="spark"><i style="height:59%"></i><i style="height:60%"></i><i style="height:79%"></i><i style="height:92%"></i><i style="height:100%"></i><i style="height:98%"></i><i style="height:90%"></i><i style="height:87%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+47%</span><br>
+    <span class="speed">Persistence: 6.9/8 · 45 strong, 18 med, 6 weak</span>
+    <span class="speed">Demand: At 300-499 EGP: 40 sold out (of 202 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 108 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 4.7×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">town_team</span><span class="b top">khotwh</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>trousers · <b>chino</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 399 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">500-699</span><br>
+    <span class="ci">37.7% ±8.9 sell-through</span></td>
+  <td><span class="spark"><i style="height:47%"></i><i style="height:47%"></i><i style="height:64%"></i><i style="height:94%"></i><i style="height:100%"></i><i style="height:96%"></i><i style="height:96%"></i><i style="height:96%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+104%</span><br>
+    <span class="speed">Persistence: 6.6/8 · 34 strong, 27 med, 3 weak</span>
+    <span class="speed">Demand: At 500-699 EGP: 43 sold out (of 94 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 100 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 7.6×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">mens_club</span><span class="b top">tie_house</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jeans · <b>straight</b><br>
+    <span class="speed"><span class="conf md"></span> 16 brands · 257 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">46.9% ±9.2 sell-through</span></td>
+  <td><span class="spark"><i style="height:54%"></i><i style="height:54%"></i><i style="height:45%"></i><i style="height:63%"></i><i style="height:72%"></i><i style="height:81%"></i><i style="height:100%"></i><i style="height:81%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+50%</span><br>
+    <span class="speed">Persistence: 6.9/8 · 5 strong, 5 med, 1 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 53 sold out (of 97 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 98 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.1×</span></td>
+  <td><span class="b top">cizaro</span><span class="b top">tomato</span><span class="b top">dott_jeans</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jeans · <b>slim</b><br>
+    <span class="speed"><span class="conf md"></span> 14 brands · 370 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">33.8% ±10.8 sell-through</span></td>
+  <td><span class="spark"><i style="height:43%"></i><i style="height:43%"></i><i style="height:86%"></i><i style="height:100%"></i><i style="height:86%"></i><i style="height:86%"></i><i style="height:86%"></i><i style="height:86%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+100%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 16 strong, 6 med, 2 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 25 sold out (of 92 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 108 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.4×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">cizaro</span><span class="b top">town_team</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jackets · <b>puffer</b><br>
+    <span class="speed"><span class="conf md"></span> 12 brands · 529 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">20.0% ±3.8 sell-through</span></td>
+  <td><span class="spark"><i style="height:88%"></i><i style="height:92%"></i><i style="height:94%"></i><i style="height:100%"></i><i style="height:79%"></i><i style="height:80%"></i><i style="height:72%"></i><i style="height:61%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-30%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 59 strong, 45 med, 8 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 86 sold out (of 114 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 117 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 4.4×</span></td>
+  <td><span class="b top">town_team</span><span class="b top">mens_club</span><span class="b top">andora</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>shirts · <b>formal</b><br>
+    <span class="speed"><span class="conf md"></span> 13 brands · 552 products</span></td>
+  <td><span class="pill go">Make now</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">32.4% ±10.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:97%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:97%"></i><i style="height:87%"></i><i style="height:85%"></i><i style="height:85%"></i><i style="height:87%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">-10%</span><br>
+    <span class="speed">Persistence: 7.3/8 · 38 strong, 13 med, 5 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 24 sold out (of 97 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 100 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.9×</span></td>
+  <td><span class="b top">tie_house</span><span class="b top">esla</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr><tr><td colspan="6" class="tier">Make these — mid volume</td></tr><tr>
+  <td>jeans · <b>wide-baggy</b><br>
+    <span class="speed"><span class="conf hi"></span> 16 brands · 501 products</span></td>
+  <td><span class="pill buy">Make — mid vol</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">74.0% ±5.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:56%"></i><i style="height:62%"></i><i style="height:68%"></i><i style="height:71%"></i><i style="height:93%"></i><i style="height:100%"></i><i style="height:81%"></i><i style="height:49%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">-13%</span><br>
+    <span class="speed">Persistence: 5.1/8 · 33 strong, 82 med, 52 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 168 sold out (of 294 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 84 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 1.5×</span></td>
+  <td><span class="b top">cizaro</span><span class="b top">tomato</span><span class="b top">tie_house</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>t-shirts · <b>oversized</b><br>
+    <span class="speed"><span class="conf hi"></span> 16 brands · 1,063 products</span></td>
+  <td><span class="pill buy">Make — mid vol</span></td>
+  <td><span class="price-pill">under 300</span><br>
+    <span class="ci">46.2% ±5.5 sell-through</span></td>
+  <td><span class="spark"><i style="height:81%"></i><i style="height:88%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:93%"></i><i style="height:72%"></i><i style="height:67%"></i><i style="height:64%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-21%</span><br>
+    <span class="speed">Persistence: 6.0/8 · 40 strong, 64 med, 26 weak</span>
+    <span class="speed">Demand: At under 300 EGP: 144 sold out (of 457 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 95 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 6.1×</span></td>
+  <td><span class="b top">ravin</span><span class="b top">tomato</span><span class="b top">town_team</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>trousers · <b>wide-leg</b><br>
+    <span class="speed"><span class="conf md"></span> 19 brands · 621 products</span></td>
+  <td><span class="pill buy">Make — mid vol</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">42.5% ±7.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:78%"></i><i style="height:80%"></i><i style="height:76%"></i><i style="height:76%"></i><i style="height:94%"></i><i style="height:100%"></i><i style="height:91%"></i><i style="height:82%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+5%</span><br>
+    <span class="speed">Persistence: 6.4/8 · 33 strong, 27 med, 18 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 68 sold out (of 235 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 97 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 4.1×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">mlameh</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr><tr><td colspan="6" class="tier">Watch — don't commit yet</td></tr><tr>
+  <td>sweatshirts · <b>long-sleeve</b><br>
+    <span class="speed"><span class="conf lo"></span> 7 brands · 612 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">500-699</span><br>
+    <span class="ci">49.7% ±8.0 sell-through</span></td>
+  <td><span class="spark"><i style="height:71%"></i><i style="height:71%"></i><i style="height:71%"></i><i style="height:85%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+40%</span><br>
+    <span class="speed">Persistence: 7.4/8 · 5 strong, 2 med, 0 weak</span>
+    <span class="speed">Demand: At 500-699 EGP: 75 sold out (of 173 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 130 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 5.4×</span></td>
+  <td><span class="b top">town_team</span><span class="b top">activ</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jeans · <b>flare</b><br>
+    <span class="speed"><span class="conf lo"></span> 8 brands · 52 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">88.6% ±9.4 sell-through</span></td>
+  <td><span class="spark"><i style="height:65%"></i><i style="height:70%"></i><i style="height:60%"></i><i style="height:37%"></i><i style="height:92%"></i><i style="height:100%"></i><i style="height:72%"></i><i style="height:50%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-23%</span><br>
+    <span class="speed">Persistence: 5.6/8 · 17 strong, 22 med, 12 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 39 sold out (of 47 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 97 days to sell</span></td>
+  <td><span class="timing slow">Slowing</span><br>
+    <span class="speed">Gap 1.2×</span></td>
+  <td><span class="b top">cizaro</span><span class="b top">or_egypt</span><span class="b top">andora</span><span class="b">+2</span></td>
+</tr><tr>
+  <td>t-shirts · <b>long-sleeve</b><br>
+    <span class="speed"><span class="conf lo"></span> 10 brands · 238 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">under 300</span><br>
+    <span class="ci">63.2% ±12.5 sell-through</span></td>
+  <td><span class="spark"><i style="height:29%"></i><i style="height:35%"></i><i style="height:45%"></i><i style="height:59%"></i><i style="height:51%"></i><i style="height:94%"></i><i style="height:100%"></i><i style="height:97%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+227%</span><br>
+    <span class="speed">Persistence: 4.7/8 · 9 strong, 35 med, 6 weak</span>
+    <span class="speed">Demand: At under 300 EGP: 36 sold out (of 112 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 91 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 3.1×</span></td>
+  <td><span class="b top">ravin</span><span class="b top">arafa</span><span class="b top">or_egypt</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>trousers · <b>cargo</b><br>
+    <span class="speed"><span class="conf lo"></span> 15 brands · 158 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">54.5% ±20.8 sell-through</span></td>
+  <td><span class="spark"><i style="height:64%"></i><i style="height:64%"></i><i style="height:78%"></i><i style="height:96%"></i><i style="height:100%"></i><i style="height:85%"></i><i style="height:89%"></i><i style="height:85%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+33%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 15 strong, 14 med, 8 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 12 sold out (of 58 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 108 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 4.6×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">arafa</span><span class="b top">ravin</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>trousers · <b>formal</b><br>
+    <span class="speed"><span class="conf lo"></span> 14 brands · 317 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">40.4% ±12.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:97%"></i><i style="height:100%"></i><i style="height:97%"></i><i style="height:92%"></i><i style="height:74%"></i><i style="height:76%"></i><i style="height:71%"></i><i style="height:74%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-24%</span><br>
+    <span class="speed">Persistence: 6.7/8 · 24 strong, 18 med, 6 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 23 sold out (of 78 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 104 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 4.5×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">tie_house</span><span class="b top">esla</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>shorts · <b>denim</b><br>
+    <span class="speed"><span class="conf lo"></span> 11 brands · 118 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">300-499</span><br>
+    <span class="ci">34.0% ±13.1 sell-through</span></td>
+  <td><span class="spark"><i style="height:62%"></i><i style="height:62%"></i><i style="height:62%"></i><i style="height:87%"></i><i style="height:100%"></i><i style="height:87%"></i><i style="height:87%"></i><i style="height:75%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+20%</span><br>
+    <span class="speed">Persistence: 5.8/8 · 3 strong, 6 med, 2 weak</span>
+    <span class="speed">Demand: At 300-499 EGP: 17 sold out (of 42 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 125 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 10.4×</span></td>
+  <td><span class="b top">tomato</span><span class="b top">ravin</span><span class="b top">arafa</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>dresses · <b>maxi</b><br>
+    <span class="speed"><span class="conf lo"></span> 8 brands · 156 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">37.7% ±11.4 sell-through</span></td>
+  <td><span class="spark"><i style="height:81%"></i><i style="height:100%"></i><i style="height:81%"></i><i style="height:81%"></i><i style="height:81%"></i><i style="height:81%"></i><i style="height:72%"></i><i style="height:81%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+0%</span><br>
+    <span class="speed">Persistence: 5.8/8 · 5 strong, 8 med, 5 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 26 sold out (of 54 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 51 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.3×</span></td>
+  <td><span class="b top">mlameh</span><span class="b top">or_egypt</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>sweaters · <b>zip</b><br>
+    <span class="speed"><span class="conf lo"></span> 12 brands · 113 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">500-699</span><br>
+    <span class="ci">55.6% ±23.0 sell-through</span></td>
+  <td><span class="spark"><i style="height:75%"></i><i style="height:75%"></i><i style="height:75%"></i><i style="height:75%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:75%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+0%</span><br>
+    <span class="speed">Persistence: 0/8 · 0 strong, 0 med, 0 weak</span>
+    <span class="speed">Demand: At 500-699 EGP: 10 sold out (of 35 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 123 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.2×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">andora</span><span class="b top">town_team</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>skirts · <b>maxi</b><br>
+    <span class="speed"><span class="conf lo"></span> 8 brands · 77 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">54.5% ±20.8 sell-through</span></td>
+  <td><span class="spark"><i style="height:66%"></i><i style="height:75%"></i><i style="height:75%"></i><i style="height:75%"></i><i style="height:83%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:100%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+50%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 7 strong, 7 med, 1 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 12 sold out (of 35 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 71 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 1.7×</span></td>
+  <td><span class="b top">or_egypt</span><span class="b top">mlameh</span><span class="b top">ravin</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>sweaters · <b>turtleneck</b><br>
+    <span class="speed"><span class="conf lo"></span> 13 brands · 127 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">37.1% ±16.0 sell-through</span></td>
+  <td><span class="spark"><i style="height:60%"></i><i style="height:60%"></i><i style="height:80%"></i><i style="height:100%"></i><i style="height:80%"></i><i style="height:80%"></i><i style="height:100%"></i><i style="height:80%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+33%</span><br>
+    <span class="speed">Persistence: 6.2/8 · 2 strong, 3 med, 2 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 13 sold out (of 33 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 111 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 2.8×</span></td>
+  <td><span class="b top">or_egypt</span><span class="b top">town_team</span><span class="b top">andora</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jackets · <b>bomber</b><br>
+    <span class="speed"><span class="conf lo"></span> 10 brands · 131 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">33.3% ±9.3 sell-through</span></td>
+  <td><span class="spark"><i style="height:93%"></i><i style="height:90%"></i><i style="height:100%"></i><i style="height:96%"></i><i style="height:65%"></i><i style="height:68%"></i><i style="height:78%"></i><i style="height:50%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-47%</span><br>
+    <span class="speed">Persistence: 6.7/8 · 20 strong, 12 med, 5 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 33 sold out (of 42 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 122 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 5.5×</span></td>
+  <td><span class="b top">ravin</span><span class="b top">town_team</span><span class="b top">mens_club</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jackets · <b>denim</b><br>
+    <span class="speed"><span class="conf lo"></span> 12 brands · 111 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">31.2% ±16.1 sell-through</span></td>
+  <td><span class="spark"><i style="height:78%"></i><i style="height:78%"></i><i style="height:78%"></i><i style="height:84%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:94%"></i><i style="height:84%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+7%</span><br>
+    <span class="speed">Persistence: 6.4/8 · 12 strong, 9 med, 6 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 10 sold out (of 27 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 105 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 1.9×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">khotwh</span><span class="b top">cizaro</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>t-shirts · <b>sleeveless</b><br>
+    <span class="speed"><span class="conf lo"></span> 7 brands · 52 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">under 300</span><br>
+    <span class="ci">42.9% ±18.3 sell-through</span></td>
+  <td><span class="spark"><i style="height:100%"></i><i style="height:100%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+0%</span><br>
+    <span class="speed">Persistence: 0/8 · 0 strong, 0 med, 0 weak</span>
+    <span class="speed">Demand: At under 300 EGP: 12 sold out (of 18 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 84 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 6.9×</span></td>
+  <td><span class="b top">arafa</span><span class="b top">tomato</span><span class="b top">ravin</span><span class="b">+2</span></td>
+</tr><tr>
+  <td>jackets · <b>windbreaker</b><br>
+    <span class="speed"><span class="conf lo"></span> 6 brands · 137 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">16.2% ±6.7 sell-through</span></td>
+  <td><span class="spark"><i style="height:59%"></i><i style="height:59%"></i><i style="height:62%"></i><i style="height:70%"></i><i style="height:100%"></i><i style="height:92%"></i><i style="height:92%"></i><i style="height:88%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--good);">+50%</span><br>
+    <span class="speed">Persistence: 6.8/8 · 15 strong, 12 med, 1 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 19 sold out (of 27 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 124 days to sell</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 3.3×</span></td>
+  <td><span class="b top">town_team</span><span class="b top">andora</span><span class="b top">tomato</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>dresses · <b>midi</b><br>
+    <span class="speed"><span class="conf lo"></span> 8 brands · 60 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">38.9% ±22.5 sell-through</span></td>
+  <td><span class="spark"><i style="height:83%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:83%"></i><i style="height:83%"></i><i style="height:83%"></i><i style="height:66%"></i><i style="height:66%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-20%</span><br>
+    <span class="speed">Persistence: 6.5/8 · 4 strong, 3 med, 0 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 7 sold out (of 21 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 81 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 4.7×</span></td>
+  <td><span class="b top">just_sbr</span><span class="b top">tomato</span><span class="b top">or_egypt</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>jackets · <b>leather</b><br>
+    <span class="speed"><span class="conf lo"></span> 11 brands · 72 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">1,000+</span><br>
+    <span class="ci">31.0% ±11.9 sell-through</span></td>
+  <td><span class="spark"><i style="height:88%"></i><i style="height:88%"></i><i style="height:100%"></i><i style="height:100%"></i><i style="height:66%"></i><i style="height:55%"></i><i style="height:66%"></i><i style="height:55%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-38%</span><br>
+    <span class="speed">Persistence: 6.9/8 · 6 strong, 2 med, 1 weak</span>
+    <span class="speed">Demand: At 1,000+ EGP: 18 sold out (of 20 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 107 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 2.3×</span></td>
+  <td><span class="b top">ravin</span><span class="b top">town_team</span><span class="b top">arafa</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>sweaters · <b>v-neck</b><br>
+    <span class="speed"><span class="conf lo"></span> 12 brands · 127 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">37.0% ±18.2 sell-through</span></td>
+  <td><span class="spark"><i style="height:83%"></i><i style="height:83%"></i><i style="height:100%"></i><i style="height:83%"></i><i style="height:83%"></i><i style="height:83%"></i><i style="height:83%"></i><i style="height:66%"></i></span><span style="font-family:var(--mono);font-size:10px;color:var(--bad);">-20%</span><br>
+    <span class="speed">Persistence: 7.8/8 · 5 strong, 0 med, 1 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 10 sold out (of 17 sold out across all prices in this category)</span>
+    <span class="speed">Speed: 119 days to sell</span></td>
+  <td><span class="timing soon">Soon</span><br>
+    <span class="speed">Gap 5.4×</span></td>
+  <td><span class="b top">ravin</span><span class="b top">andora</span><span class="b top">tie_house</span><span class="b">+3</span></td>
+</tr><tr>
+  <td>sweatshirts · <b>short-sleeve</b><br>
+    <span class="speed"><span class="conf lo"></span> 1 brands · 23 products</span></td>
+  <td><span class="pill watch">Watch</span></td>
+  <td><span class="price-pill">700-999</span><br>
+    <span class="ci">31.2% ±22.7 sell-through</span></td>
+  <td><span style="font-family:var(--mono);font-size:10px;color:var(--faint);">+0%</span><br>
+    <span class="speed">Persistence: 0/8 · 0 strong, 0 med, 0 weak</span>
+    <span class="speed">Demand: At 700-999 EGP: 5 sold out (of 10 sold out across all prices in this category)</span>
+    <span class="speed">Speed: —</span></td>
+  <td><span class="timing go">Now</span><br>
+    <span class="speed">Gap 13.5×</span></td>
+  <td><span class="b top">town_team</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>How to read this:</b> Each row is a production decision.
+      The demand proof column shows three layers: bestseller trend, persistence score,
+      and demand index. Price sell-through is an <b>observed association</b> — premium brands
+      may sell more because of brand strength, not price alone.
+      <br><br><b>Newness caveat:</b> Products under 14 days on bestseller lists may reflect
+      small initial stock, not strong demand. Persistence score helps distinguish:
+      1-2 weeks = could be scarcity, 6+ weeks = proven demand.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">03</span>
+    <span class="t">Don't make these — they look like gaps but they're traps</span></div>
+  <div class="bd"><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>dresses · mini</strong>
+    <span class="ci"><span class="conf lo"></span> low confidence</span> —
+    <span class="reason">392 products in discount escalation (avg 38.9% depth).
+    Led by lc_waikiki, khotwh. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>hoodies · pullover</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">1605 products in discount escalation (avg 25.1% depth).
+    Led by khotwh. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>shirts · linen</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">1038 products in discount escalation (avg 38.9% depth).
+    Led by khotwh, lc_waikiki, cizaro. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>shirts · overshirt</strong>
+    <span class="ci"><span class="conf md"></span> medium confidence</span> —
+    <span class="reason">1204 products in discount escalation (avg 36.5% depth).
+    Led by khotwh, lc_waikiki, mens_club. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>jeans · mom-fit</strong>
+    <span class="ci"><span class="conf lo"></span> low confidence</span> —
+    <span class="reason">251 products in discount escalation (avg 31.9% depth).
+    Led by khotwh, lc_waikiki, tomato. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>t-shirts · graphic-printed</strong>
+    <span class="ci"><span class="conf hi"></span> high confidence</span> —
+    <span class="reason">6094 products in discount escalation (avg 44.6% depth).
+    Led by khotwh, lc_waikiki, town_team. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>skirts · midi</strong>
+    <span class="ci"><span class="conf lo"></span> low confidence</span> —
+    <span class="reason">160 products in discount escalation (avg 25.0% depth).
+    Led by khotwh. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div><div class="avoid-item">
+  <span class="avoid-x">✕</span>
+  <div class="avoid-body"><strong>shorts · chino</strong>
+    <span class="ci"><span class="conf lo"></span> low confidence</span> —
+    <span class="reason">553 products in discount escalation (avg 38.6% depth).
+    Led by khotwh, lc_waikiki. Sell-outs in this category are clearance-driven, not real demand.</span>
+  </div>
+</div></div>
+</section><section class="blk">
+  <div class="hd"><span class="n">04</span>
+    <span class="t">Are you early or late? — sell-outs vs restocks (last 21 days)</span></div>
+  <div class="bd">
+    <p class="intro">Ratio above 2× = gap wide open. 1-2× = narrowing. Counts are witnessed events over the last 21 days — small categories will naturally show small counts.</p>
+    <div class="table-wrap"><table><thead><tr>
+      <th>Opportunity</th><th>Sell-outs<br><span style="font-weight:400;text-transform:none;">21 days</span></th><th>Restocks<br><span style="font-weight:400;text-transform:none;">21 days</span></th><th>Gap</th>
+      <th>Demand index</th><th>Top restockers</th>
+    </tr></thead><tbody><tr>
+  <td>sweatshirts · <b>short-sleeve</b></td>
+  <td class="m">27</td><td class="m">2</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 13.5×</td>
+  <td class="m">10 + 8 = 18</td>
+  <td><span class="b">town_team</span></td>
+</tr><tr>
+  <td>t-shirts · <b>short-sleeve</b></td>
+  <td class="m">2,953</td><td class="m">275</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 10.7×</td>
+  <td class="m">873 + 715 = 1588</td>
+  <td><span class="b">arafa</span><span class="b">tomato</span><span class="b">town_team</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>shorts · <b>denim</b></td>
+  <td class="m">166</td><td class="m">16</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 10.4×</td>
+  <td class="m">42 + 37 = 79</td>
+  <td><span class="b">tomato</span><span class="b">ravin</span><span class="b">arafa</span><span class="b">town_team</span></td>
+</tr><tr>
+  <td>shorts · <b>sport</b></td>
+  <td class="m">566</td><td class="m">61</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 9.3×</td>
+  <td class="m">147 + 112 = 259</td>
+  <td><span class="b">arafa</span><span class="b">tomato</span><span class="b">town_team</span><span class="b">andora</span></td>
+</tr><tr>
+  <td>trousers · <b>chino</b></td>
+  <td class="m">435</td><td class="m">57</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 7.6×</td>
+  <td class="m">94 + 66 = 160</td>
+  <td><span class="b">tomato</span><span class="b">mens_club</span><span class="b">tie_house</span><span class="b">dott_jeans</span></td>
+</tr><tr>
+  <td>t-shirts · <b>sleeveless</b></td>
+  <td class="m">62</td><td class="m">9</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 6.9×</td>
+  <td class="m">18 + 14 = 32</td>
+  <td><span class="b">arafa</span><span class="b">tomato</span><span class="b">ravin</span><span class="b">or_egypt</span></td>
+</tr><tr>
+  <td>shirts · <b>short-sleeve</b></td>
+  <td class="m">1,509</td><td class="m">222</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 6.8×</td>
+  <td class="m">589 + 444 = 1033</td>
+  <td><span class="b">town_team</span><span class="b">tomato</span><span class="b">arafa</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>t-shirts · <b>oversized</b></td>
+  <td class="m">1,131</td><td class="m">185</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 6.1×</td>
+  <td class="m">457 + 344 = 801</td>
+  <td><span class="b">ravin</span><span class="b">tomato</span><span class="b">town_team</span><span class="b">arafa</span></td>
+</tr><tr>
+  <td>jackets · <b>bomber</b></td>
+  <td class="m">77</td><td class="m">14</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 5.5×</td>
+  <td class="m">42 + 30 = 72</td>
+  <td><span class="b">ravin</span><span class="b">town_team</span><span class="b">mens_club</span><span class="b">andora</span></td>
+</tr><tr>
+  <td>sweatshirts · <b>long-sleeve</b></td>
+  <td class="m">392</td><td class="m">73</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 5.4×</td>
+  <td class="m">173 + 128 = 301</td>
+  <td><span class="b">town_team</span><span class="b">activ</span><span class="b">tomato</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>sweaters · <b>v-neck</b></td>
+  <td class="m">27</td><td class="m">5</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 5.4×</td>
+  <td class="m">17 + 13 = 30</td>
+  <td><span class="b">ravin</span><span class="b">andora</span><span class="b">tie_house</span><span class="b">or_egypt</span></td>
+</tr><tr>
+  <td>trousers · <b>jogger-style</b></td>
+  <td class="m">479</td><td class="m">101</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.7×</td>
+  <td class="m">202 + 145 = 347</td>
+  <td><span class="b">tomato</span><span class="b">town_team</span><span class="b">khotwh</span><span class="b">arafa</span></td>
+</tr><tr>
+  <td>dresses · <b>midi</b></td>
+  <td class="m">52</td><td class="m">11</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.7×</td>
+  <td class="m">21 + 15 = 36</td>
+  <td><span class="b">just_sbr</span><span class="b">tomato</span><span class="b">or_egypt</span><span class="b">carina</span></td>
+</tr><tr>
+  <td>trousers · <b>cargo</b></td>
+  <td class="m">247</td><td class="m">54</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.6×</td>
+  <td class="m">58 + 36 = 94</td>
+  <td><span class="b">tomato</span><span class="b">arafa</span><span class="b">ravin</span><span class="b">mens_club</span></td>
+</tr><tr>
+  <td>trousers · <b>formal</b></td>
+  <td class="m">227</td><td class="m">51</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.5×</td>
+  <td class="m">78 + 50 = 128</td>
+  <td><span class="b">tomato</span><span class="b">tie_house</span><span class="b">esla</span><span class="b">mlameh</span></td>
+</tr><tr>
+  <td>jackets · <b>puffer</b></td>
+  <td class="m">244</td><td class="m">55</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.4×</td>
+  <td class="m">114 + 74 = 188</td>
+  <td><span class="b">town_team</span><span class="b">mens_club</span><span class="b">andora</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>shirts · <b>long-sleeve</b></td>
+  <td class="m">1,152</td><td class="m">283</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.1×</td>
+  <td class="m">446 + 305 = 751</td>
+  <td><span class="b">tomato</span><span class="b">ravin</span><span class="b">arafa</span><span class="b">town_team</span></td>
+</tr><tr>
+  <td>trousers · <b>wide-leg</b></td>
+  <td class="m">799</td><td class="m">196</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.1×</td>
+  <td class="m">235 + 141 = 376</td>
+  <td><span class="b">arafa</span><span class="b">mlameh</span><span class="b">tomato</span><span class="b">esla</span></td>
+</tr><tr>
+  <td>t-shirts · <b>basic</b></td>
+  <td class="m">742</td><td class="m">179</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 4.1×</td>
+  <td class="m">219 + 146 = 365</td>
+  <td><span class="b">arafa</span><span class="b">ravin</span><span class="b">tomato</span><span class="b">tie_house</span></td>
+</tr><tr>
+  <td>jackets · <b>windbreaker</b></td>
+  <td class="m">53</td><td class="m">16</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 3.3×</td>
+  <td class="m">27 + 16 = 43</td>
+  <td><span class="b">town_team</span><span class="b">andora</span><span class="b">tomato</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>t-shirts · <b>long-sleeve</b></td>
+  <td class="m">279</td><td class="m">91</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 3.1×</td>
+  <td class="m">112 + 66 = 178</td>
+  <td><span class="b">ravin</span><span class="b">arafa</span><span class="b">or_egypt</span><span class="b">andora</span></td>
+</tr><tr>
+  <td>shirts · <b>formal</b></td>
+  <td class="m">234</td><td class="m">82</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.9×</td>
+  <td class="m">97 + 61 = 158</td>
+  <td><span class="b">tie_house</span><span class="b">esla</span><span class="b">tomato</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>sweaters · <b>turtleneck</b></td>
+  <td class="m">77</td><td class="m">28</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.8×</td>
+  <td class="m">33 + 16 = 49</td>
+  <td><span class="b">or_egypt</span><span class="b">town_team</span><span class="b">andora</span><span class="b">khotwh</span></td>
+</tr><tr>
+  <td>jeans · <b>slim</b></td>
+  <td class="m">284</td><td class="m">118</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.4×</td>
+  <td class="m">92 + 58 = 150</td>
+  <td><span class="b">tomato</span><span class="b">cizaro</span><span class="b">town_team</span><span class="b">dott_jeans</span></td>
+</tr><tr>
+  <td>dresses · <b>maxi</b></td>
+  <td class="m">146</td><td class="m">64</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.3×</td>
+  <td class="m">54 + 33 = 87</td>
+  <td><span class="b">mlameh</span><span class="b">or_egypt</span><span class="b">tomato</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>jackets · <b>leather</b></td>
+  <td class="m">43</td><td class="m">19</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.3×</td>
+  <td class="m">20 + 10 = 30</td>
+  <td><span class="b">ravin</span><span class="b">town_team</span><span class="b">arafa</span><span class="b">mens_club</span></td>
+</tr><tr>
+  <td>sweaters · <b>zip</b></td>
+  <td class="m">103</td><td class="m">47</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.2×</td>
+  <td class="m">35 + 23 = 58</td>
+  <td><span class="b">arafa</span><span class="b">andora</span><span class="b">town_team</span><span class="b">mens_club</span></td>
+</tr><tr>
+  <td>jeans · <b>straight</b></td>
+  <td class="m">414</td><td class="m">193</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--good);">OPEN 2.1×</td>
+  <td class="m">97 + 43 = 140</td>
+  <td><span class="b">cizaro</span><span class="b">tomato</span><span class="b">dott_jeans</span><span class="b">town_team</span></td>
+</tr><tr>
+  <td>jackets · <b>denim</b></td>
+  <td class="m">63</td><td class="m">34</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--warn);">NARROWING 1.9×</td>
+  <td class="m">27 + 12 = 39</td>
+  <td><span class="b">arafa</span><span class="b">khotwh</span><span class="b">cizaro</span><span class="b">ravin</span></td>
+</tr><tr>
+  <td>skirts · <b>maxi</b></td>
+  <td class="m">82</td><td class="m">49</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--warn);">NARROWING 1.7×</td>
+  <td class="m">35 + 13 = 48</td>
+  <td><span class="b">or_egypt</span><span class="b">mlameh</span><span class="b">ravin</span><span class="b">esla</span></td>
+</tr><tr>
+  <td>jeans · <b>wide-baggy</b></td>
+  <td class="m">1,646</td><td class="m">1,123</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--warn);">NARROWING 1.5×</td>
+  <td class="m">294 + 98 = 392</td>
+  <td><span class="b">cizaro</span><span class="b">tomato</span><span class="b">tie_house</span><span class="b">dott_jeans</span></td>
+</tr><tr>
+  <td>jeans · <b>flare</b></td>
+  <td class="m">290</td><td class="m">235</td>
+  <td style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--warn);">NARROWING 1.2×</td>
+  <td class="m">47 + 7 = 54</td>
+  <td><span class="b">cizaro</span><span class="b">or_egypt</span><span class="b">andora</span><span class="b">esla</span></td>
+</tr></tbody></table></div>
+    <div class="note"><b>Demand index:</b> "sold out" + "still out of stock" = estimated total demand
+      including what couldn't be sold because it was already gone. All figures cover the last 21 days only.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">05</span><span class="t">Production specs — size and colour ratios</span></div>
+  <div class="bd">
+    <p class="intro">Pick a tab. Ratios come from what customers are buying out — not what brands are stocking.</p>
+    <div class="tabs">
+      <div class="tab-nav"><button class="tab-btn active" onclick="switchTab(this,'spec0')">t-shirts · short-sleeve</button><button class="tab-btn" onclick="switchTab(this,'spec1')">shirts · short-sleeve</button><button class="tab-btn" onclick="switchTab(this,'spec2')">shirts · long-sleeve</button><button class="tab-btn" onclick="switchTab(this,'spec3')">t-shirts · basic</button><button class="tab-btn" onclick="switchTab(this,'spec4')">shorts · sport</button><button class="tab-btn" onclick="switchTab(this,'spec5')">trousers · jogger-style</button><button class="tab-btn" onclick="switchTab(this,'spec6')">trousers · chino</button><button class="tab-btn" onclick="switchTab(this,'spec7')">jeans · straight</button><button class="tab-btn" onclick="switchTab(this,'spec8')">jeans · slim</button><button class="tab-btn" onclick="switchTab(this,'spec9')">jackets · puffer</button><button class="tab-btn" onclick="switchTab(this,'spec10')">shirts · formal</button><button class="tab-btn" onclick="switchTab(this,'spec11')">jeans · wide-baggy</button><button class="tab-btn" onclick="switchTab(this,'spec12')">t-shirts · oversized</button><button class="tab-btn" onclick="switchTab(this,'spec13')">trousers · wide-leg</button></div>
+      <div id="spec0" class="tab-panel active">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">23%</span></div></div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:95%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:81%;background:var(--act);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">3XL</span><div class="bar-track"><div class="bar-fill" style="width:55%;background:var(--act);"></div><span class="bar-val">13%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:54%;background:var(--act);"></div><span class="bar-val">12%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:43%;background:var(--act);"></div><span class="bar-val">10%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">39%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:65%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">26%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:31%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">12%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:31%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">12%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:29%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">11%</span></div></div></div>
+  </div>
+</div><div id="spec1" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">21%</span></div></div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:95%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:87%;background:var(--act);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:71%;background:var(--act);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:69%;background:var(--act);"></div><span class="bar-val">14%</span></div></div><div class="bar-row"><span class="bar-lbl">3XL</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:var(--act);"></div><span class="bar-val">13%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:99%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:88%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:71%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:52%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">13%</span></div></div></div>
+  </div>
+</div><div id="spec2" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:92%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:82%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:59%;background:var(--act);"></div><span class="bar-val">14%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:52%;background:var(--act);"></div><span class="bar-val">12%</span></div></div><div class="bar-row"><span class="bar-lbl">3XL</span><div class="bar-track"><div class="bar-fill" style="width:32%;background:var(--act);"></div><span class="bar-val">8%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">28%</span></div></div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:74%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">21%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:69%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:51%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">14%</span></div></div></div>
+  </div>
+</div><div id="spec3" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:88%;background:var(--act);"></div><span class="bar-val">21%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:84%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:65%;background:var(--act);"></div><span class="bar-val">16%</span></div></div><div class="bar-row"><span class="bar-lbl">XXL</span><div class="bar-track"><div class="bar-fill" style="width:43%;background:var(--act);"></div><span class="bar-val">10%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:38%;background:var(--act);"></div><span class="bar-val">9%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">31%</span></div></div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:80%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">25%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:62%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:41%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">13%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:41%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">13%</span></div></div></div>
+  </div>
+</div><div id="spec4" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:85%;background:var(--act);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:85%;background:var(--act);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">8</span><div class="bar-track"><div class="bar-fill" style="width:69%;background:var(--act);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">6</span><div class="bar-track"><div class="bar-fill" style="width:66%;background:var(--act);"></div><span class="bar-val">14%</span></div></div><div class="bar-row"><span class="bar-lbl">4</span><div class="bar-track"><div class="bar-fill" style="width:53%;background:var(--act);"></div><span class="bar-val">12%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">27%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:86%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">23%</span></div></div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:67%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:63%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:59%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">16%</span></div></div></div>
+  </div>
+</div><div id="spec5" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">25%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:86%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:79%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:59%;background:var(--act);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:41%;background:var(--act);"></div><span class="bar-val">10%</span></div></div><div class="bar-row"><span class="bar-lbl">3XL</span><div class="bar-track"><div class="bar-fill" style="width:32%;background:var(--act);"></div><span class="bar-val">8%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">25%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:98%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:79%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:69%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:61%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">15%</span></div></div></div>
+  </div>
+</div><div id="spec6" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">36</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">38</span><div class="bar-track"><div class="bar-fill" style="width:82%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">40</span><div class="bar-track"><div class="bar-fill" style="width:69%;background:var(--act);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">34</span><div class="bar-track"><div class="bar-fill" style="width:65%;background:var(--act);"></div><span class="bar-val">16%</span></div></div><div class="bar-row"><span class="bar-lbl">30</span><div class="bar-track"><div class="bar-fill" style="width:51%;background:var(--act);"></div><span class="bar-val">12%</span></div></div><div class="bar-row"><span class="bar-lbl">14Y</span><div class="bar-track"><div class="bar-fill" style="width:44%;background:var(--act);"></div><span class="bar-val">11%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:90%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">21%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:72%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:58%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">14%</span></div></div></div>
+  </div>
+</div><div id="spec7" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">40</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">38</span><div class="bar-track"><div class="bar-fill" style="width:98%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">42</span><div class="bar-track"><div class="bar-fill" style="width:89%;background:var(--act);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">34</span><div class="bar-track"><div class="bar-fill" style="width:79%;background:var(--act);"></div><span class="bar-val">16%</span></div></div><div class="bar-row"><span class="bar-lbl">44</span><div class="bar-track"><div class="bar-fill" style="width:66%;background:var(--act);"></div><span class="bar-val">13%</span></div></div><div class="bar-row"><span class="bar-lbl">46</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:var(--act);"></div><span class="bar-val">13%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">68%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:24%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">16%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:16%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">11%</span></div></div><div class="bar-row"><span class="bar-lbl">nan</span><div class="bar-track"><div class="bar-fill" style="width:6%;background:#B8B4A8;border:1px solid var(--grid);"></div><span class="bar-val">4%</span></div></div><div class="bar-row"><span class="bar-lbl">BLB</span><div class="bar-track"><div class="bar-fill" style="width:1%;background:#B8B4A8;border:1px solid var(--grid);"></div><span class="bar-val">1%</span></div></div></div>
+  </div>
+</div><div id="spec8" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">34</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">40</span><div class="bar-track"><div class="bar-fill" style="width:85%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">36</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:var(--act);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">38</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:var(--act);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">32</span><div class="bar-track"><div class="bar-fill" style="width:59%;background:var(--act);"></div><span class="bar-val">14%</span></div></div><div class="bar-row"><span class="bar-lbl">30</span><div class="bar-track"><div class="bar-fill" style="width:44%;background:var(--act);"></div><span class="bar-val">10%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">60%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:32%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:17%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">10%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:13%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">8%</span></div></div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:4%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">2%</span></div></div></div>
+  </div>
+</div><div id="spec9" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">26%</span></div></div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:83%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:75%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:75%;background:var(--act);"></div><span class="bar-val">20%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:25%;background:var(--act);"></div><span class="bar-val">7%</span></div></div><div class="bar-row"><span class="bar-lbl">3XL</span><div class="bar-track"><div class="bar-fill" style="width:23%;background:var(--act);"></div><span class="bar-val">6%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">41%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:59%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">25%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:37%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:23%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">9%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:23%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">9%</span></div></div></div>
+  </div>
+</div><div id="spec10" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">42</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:96%;background:var(--act);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:96%;background:var(--act);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">40</span><div class="bar-track"><div class="bar-fill" style="width:88%;background:var(--act);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">44</span><div class="bar-track"><div class="bar-fill" style="width:88%;background:var(--act);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">41</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:var(--act);"></div><span class="bar-val">12%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">32%</span></div></div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:67%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">21%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:59%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:49%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">16%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:39%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">12%</span></div></div></div>
+  </div>
+</div><div id="spec11" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">38</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">44</span><div class="bar-track"><div class="bar-fill" style="width:97%;background:var(--act);"></div><span class="bar-val">18%</span></div></div><div class="bar-row"><span class="bar-lbl">42</span><div class="bar-track"><div class="bar-fill" style="width:94%;background:var(--act);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">40</span><div class="bar-track"><div class="bar-fill" style="width:88%;background:var(--act);"></div><span class="bar-val">16%</span></div></div><div class="bar-row"><span class="bar-lbl">46</span><div class="bar-track"><div class="bar-fill" style="width:83%;background:var(--act);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">36</span><div class="bar-track"><div class="bar-fill" style="width:79%;background:var(--act);"></div><span class="bar-val">15%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">81%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:8%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">7%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:8%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">6%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:5%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">4%</span></div></div><div class="bar-row"><span class="bar-lbl">nan</span><div class="bar-track"><div class="bar-fill" style="width:2%;background:#B8B4A8;border:1px solid var(--grid);"></div><span class="bar-val">2%</span></div></div></div>
+  </div>
+</div><div id="spec12" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">27%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:90%;background:var(--act);"></div><span class="bar-val">25%</span></div></div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:90%;background:var(--act);"></div><span class="bar-val">24%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:51%;background:var(--act);"></div><span class="bar-val">14%</span></div></div><div class="bar-row"><span class="bar-lbl">2XL</span><div class="bar-track"><div class="bar-fill" style="width:26%;background:var(--act);"></div><span class="bar-val">7%</span></div></div><div class="bar-row"><span class="bar-lbl">3XL</span><div class="bar-track"><div class="bar-fill" style="width:11%;background:var(--act);"></div><span class="bar-val">3%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">white</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#F5F3ED;border:1px solid var(--grid);"></div><span class="bar-val">30%</span></div></div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:76%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">23%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:64%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:52%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">15%</span></div></div><div class="bar-row"><span class="bar-lbl">grey</span><div class="bar-track"><div class="bar-fill" style="width:42%;background:#9A978F;border:1px solid var(--grid);"></div><span class="bar-val">13%</span></div></div></div>
+  </div>
+</div><div id="spec13" class="tab-panel">
+  <div class="spec-grid">
+    <div class="spec-col"><div class="spec-title">Size ratio</div><div class="bar-row"><span class="bar-lbl">L</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">XL</span><div class="bar-track"><div class="bar-fill" style="width:98%;background:var(--act);"></div><span class="bar-val">22%</span></div></div><div class="bar-row"><span class="bar-lbl">M</span><div class="bar-track"><div class="bar-fill" style="width:97%;background:var(--act);"></div><span class="bar-val">21%</span></div></div><div class="bar-row"><span class="bar-lbl">S</span><div class="bar-track"><div class="bar-fill" style="width:76%;background:var(--act);"></div><span class="bar-val">17%</span></div></div><div class="bar-row"><span class="bar-lbl">XXL</span><div class="bar-track"><div class="bar-fill" style="width:48%;background:var(--act);"></div><span class="bar-val">11%</span></div></div><div class="bar-row"><span class="bar-lbl">4</span><div class="bar-track"><div class="bar-fill" style="width:32%;background:var(--act);"></div><span class="bar-val">7%</span></div></div></div>
+    <div class="spec-col"><div class="spec-title">Colour ratio</div><div class="bar-row"><span class="bar-lbl">black</span><div class="bar-track"><div class="bar-fill" style="width:100%;background:#1B1B19;border:1px solid var(--grid);"></div><span class="bar-val">31%</span></div></div><div class="bar-row"><span class="bar-lbl">blue</span><div class="bar-track"><div class="bar-fill" style="width:77%;background:#4A6FA5;border:1px solid var(--grid);"></div><span class="bar-val">23%</span></div></div><div class="bar-row"><span class="bar-lbl">green</span><div class="bar-track"><div class="bar-fill" style="width:62%;background:#4A7C59;border:1px solid var(--grid);"></div><span class="bar-val">19%</span></div></div><div class="bar-row"><span class="bar-lbl">brown</span><div class="bar-track"><div class="bar-fill" style="width:45%;background:#8B6F4E;border:1px solid var(--grid);"></div><span class="bar-val">14%</span></div></div><div class="bar-row"><span class="bar-lbl">beige</span><div class="bar-track"><div class="bar-fill" style="width:43%;background:#C8B590;border:1px solid var(--grid);"></div><span class="bar-val">13%</span></div></div></div>
+  </div>
+</div>
+    </div>
+  </div>
+</section>
+<script>
+function switchTab(btn, id) {
+  const c = btn.closest('.tabs');
+  c.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  c.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  c.querySelector('#' + id).classList.add('active');
+}
+</script><section class="blk">
+  <div class="hd"><span class="n">06</span><span class="t">Where to position your price — gaps and commodity zones</span></div>
+  <div class="bd">
+    <p class="intro">Green = where demand peaks (from §02). Each dot is a brand's median price. Find the gap.</p>
+    <div class="sp-block">
+  <div class="sp-name">t-shirts · short-sleeve <span>1668 products tracked</span></div>
+  <div class="sp-axis"><div class="sp-zone peak" style="left:18.8%;width:12.5%;"><span class="sp-zone-lbl pk">★ demand peak</span></div><div class="sp-dot" style="left:10.9%;">Ravin 174</div><div class="sp-dot" style="left:12.4%;">Premoda 199</div><div class="sp-dot" style="left:14.9%;">Tie House 238</div><div class="sp-dot" style="left:15.6%;">Coup 249</div><div class="sp-dot" style="left:18.7%;">Arafa 299</div><div class="sp-dot" style="left:21.8%;">Andora 349</div><div class="sp-dot" style="left:24.9%;">Lc Waikiki 399</div><div class="sp-dot" style="left:24.9%;">Dott Jeans 399</div><div class="sp-dot" style="left:24.9%;">Tomato 399</div><div class="sp-dot" style="left:24.9%;">Or Egypt 399</div><div class="sp-dot" style="left:24.9%;">Town Team 399</div><div class="sp-dot" style="left:43.7%;">Defacto 699</div></div>
+  <div class="sp-ticks"><span>0</span><span>300</span><span>500</span><span>700</span><span>1,000</span><span>1,300</span><span>1,600</span></div>
+</div><div class="sp-block">
+  <div class="sp-name">shirts · short-sleeve <span>2488 products tracked</span></div>
+  <div class="sp-axis"><div class="sp-zone peak" style="left:31.2%;width:12.5%;"><span class="sp-zone-lbl pk">★ demand peak</span></div><div class="sp-dot" style="left:15.6%;">Coup 249</div><div class="sp-dot" style="left:18.7%;">Arafa 299</div><div class="sp-dot" style="left:21.8%;">Andora 349</div><div class="sp-dot" style="left:21.9%;">Eagle 350</div><div class="sp-dot" style="left:24.7%;">Mens Club 395</div><div class="sp-dot" style="left:24.9%;">Dott Jeans 399</div><div class="sp-dot" style="left:25.6%;">Khotwh 410</div><div class="sp-dot" style="left:25.9%;">Tie House 415</div><div class="sp-dot" style="left:28.1%;">Tomato 449</div><div class="sp-dot" style="left:28.1%;">Lc Waikiki 449</div><div class="sp-dot" style="left:31.2%;">Town Team 499</div><div class="sp-dot" style="left:40.6%;">Activ 649</div><div class="sp-dot" style="left:49.9%;">Or Egypt 799</div><div class="sp-dot" style="left:62.4%;">Defacto 999</div><div class="sp-dot" style="left:62.5%;">Ravin 999</div><div class="sp-dot" style="left:81.2%;">Carina 1299</div></div>
+  <div class="sp-ticks"><span>0</span><span>300</span><span>500</span><span>700</span><span>1,000</span><span>1,300</span><span>1,600</span></div>
+</div><div class="sp-block">
+  <div class="sp-name">shirts · long-sleeve <span>1520 products tracked</span></div>
+  <div class="sp-axis"><div class="sp-zone peak" style="left:31.2%;width:12.5%;"><span class="sp-zone-lbl pk">★ demand peak</span></div><div class="sp-dot" style="left:28.1%;">Andora 449</div><div class="sp-dot" style="left:33.6%;">Mlameh 537</div><div class="sp-dot" style="left:34.1%;">Mens Club 545</div><div class="sp-dot" style="left:34.4%;">Arafa 549</div><div class="sp-dot" style="left:34.7%;">Tie House 555</div><div class="sp-dot" style="left:37.4%;">Town Team 599</div><div class="sp-dot" style="left:37.5%;">Eagle 600</div><div class="sp-dot" style="left:43.7%;">Lc Waikiki 699</div><div class="sp-dot" style="left:45.3%;">Khotwh 725</div><div class="sp-dot" style="left:49.9%;">Dott Jeans 799</div><div class="sp-dot" style="left:49.9%;">Coup 799</div><div class="sp-dot" style="left:50.0%;">Tomato 799</div><div class="sp-dot" style="left:52.5%;">Cizaro 839</div><div class="sp-dot" style="left:53.1%;">Activ 849</div><div class="sp-dot" style="left:59.3%;">Or Egypt 949</div><div class="sp-dot" style="left:62.5%;">Ravin 999</div><div class="sp-dot" style="left:74.4%;">Esla 1190</div><div class="sp-dot" style="left:81.2%;">Defacto 1299</div><div class="sp-dot" style="left:81.2%;">Carina 1299</div></div>
+  <div class="sp-ticks"><span>0</span><span>300</span><span>500</span><span>700</span><span>1,000</span><span>1,300</span><span>1,600</span></div>
+</div><div class="sp-block">
+  <div class="sp-name">t-shirts · basic <span>837 products tracked</span></div>
+  <div class="sp-axis"><div class="sp-zone peak" style="left:0.0%;width:18.8%;"><span class="sp-zone-lbl pk">★ demand peak</span></div><div class="sp-dot" style="left:12.4%;">Andora 199</div><div class="sp-dot" style="left:12.5%;">Arafa 199</div><div class="sp-dot" style="left:15.6%;">Coup 249</div><div class="sp-dot" style="left:15.6%;">Premoda 249</div><div class="sp-dot" style="left:16.6%;">Khotwh 265</div><div class="sp-dot" style="left:21.8%;">Lc Waikiki 349</div><div class="sp-dot" style="left:22.5%;">Ravin 359</div><div class="sp-dot" style="left:24.4%;">Tie House 390</div><div class="sp-dot" style="left:26.2%;">Tomato 419</div><div class="sp-dot" style="left:29.9%;">Or Egypt 479</div><div class="sp-dot" style="left:36.2%;">Activ 579</div><div class="sp-dot" style="left:37.4%;">Town Team 599</div><div class="sp-dot" style="left:40.6%;">Carina 649</div><div class="sp-dot" style="left:49.9%;">Defacto 799</div></div>
+  <div class="sp-ticks"><span>0</span><span>300</span><span>500</span><span>700</span><span>1,000</span><span>1,300</span><span>1,600</span></div>
+</div><div class="sp-block">
+  <div class="sp-name">shorts · sport <span>516 products tracked</span></div>
+  <div class="sp-axis"><div class="sp-zone peak" style="left:0.0%;width:18.8%;"><span class="sp-zone-lbl pk">★ demand peak</span></div><div class="sp-dot" style="left:18.4%;">Mens Club 295</div><div class="sp-dot" style="left:18.7%;">Andora 299</div><div class="sp-dot" style="left:18.7%;">Arafa 299</div><div class="sp-dot" style="left:22.4%;">Town Team 359</div><div class="sp-dot" style="left:24.9%;">Lc Waikiki 399</div><div class="sp-dot" style="left:28.1%;">Premoda 449</div><div class="sp-dot" style="left:28.4%;">Tie House 455</div><div class="sp-dot" style="left:29.3%;">Activ 469</div><div class="sp-dot" style="left:31.2%;">Or Egypt 499</div><div class="sp-dot" style="left:34.4%;">Khotwh 550</div><div class="sp-dot" style="left:36.3%;">Tomato 580</div><div class="sp-dot" style="left:43.7%;">Carina 699</div><div class="sp-dot" style="left:49.9%;">Defacto 799</div><div class="sp-dot" style="left:50.0%;">Ravin 799</div></div>
+  <div class="sp-ticks"><span>0</span><span>300</span><span>500</span><span>700</span><span>1,000</span><span>1,300</span><span>1,600</span></div>
+</div>
+    <div class="note"><b>How to read this:</b> If a green zone has no dots in it, that's an opening —
+      nobody is priced where demand peaks. Prices are observed medians, not asking prices for new stock.</div>
+  </div>
+</section><section class="blk">
+  <div class="hd"><span class="n">07</span><span class="t">Methodology & reliability</span></div>
+  <div class="bd"><div class="cov">
+    <span><b>Confidence levels:</b> based on brand count (12+ = high), product count (500+ = high), sell-out sample (200+ = high)</span>
+    <span><b>Bestseller persistence:</b> avg weeks each product appeared on bestseller lists out of 8 weeks of daily snapshots from 19 Shopify brands</span>
+    <span><b>Demand index:</b> sell-outs + products still out of stock — partial proxy for unmet demand, not a unit count</span>
+    <span><b>Confidence intervals:</b> approximate 95% binomial CI — within-brand correlation means true uncertainty is wider</span>
+    <span><b>Speed to sell:</b> median days from product launch to first witnessed sell-out — truncated for products under 21 days old</span>
+    <span><b>Prices:</b> each product's latest snapshot within the last 8 days (not a single fixed date)</span>
+    <span class="x">All price-band findings are <b>observed associations</b> — premium brands may sell more because of brand strength, not price</span>
+    <span class="x">Excludes DeFacto (stock unreliable), Tree, Dalydress. Under-tagged: Carina 17%, Mlameh 33%, Activ 40%</span>
+    <span class="x">Excludes sweatshirts/hoodies mistagged as "shirts" by a known classifier bug (~15% of the category) — fix pending a taxonomy backfill</span>
+  </div></div>
+</section></div>
+</body></html>
