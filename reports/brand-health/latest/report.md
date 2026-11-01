@@ -2,25 +2,29 @@
 *Monthly · replenishment, availability, markdown distress & dead stock*
 
 ## Decision brief — what to act on
-- **mens_club** under stress — restocks 1.7× slower than market; only 5% of sellouts return; 52 escalating markdowns.
-- **lc_waikiki** under stress — 801 escalating markdowns; 469 dead-stock lines.
-- **town_team** under stress — only 12% of sellouts return; 89 escalating markdowns; 104 dead-stock lines.
-- Benchmark the client's restock lag against the slow brands here. [confirmed · 18 brands, 37,647 cycles]
+- **town_team** under stress — restocks 1.7× slower than market; only 26% of sellouts return; 453 escalating markdowns; 132 dead-stock lines.
+- Benchmark the client's restock lag against the slow brands here. [confirmed · 19 brands, 40,057 cycles]
 
 
 ## Brands that need attention
 
 | Brand | Health | Replen vs mkt (×) | Availability % | Distress markdowns | Dead stock | Training risk |
 |---|---|---|---|---|---|---|
-| mens_club | 🔴 stress | 1.67 | 5.0 | 52 | 10 | watch |
-| lc_waikiki | 🔴 stress |  | 92.0 | 801 | 469 | high |
-| town_team | 🔴 stress | 1.33 | 12.0 | 89 | 104 | watch |
-| defacto | 🟡 watch |  |  | 28 | 16 | watch |
-| esla | 🟡 watch | 2.0 | 34.0 | 0 | 5 | healthy |
-| ravin | 🟡 watch | 2.0 | 32.0 | 0 | 0 |  |
+| town_team | 🔴 stress | 1.67 | 26.0 | 453 | 132 | watch |
+| andora | 🟡 watch | 1.0 | 34.0 | 54 | 0 | healthy |
+| esla | 🟡 watch | 2.33 | 5.0 | 0 | 0 | healthy |
+| defacto | 🟡 watch |  |  | 50 | 104 | watch |
+| khotwh | 🟡 watch | 1.0 | 40.0 | 66 | 32 | healthy |
+| lc_waikiki | 🟡 watch |  | 87.0 | 497 | 0 | high |
+| ravin | 🟡 watch | 2.0 | 17.0 | 0 | 0 | watch |
+| mens_club | 🟡 watch | 1.67 | 5.0 | 12 | 4 | watch |
+| rojada | 🟡 watch | 0.33 |  | 116 | 28 | healthy |
+| tie_house | 🟡 watch | 1.0 | 33.0 | 0 | 23 | healthy |
+| tomato | 🟡 watch | 1.33 | 19.0 | 16 | 18 | healthy |
+| zodiac | 🟡 watch | 0.67 | 13.0 | 0 | 17 |  |
 
 
-_14 other brands read healthy and are omitted for brevity._
+_12 other brands read healthy and are omitted for brevity._
 
 
 ![Brands restocking slower than the market median.](charts/replen_vs_market.png)
@@ -34,4 +38,4 @@ _14 other brands read healthy and are omitted for brevity._
 ### Method & confidence
 - Health = count of stress flags (slow replen, low availability, distress markdowns, dead stock, high training risk): 3+ = stress, 2 = watch.
 
-*Auto-generated 2026-10-01. Confidence tiers: confirmed / directional / maturing — based on brands covered, days observed, and event volume.*
+*Auto-generated 2026-11-01. Confidence tiers: confirmed / directional / maturing — based on brands covered, days observed, and event volume.*
