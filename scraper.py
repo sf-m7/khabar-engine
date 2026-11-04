@@ -2566,15 +2566,33 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
     # Pagination stays on ?page=N — since_id is an Admin API parameter that
     # the public storefront endpoint silently ignores (causes infinite loop).
     empty_confirm = False
+    page_error = None  # v14.7x: set only on a genuine mid-catalog failure,
+    # distinct from a confirmed empty page. Checked live 2026-11-04: andora,
+    # khotwh, tomato, esla, town_team, ravin, or_egypt all under-counted in
+    # the SAME run, at round multiples of the 250-item page size (3, 4, 6, 8,
+    # 8, 5 pages) -- every one of them a DataImpulse-proxied brand. The old
+    # `except Exception: break` / `if status != 200: break` on this loop is
+    # structurally identical to the DeFacto bug fixed 2026-10-16: a mid-
+    # catalog failure (proxy blip, 429, timeout) looks EXACTLY like a clean
+    # end-of-catalog, since both just `break` out of the same loop. The
+    # brand still printed "✅ N products scanned" afterwards -- success,
+    # for a partial scrape. execute_with_retry already retries each request
+    # up to 5x with backoff (v14.20) before raising, so this loop isn't
+    # under-retrying; it's under-REPORTING. Fix: tell the two cases apart
+    # and make a real failure impossible to mistake for a finished catalog.
     while True:
         url = f"https://{domain}/products.json?limit=250&page={page}"
         try:
             response = execute_with_retry(session.get, url, timeout=PROXY_HTTP_TIMEOUT,
                                           headers={"User-Agent": "Mozilla/5.0"})
         except Exception as e:
-            print(f"  ⚠️ HTTP fault on page {page}: {e}")
+            page_error = f"exception on page {page} after full retry budget: {e}"
+            print(f"  🛑 [{brand_name}] PARTIAL SCRAPE — {page_error}")
             break
-        if response.status_code != 200: break
+        if response.status_code != 200:
+            page_error = f"HTTP {response.status_code} on page {page} after full retry budget"
+            print(f"  🛑 [{brand_name}] PARTIAL SCRAPE — {page_error}")
+            break
         products = response.json().get("products", [])
         if not products:
             # v14.18: a single empty page might be transient — retry once
@@ -2782,6 +2800,10 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         print(f"  Page {page} — {len(batch_products)} products processed.")
         time.sleep(1)
         page += 1
+    if page_error:
+        print(f"  🛑 [{brand_name}] SCRAPE INCOMPLETE — stopped at page {page} "
+              f"({products_seen} products collected before the failure). "
+              f"Do not read this run's row count as the full catalogue.")
     return products_seen, price_changes
 
 # ── LC Waikiki Scraper ────────────────────────────────────────────────────────
@@ -5583,13 +5605,24 @@ def _mage_parse_item(item, brand_name, domain):
 def _mage_fetch_page(sessions, endpoints, page):
     """POST one page. Tries each endpoint/session combo; returns parsed 'products' dict or None."""
     body = {"query": MAGENTO_QUERY, "variables": {"page": page, "size": MAGENTO_PAGE_SIZE}}
+    # 2026-11-04: UNVERIFIED HYPOTHESIS, shipped as a cheap experiment.
+    # mobaco: compare_at_price NULL on every observation and 0/419 products
+    # off their first_observed_price since this engine went live. That could
+    # be a cached response (mobaco.hypernode.io is Hypernode-hosted) OR the
+    # store simply never changes prices; I could not hit the endpoint to
+    # tell. No-cache headers + a per-request nonce cost nothing, and the raw
+    # price_range print below shows what the API actually returns.
     hdrs = {"content-type": "application/json", "accept": "application/json",
-            "accept-language": "en-US,en;q=0.9"}
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache, no-store, must-revalidate",
+            "pragma": "no-cache"}
+    _nonce = f"_={int(time.time() * 1000)}"
     for ep in endpoints:
+        _ep = f"{ep}{'&' if '?' in ep else '?'}{_nonce}"
         for sess in sessions:
             try:
                 _woo_pace()
-                r = execute_with_retry(sess.post, ep, max_retries=3, backoff=3,
+                r = execute_with_retry(sess.post, _ep, max_retries=3, backoff=3,
                                        timeout=PROXY_HTTP_TIMEOUT, json=body, headers=hdrs)
                 if r.status_code != 200:
                     print(f"  ⚠️ [Magento] {ep} HTTP {r.status_code}: {r.text[:120]!r}")
@@ -5636,6 +5669,14 @@ def scrape_magento(supabase, session, brand_name, domain, today, prev_stock_stat
         items = data.get("items") or []
         if not items:
             break
+
+        if page == 1:
+            for _it in items[:3]:
+                if _it.get("__typename") == "ConfigurableProduct":
+                    _pr = ((_it.get("variants") or [{}])[0].get("product") or {}).get("price_range")
+                else:
+                    _pr = _it.get("price_range")
+                print(f"  🔎 [Magento] raw price_range sku={_it.get('sku')}: {_pr}")
 
         parsed, batch_products, seen_ids = {}, [], set()
         for it in items:
