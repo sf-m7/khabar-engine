@@ -118,11 +118,21 @@ def check_freshness(cur):
 # computed over a silently truncated population.
 # ──────────────────────────────────────────────────────────────────────────
 def check_volume(cur):
+    # CHANGED 2026-11-04 -- today is excluded; the newest day compared is
+    # YESTERDAY. This runs at 20:00 UTC, ~19 min after the 19:41 Shopify run
+    # starts, and rows are written page by page (250 per page), so today's
+    # count is always a half-finished day at that moment. Seen 11-04: khotwh
+    # 1,000 at check time -> 3,250 a few hours later, tomato 1,500 -> 2,498,
+    # all "partial scrape" FAILs that were just the run still in flight (the
+    # round multiples of 250 were page boundaries). Cost of the change: a
+    # real drop is reported one day later. A brand with no row yesterday
+    # drops out of this check; check_freshness catches a stopped brand.
     rows = q(cur, """
         WITH daily AS (
             SELECT brand, snapshot_date, count(*) AS n
             FROM price_snapshots
             WHERE snapshot_date >= CURRENT_DATE - 14
+              AND snapshot_date <  CURRENT_DATE
             GROUP BY brand, snapshot_date
         ),
         latest AS (
@@ -137,7 +147,7 @@ def check_volume(cur):
             JOIN latest l ON l.brand = d.brand AND d.snapshot_date < l.snapshot_date
             GROUP BY d.brand
         )
-        SELECT l.brand, l.n AS today_rows, m.typical, m.days_seen,
+        SELECT l.brand, l.snapshot_date AS day, l.n AS today_rows, m.typical, m.days_seen,
                round((100.0 * l.n / NULLIF(m.typical, 0))::numeric, 1) AS pct_of_typical
         FROM latest l JOIN med m ON m.brand = l.brand
         WHERE m.days_seen >= %s
@@ -147,11 +157,11 @@ def check_volume(cur):
         pct = float(r["pct_of_typical"] or 0)
         if pct < 50:
             record("FAIL", f"volume/{r['brand']}",
-                   f"{r['today_rows']:,} rows = {pct}% of typical "
+                   f"{r['day']}: {r['today_rows']:,} rows = {pct}% of typical "
                    f"({int(r['typical']):,}) — likely a partial scrape")
         elif pct < 75:
             record("WARN", f"volume/{r['brand']}",
-                   f"{r['today_rows']:,} rows = {pct}% of typical")
+                   f"{r['day']}: {r['today_rows']:,} rows = {pct}% of typical")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -175,6 +185,20 @@ def check_discount_capture(cur):
     """)
     for r in rows:
         if r["discounted"] == 0 and r["days"] >= 5:
+            # 2026-11-04 -- zero discounted rows also happens when a sale
+            # genuinely ended. khotwh: 0 discounted 10-12..10-19, while
+            # price_events logged 4,824 increases on 10-12 and 2,848
+            # decreases on 10-19. A blind scraper records neither. If the
+            # brand logged real price moves in 30d, capture is alive.
+            moves = q(cur, """
+                SELECT count(DISTINCT pe.product_id) AS n
+                FROM price_events pe JOIN products p ON p.id = pe.product_id
+                WHERE p.brand = %s AND pe.recorded_at >= now() - interval '30 days'
+            """, (r["brand"],))[0]["n"]
+            if moves >= 10:
+                print(f"  ℹ️  discount_capture/{r['brand']}: {moves:,} products logged "
+                      f"price moves in 30d — capture is fine, just no active sale")
+                continue
             record("FAIL", f"discount_capture/{r['brand']}",
                    f"0 discounted rows in {r['obs']:,} observations over "
                    f"{r['days']} days — price fields have almost certainly moved")
@@ -425,6 +449,23 @@ def check_frozen_prices(cur):
                 print(f"  ℹ️  frozen_prices/{r['brand']}: sale-ending explains it "
                       f"({ups:,} products logged price increases in 30d) — not flagged")
                 continue
+            # 2026-11-04 -- the 30-day window above ages out: carina's real
+            # sale-ending (305 increases, 09-23) is >35 days old and already
+            # purged from price_events, so the check re-fired on a brand that
+            # is simply quiet at full price. A scraper that cannot see prices
+            # records ~zero moves of ANY kind; carina still logs a handful
+            # (11 decreases wk of 10-12, 9 increases wk of 10-26). So any
+            # steady trickle of real moves also proves capture is alive.
+            # The floor of 10 products is a heuristic -- tune if needed.
+            alive = q(cur, """
+                SELECT count(DISTINCT pe.product_id) AS n
+                FROM price_events pe JOIN products p ON p.id = pe.product_id
+                WHERE p.brand = %s AND pe.recorded_at >= now() - interval '30 days'
+            """, (r["brand"],))[0]["n"]
+            if alive >= 10:
+                print(f"  ℹ️  frozen_prices/{r['brand']}: quiet, not blind "
+                      f"({alive:,} products logged price moves in 30d) — not flagged")
+                continue
             record("FAIL", f"frozen_prices/{r['brand']}",
                    f"{pct_frozen:.1f}% of {r['products']:,} products held ONE "
                    f"price for {r['days']} days AND only {pct_on_sale:.1f}% show "
@@ -462,6 +503,18 @@ def main():
             print(f"{icon} [{status}] {name}\n     {detail}")
     print("\n" + "-" * 78)
     print(f"{len(fails)} failure(s), {len(warns)} warning(s).")
+
+    # One-line headline for the Telegram alert, written to a file so the
+    # workflow can put it FIRST in the message -- the first line is what
+    # shows in the phone's notification bar, so errors/warnings can be read
+    # without opening Telegram.
+    def _n(count, word):
+        return f"{count} {word}" + ("" if count == 1 else "s")
+    try:
+        with open("summary.txt", "w", encoding="utf-8") as f:
+            f.write(f"🔴 {_n(len(fails), 'error')} · 🟡 {_n(len(warns), 'warning')}\n")
+    except OSError as e:
+        print(f"(could not write summary.txt: {e})")
 
     if fails:
         # Non-zero exit is the entire point: it turns the GitHub run red and
