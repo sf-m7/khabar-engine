@@ -53,6 +53,15 @@ jobs:
             exit 0
           fi
           {
+            # FIRST line = error/warning counts, written by health_check.py.
+            # Telegram shows the first line in the phone's notification bar,
+            # so severity is readable without opening the chat. If the checker
+            # died before writing it (e.g. couldn't reach the database), say so.
+            if [ -s summary.txt ]; then
+              head -n 1 summary.txt
+            else
+              echo "🔴 Health check did not complete"
+            fi
             echo "Khabar health check FAILED"
             echo ""
             # v14.48 fix: previously filtered with `grep '^\xe2\x9d\x8c'`,
