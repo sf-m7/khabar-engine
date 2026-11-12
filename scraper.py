@@ -731,7 +731,15 @@ DECODO_USER  = os.environ.get("DECODO_PROXY_USER", "")
 DECODO_PASS  = os.environ.get("DECODO_PROXY_PASS", "")
 DECODO_HOST  = env_str("DECODO_HOST", "isp.decodo.com")
 DECODO_PORTS = [10001, 10002, 10003]
-DECODO_CONFIGURED = bool(DECODO_USER and DECODO_PASS)
+# v14.80: Decodo is DROPPED. Its 3 static ISP IPs returned HTTP 407 (proxy auth
+# failure) in the 2026-11-12 run, and a configured-but-dead tier is worse than
+# none: the ladder "escalated" onto it, then (with creds missing) silently fell
+# back to DIRECT -- re-hitting the exact IP that was already blocked. It now needs
+# an explicit DECODO_ENABLED=1 on top of the credentials, so leftover secrets
+# cannot bring it back by accident. Everything below (PROXY_TIERS,
+# LCW_PROXY_PROVIDERS, the startup banner) keys off this one flag.
+DECODO_ENABLED    = env_str("DECODO_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+DECODO_CONFIGURED = bool(DECODO_USER and DECODO_PASS) and DECODO_ENABLED
 
 # ── v14.39: exit-country is now per-engine, not global ───────────────────────
 #
@@ -1233,10 +1241,85 @@ def get_decodo_session(brand_name):
 # Direct is free — always the starting point unless the baseline has
 # already moved. get_shopify_session() just reads _proxy_tier_name(); it
 # has no idea whether it's reading the baseline or a brand's own override.
-PROXY_TIERS = ["direct", "dataimpulse", "decodo"]
+PROXY_TIERS = ["direct", "dataimpulse"] + (["decodo"] if DECODO_CONFIGURED else [])
 _proxy_tier_state = {"idx": 0}          # baseline, set by the canary
 _proxy_tier_override_stack = []          # per-brand override, if any
 _proxy_canary_done = {"done": False}
+# v14.7x: partial-scrape escalation. scrape_shopify records the page it died on
+# (HTTP 403/429/5xx or a network exception that survived the retry budget);
+# the cascade then retries THAT brand on the next tier, resuming from that page.
+_shopify_partial = {}   # brand -> page the scrape failed on
+_shopify_resume  = {}   # brand -> page the next (escalated) attempt starts at
+_shopify_tail    = {}   # brand -> how a CLEAN-looking scrape ended (see _suspect_truncation)
+
+# v14.7x: SILENT-TRUNCATION DETECTOR. The error path above catches a page that
+# fails loudly (403/429/exception). It cannot catch a catalogue that simply
+# STOPS: an empty 200 page mid-catalogue looks identical to a real end. Two
+# independent tells, then a second-route check before anything is believed:
+#   1. Shape  -- a real catalogue almost always ends on a PARTIAL page (the
+#      remainder). Ending right after a completely full 250-item page happens
+#      by chance only ~1 time in 250, so it is suspicious with zero history.
+#   2. Size   -- collected far fewer products than the brand's active catalogue
+#      (products still is_active, i.e. seen within housekeeping's 14-day
+#      window, so a few days of truncation cannot drag the yardstick down).
+#      Needs BOTH a relative shortfall and an absolute gap, so a 10-product
+#      boutique wobbling by 2 is never flagged.
+# A suspicion alone changes nothing. It triggers ONE probe request for the
+# page that came back empty, over the next proxy tier up:
+#   probe returns products -> the empty page was a block: resume there.
+#   probe also empty       -> two routes agree it ends there: genuine change
+#                             (e.g. a real clearance), accept it, no extra cost.
+#   probe errors           -> try the next tier; if none can answer, say so.
+SUSPECT_COVERAGE = float(os.environ.get("SUSPECT_COVERAGE") or "0.85")
+SUSPECT_MIN_GAP  = int(os.environ.get("SUSPECT_MIN_GAP") or "50")
+SHOPIFY_PAGE_LIMIT = 250
+
+def _suspect_truncation(seen, last_page_len, expected):
+    """Pure. Returns a list of human-readable reasons (empty list = looks fine)."""
+    reasons = []
+    if last_page_len >= SHOPIFY_PAGE_LIMIT:
+        reasons.append(f"catalogue ended right after a full {SHOPIFY_PAGE_LIMIT}-product page "
+                       f"(a genuine end is almost always a partial page)")
+    if expected:
+        gap = expected - seen
+        if gap >= SUSPECT_MIN_GAP and seen < SUSPECT_COVERAGE * expected:
+            reasons.append(f"collected {seen:,} vs ~{expected:,} active products "
+                           f"({100.0 * seen / expected:.0f}%, short by {gap:,})")
+    return reasons
+
+def _shopify_active_count(supabase, brand_name):
+    """Active-catalogue size for the brand, or None if it can't be read."""
+    try:
+        r = safe_db_execute(
+            supabase.table("products").select("id", count="exact")
+            .eq("brand", brand_name).eq("is_active", True).limit(1)
+        )
+        return int(r.count) if (r is not None and r.count is not None) else None
+    except Exception:
+        return None
+
+def _shopify_probe_page(brand_name, domain, page, tier_idx):
+    """ONE request for `page` over proxy tier `tier_idx`.
+    Returns ("products", n) | ("empty", 0) | ("error", reason). Never raises."""
+    _proxy_tier_override_stack.append(tier_idx)
+    try:
+        sess = get_shopify_session(brand_name)
+        url = f"https://{domain}/products.json?limit={SHOPIFY_PAGE_LIMIT}&page={page}"
+        r = execute_with_retry(sess.get, url, max_retries=2, backoff=2,
+                               timeout=PROXY_HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return ("error", f"HTTP {r.status_code}")
+        try:
+            prods = r.json().get("products")
+        except Exception:
+            return ("error", "non-JSON response")
+        if prods is None:
+            return ("error", "no 'products' key in response")
+        return ("products", len(prods)) if prods else ("empty", 0)
+    except Exception as e:
+        return ("error", str(e)[:120])
+    finally:
+        _proxy_tier_override_stack.pop()
 
 def _proxy_tier_idx():
     return _proxy_tier_override_stack[-1] if _proxy_tier_override_stack else _proxy_tier_state["idx"]
@@ -1250,6 +1333,12 @@ def _next_tier_idx(current_idx, brand_name, reason):
     if current_idx >= len(PROXY_TIERS) - 1:
         return None
     new_idx = current_idx + 1
+    # v14.80: get_shopify_session() falls back to DIRECT when a tier's credentials
+    # are missing. "Escalating" onto such a tier would just re-run the same blocked
+    # datacenter IP and burn the retry budget for nothing, so refuse to escalate.
+    if PROXY_TIERS[new_idx] == "dataimpulse" and not DATAIMPULSE_CONFIGURED:
+        print(f"  ⚠️ [{brand_name}] cannot escalate to 'dataimpulse' — credentials not set ({reason}).")
+        return None
     print(f"  ⬆️  [{brand_name}] escalating proxy tier -> '{PROXY_TIERS[new_idx]}' ({reason})")
     return new_idx
 
@@ -1281,7 +1370,7 @@ def get_shopify_session(brand_name):
 # full reasoning. Separate from the Shopify/Woo PROXY_TIERS state above:
 # LCW is a single brand with its own circuit breaker already, so this only
 # needs two providers and no per-brand override stack.
-LCW_PROXY_PROVIDERS = ["dataimpulse", "decodo"]
+LCW_PROXY_PROVIDERS = ["dataimpulse"] + (["decodo"] if DECODO_CONFIGURED else [])
 _lcw_provider_state = {"idx": 0}
 # v14.62: set True when scrape_lcw hits the "day already fully checkpointed,
 # nothing to do" no-op path (see set-site below). 0 products in THAT case is
@@ -1427,6 +1516,15 @@ def execute_with_retry(session_method, url, max_retries=5, backoff=2, max_delay=
         retry_after = None
         try:
             res = session_method(url, **kwargs)
+            if res.status_code == 403:
+                # v14.80: one diagnostic line per request, headers only.
+                if attempt == 0:
+                    print(f"  🔍 403 on {url} (server={res.headers.get('server')}, "
+                          f"cf-mitigated={res.headers.get('cf-mitigated')}, "
+                          f"{'proxy peer' if _eg_proxy else 'direct runner IP'})")
+                if _eg_proxy and attempt < 2 and attempt < max_retries - 1:
+                    raise requests.RequestsError("HTTP 403 (this proxy peer is blocked)")
+                return res   # direct runner, or peer retries used up: hand the 403 back
             if res.status_code in (429, 500, 502, 503, 504):
                 if res.status_code == 429:
                     try:
@@ -2535,7 +2633,11 @@ def build_attributes_extracted(brand_name, category_normalized, category_raw, na
 
 def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_state, fop_done_ids):
     products_seen, price_changes = 0, 0
-    page = 1                     # v14.18: kept on ?page=N (since_id is Admin-API only)
+    _shopify_partial.pop(brand_name, None)
+    _shopify_tail.pop(brand_name, None)
+    last_page_len, ended_on_empty = 0, False
+    page = _shopify_resume.pop(brand_name, 1)  # v14.7x: resume page after an escalation
+    # v14.18: kept on ?page=N (since_id is Admin-API only)
     prev_prices = load_last_prices(supabase, brand_name)
     # v14.17: fop_done_ids is passed in from scrape_brand (derived from the
     # variant preload we already load). The separate load_products_with_fop()
@@ -2586,10 +2688,24 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
             response = execute_with_retry(session.get, url, timeout=PROXY_HTTP_TIMEOUT,
                                           headers={"User-Agent": "Mozilla/5.0"})
         except Exception as e:
+            if 0 < last_page_len < SHOPIFY_PAGE_LIMIT:
+                print(f"  ℹ️ [{brand_name}] page {page} failed after a short page ({last_page_len}) — "
+                      f"treating as end of catalogue (coverage check still applies).")
+                ended_on_empty = True
+                break
             page_error = f"exception on page {page} after full retry budget: {e}"
             print(f"  🛑 [{brand_name}] PARTIAL SCRAPE — {page_error}")
             break
         if response.status_code != 200:
+            # v14.80: the previous page was short, so there is no real next page to be
+            # blocked from. Do NOT flag a partial (that escalated dalydress onto the paid
+            # proxy every sweep for a page that does not exist). _suspect_truncation's
+            # coverage test still runs on this end, so a genuinely short catalogue is caught.
+            if 0 < last_page_len < SHOPIFY_PAGE_LIMIT:
+                print(f"  ℹ️ [{brand_name}] HTTP {response.status_code} on page {page} after a short "
+                      f"page ({last_page_len}) — treating as end of catalogue.")
+                ended_on_empty = True
+                break
             page_error = f"HTTP {response.status_code} on page {page} after full retry budget"
             print(f"  🛑 [{brand_name}] PARTIAL SCRAPE — {page_error}")
             break
@@ -2601,8 +2717,10 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
                 empty_confirm = True
                 time.sleep(3)
                 continue   # retry same page number
+            ended_on_empty = True
             break
         empty_confirm = False
+        last_page_len = len(products)   # raw page size, before any filtering
 
         batch_products = []
         for p in products:
@@ -2800,7 +2918,14 @@ def scrape_shopify(supabase, session, brand_name, domain, today, prev_stock_stat
         print(f"  Page {page} — {len(batch_products)} products processed.")
         time.sleep(1)
         page += 1
+    if ended_on_empty and not page_error and last_page_len:
+        _shopify_tail[brand_name] = {
+            "last_page_len": last_page_len,
+            "next_page": page,                      # the page that came back empty
+            "expected": _shopify_active_count(supabase, brand_name),
+        }
     if page_error:
+        _shopify_partial[brand_name] = page
         print(f"  🛑 [{brand_name}] SCRAPE INCOMPLETE — stopped at page {page} "
               f"({products_seen} products collected before the failure). "
               f"Do not read this run's row count as the full catalogue.")
@@ -6181,15 +6306,90 @@ def _run_brand_with_proxy_cascade(brand_name, domain, engine):
             local_idx = next_idx
             _proxy_tier_override_stack[-1] = local_idx
             seen, changes = scrape_brand(brand_name, domain)
+
+        # The canary baseline promotion below must only ever reflect the
+        # 0-products case (read as "the runner's IP is blocked"). A mid-
+        # catalogue failure is a per-domain problem, so it escalates this
+        # brand alone and never moves the baseline for everyone else.
+        baseline_idx = local_idx
+
+        # v14.7x: PARTIAL-SCRAPE ESCALATION. Seen 2026-11-06 in the live log:
+        # "dalydress: PARTIAL SCRAPE -- HTTP 403 on page 6 after full retry
+        # budget" (Cloudflare challenging the direct runner connection after
+        # five pages). The loop above only escalates on 0 products, and
+        # dalydress had already scanned 1,250, so it never left 'direct' and
+        # the other 4,500 rows were simply not collected. Same story for
+        # andora/khotwh/tomato/tie_house/ravin/town_team from 11-04 onward
+        # (rows stopping at page multiples of 250). Now: if scrape_shopify
+        # reports it died on a page, retry on the next tier, resuming from
+        # that page so the proxy only carries the pages still missing.
+        while engine == "shopify" and brand_name in _shopify_partial:
+            fail_page = _shopify_partial[brand_name]
+            next_idx = _next_tier_idx(
+                local_idx, brand_name, f"partial scrape, failed on page {fail_page}")
+            if next_idx is None:
+                print(f"  🛑 [{brand_name}] still failing on page {fail_page} at the top "
+                      f"proxy tier — leaving it partial.")
+                break
+            local_idx = next_idx
+            _proxy_tier_override_stack[-1] = local_idx
+            _shopify_resume[brand_name] = fail_page
+            _shopify_partial.pop(brand_name, None)   # a retry that dies before reaching
+            # scrape_shopify must not leave the old failure flag behind
+            s2, c2 = scrape_brand(brand_name, domain)
+            _shopify_resume.pop(brand_name, None)
+            seen += s2
+            changes += c2
+
+        # v14.7x: SILENT-TRUNCATION CHECK (see _suspect_truncation). Runs only
+        # for a scrape that ended on an apparently clean empty page.
+        while engine == "shopify" and brand_name not in _shopify_partial:
+            tail = _shopify_tail.pop(brand_name, None)
+            if not tail:
+                break
+            reasons = _suspect_truncation(seen, tail["last_page_len"], tail.get("expected"))
+            if not reasons:
+                break
+            print(f"  🔍 [{brand_name}] truncation suspected: " + "; ".join(reasons))
+            verdict, probe_idx = None, local_idx
+            while verdict is None and probe_idx < len(PROXY_TIERS) - 1:
+                probe_idx += 1
+                kind, info = _shopify_probe_page(brand_name, domain, tail["next_page"], probe_idx)
+                print(f"  🔍 [{brand_name}] second-route probe of page {tail['next_page']} via "
+                      f"'{PROXY_TIERS[probe_idx]}': {kind}" + (f" ({info})" if info else ""))
+                if kind in ("products", "empty"):
+                    verdict = (kind, probe_idx)
+            if verdict is None:
+                print(f"  ⚠️ [{brand_name}] could not verify on any higher tier — "
+                      f"treating this run as UNVERIFIED (possibly incomplete).")
+                break
+            kind, probe_idx = verdict
+            if kind == "empty":
+                print(f"  ✅ [{brand_name}] two routes agree the catalogue ends at page "
+                      f"{tail['next_page']} — treating the shortfall as genuine.")
+                break
+            print(f"  🛑 [{brand_name}] block proven: page {tail['next_page']} has products on "
+                  f"'{PROXY_TIERS[probe_idx]}' but came back empty on '{PROXY_TIERS[local_idx]}'. "
+                  f"Resuming there.")
+            local_idx = probe_idx
+            _proxy_tier_override_stack[-1] = local_idx
+            _shopify_resume[brand_name] = tail["next_page"]
+            s2, c2 = scrape_brand(brand_name, domain)
+            _shopify_resume.pop(brand_name, None)
+            seen += s2
+            changes += c2
     finally:
         _proxy_tier_override_stack.pop()
+        _shopify_resume.pop(brand_name, None)
 
-    if is_canary and local_idx > _proxy_tier_state["idx"]:
+    if is_canary and baseline_idx > _proxy_tier_state["idx"]:
+        local_idx = baseline_idx
         _proxy_tier_state["idx"] = local_idx
         print(f"  [Proxy cascade] Canary escalation -> baseline tier is now "
               f"'{PROXY_TIERS[local_idx]}' for every brand this run.")
     elif local_idx > _proxy_tier_state["idx"]:
-        status = "recovered" if seen > 0 else "still 0 products at top tier"
+        status = ("still PARTIAL at top tier" if brand_name in _shopify_partial
+                  else "recovered" if seen > 0 else "still 0 products at top tier")
         print(f"  [Proxy cascade] [{brand_name}] used '{PROXY_TIERS[local_idx]}' for "
               f"itself only ({status}) — baseline stays '{_proxy_tier_name()}' for the rest of the run.")
 
@@ -6330,7 +6530,8 @@ if __name__ == "__main__":
               f"'{PROXY_TIERS[0]}'. First brand ({_cascade_brands[0]}) is the canary — its escalation "
               f"(if any) sets the baseline for everyone else; every OTHER brand that scans 0 products "
               f"escalates for itself only, through {PROXY_TIERS[1:]}. "
-              f"DataImpulse configured: {DATAIMPULSE_CONFIGURED}, Decodo configured: {DECODO_CONFIGURED}.")
+              f"DataImpulse configured: {DATAIMPULSE_CONFIGURED}"
+              + (f", Decodo enabled+configured: {DECODO_CONFIGURED}." if DECODO_ENABLED else ", Decodo: dropped."))
     if any(b["engine"] == "lcw_proxy" for b in active_brands):
         print(f"  [DataImpulse] Proxy configured: {DATAIMPULSE_CONFIGURED} (LCW only)")
     startup_jitter = random.uniform(0, 30)
@@ -6508,6 +6709,24 @@ if __name__ == "__main__":
             print(f"  ⚠️ Best-seller rank collection failed (non-fatal): {e}")
 
     print(f"\n🏁 All done. Total price changes this run: {total}")
+
+    # v14.80: PARTIAL-RUN ALERT. The empty-run guard below only fires on brands that scanned
+    # ZERO products. A brand cut off mid-catalogue after the whole ladder (direct, then
+    # DataImpulse) still finishes "green". Surface those: any entry left in _shopify_partial
+    # is a brand that failed on a page and was NOT recovered. Alert only (no exit code change),
+    # so a red run keeps meaning "the scraper itself broke".
+    _still_partial = sorted(_shopify_partial.items())
+    if _still_partial:
+        _pmsg = (f"⚠️ Khabar scraper: {len(_still_partial)} brand(s) still PARTIAL after all proxy tiers: "
+                 + ", ".join(f"{b} (stopped at page {p})" for b, p in _still_partial))
+        print(f"\n{_pmsg}")
+        if len(_still_partial) >= int(os.environ.get("PARTIAL_ALERT_BRANDS") or "2"):
+            _ops = os.environ.get("OPS_TELEGRAM_CHAT_ID")
+            if _ops:
+                try:
+                    send_telegram(get_resilient_session(), _ops, _pmsg)
+                except Exception as e:
+                    print(f"  ⚠️ partial-run alert send failed: {e}")
 
     # v14.50: empty-run guard. A flaky proxy can silently zero out most brands
     # and still exit green — that is how a transient blip became a multi-day
