@@ -21,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install psycopg2-binary
+        run: pip install psycopg2-binary certifi
 
       - name: Generate stats.json
         env:
