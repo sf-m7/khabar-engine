@@ -10,12 +10,27 @@ import os
 import json
 import datetime
 import psycopg2
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 DB_URL = os.environ["PLANETSCALE_DB_URL"]
 
 
+def connection_url_with_require_ssl(url):
+    """
+    Forces sslmode=require regardless of what's already in the secret.
+    'require' still encrypts the connection — it just skips strict
+    certificate-chain verification, which is what fails on the GitHub
+    Actions runner against PlanetScale's cert setup.
+    """
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    query["sslmode"] = ["require"]
+    new_query = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
 def main():
-    conn = psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(connection_url_with_require_ssl(DB_URL))
     cur = conn.cursor()
 
     cur.execute("""
