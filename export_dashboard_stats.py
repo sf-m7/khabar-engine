@@ -10,27 +10,30 @@ import os
 import json
 import datetime
 import psycopg2
+import certifi
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 DB_URL = os.environ["PLANETSCALE_DB_URL"]
 
 
-def connection_url_with_require_ssl(url):
+def connection_url_with_trusted_ca(url):
     """
-    Forces sslmode=require regardless of what's already in the secret.
-    'require' still encrypts the connection — it just skips strict
-    certificate-chain verification, which is what fails on the GitHub
-    Actions runner against PlanetScale's cert setup.
+    This DSN requires channel_binding, which forbids anything weaker than
+    sslmode=verify-full — so the fix isn't to lower the SSL mode. The
+    actual problem is that psycopg2-binary's bundled OpenSSL doesn't
+    reliably find a trusted CA store on the GitHub Actions runner. This
+    keeps verify-full and just points it at certifi's CA bundle instead.
     """
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    query["sslmode"] = ["require"]
+    query["sslmode"] = ["verify-full"]
+    query["sslrootcert"] = [certifi.where()]
     new_query = urlencode(query, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
 
 
 def main():
-    conn = psycopg2.connect(connection_url_with_require_ssl(DB_URL))
+    conn = psycopg2.connect(connection_url_with_trusted_ca(DB_URL))
     cur = conn.cursor()
 
     cur.execute("""
