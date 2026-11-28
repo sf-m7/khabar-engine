@@ -40,12 +40,13 @@ def main():
         SELECT
           (SELECT COUNT(DISTINCT brand) FROM products WHERE is_active = true),
           (SELECT COUNT(*) FROM products WHERE is_active = true),
+          (SELECT COUNT(*) FROM products),
           (SELECT COUNT(*) FROM product_variants),
           (SELECT COUNT(*) FROM product_variants WHERE is_in_stock = true),
           (CURRENT_DATE - (SELECT MIN(first_seen_at)::date FROM products)),
           (SELECT MIN(first_seen_at)::date FROM products)
     """)
-    (brands_total, products_total, variants_total,
+    (brands_total, products_total, products_ever_observed, variants_total,
      variants_in_stock, days_tracked, first_date) = cur.fetchone()
 
     cur.execute("""
@@ -61,7 +62,11 @@ def main():
         "days_tracked": int(days_tracked),
         "first_tracked_date": str(first_date),
         "brands": {"total": int(brands_total)},
-        "products": {"total": int(products_total), "last_14d": last_14d},
+        "products": {
+            "total": int(products_total),
+            "ever_observed": int(products_ever_observed),
+            "last_14d": last_14d,
+        },
         "variants": {"total": int(variants_total), "in_stock": int(variants_in_stock)},
     }
 
