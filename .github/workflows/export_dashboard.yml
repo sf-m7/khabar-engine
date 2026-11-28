@@ -1,0 +1,43 @@
+name: Export Dashboard Stats
+
+on:
+  schedule:
+    # 20 min after the scraper's own 0,12 schedule, so the day's
+    # snapshot has already been written before we read it.
+    - cron: "20 0,12 * * *"
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Pull the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Generate stats.json
+        env:
+          PLANETSCALE_DB_URL: ${{ secrets.PLANETSCALE_DB_URL }}
+        run: python export_dashboard_stats.py
+
+      - name: Push stats.json to khabar-research
+        env:
+          RESEARCH_REPO_TOKEN: ${{ secrets.RESEARCH_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${RESEARCH_REPO_TOKEN}@github.com/sf-m7/khabar-research.git research_repo
+          mkdir -p research_repo/data
+          cp stats.json research_repo/data/stats.json
+          cd research_repo
+          git config user.name "khabar-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/stats.json
+          git diff --quiet --cached || git commit -m "Update dashboard stats"
+          git push
